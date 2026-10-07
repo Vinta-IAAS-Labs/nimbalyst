@@ -3,12 +3,19 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import {
   $getSelection,
+  $getNearestNodeFromDOMNode,
+  $getNodeByKey,
   $isRangeSelection,
   $createParagraphNode,
   TextNode,
   $createTextNode,
-  isDOMNode
+  isDOMNode,
+  COMMAND_PRIORITY_HIGH,
+  PASTE_COMMAND,
+  type LexicalEditor,
+  type RangeSelection,
 } from 'lexical';
+import { $isLinkNode, LinkNode } from '@lexical/link';
 import { $createDocumentReferenceNode } from './DocumentLinkNode';
 import { DocumentService } from '../../core/DocumentService';
 import documentLinkStyles from './DocumentLinkPlugin.css?inline';
@@ -16,10 +23,19 @@ import { TypeaheadMenuOption } from "../../editor";
 import { fuzzyFilterDocuments } from '../../utils/fuzzyMatch';
 import { MaterialSymbol } from "../../ui";
 import { $createEmbeddedFileNode } from '../../editor/plugins/EmbedPlugin/EmbeddedFileNode';
+import { createEmbedFileHref } from '../../editor/plugins/EmbedPlugin/embedFilePaths';
 import { isEmbeddableUrl } from '../../editor/plugins/EmbedPlugin/embeddableExtensions';
 import { useDocumentPath } from '../../DocumentPathContext';
-import { resolveDocumentLinkLookupPath, isCollabReferenceHref } from './documentLinkPaths';
+import {
+  resolveDocumentLinkLookupPaths,
+  isCollabReferenceHref,
+  parseCollabReferenceDocumentId,
+} from './documentLinkPaths';
 import { isWorkspaceFileHref } from '../../editor/utils/workspaceLinkNavigation';
+import {
+  dispatchAppActionHref,
+  isAppActionHref,
+} from '../../utils/appActionLinks';
 
 /**
  * A shared/collaborative document the `@` typeahead can reference when the
@@ -33,18 +49,145 @@ export interface CollabReferenceOption {
   target: string;
   /** Folder breadcrumb ("Design/Specs") shown as secondary text; optional. */
   folderPath?: string;
+  /**
+   * File extension of the shared document (".mockup.html", ".excalidraw"),
+   * when the host knows it. A collab deep link carries no extension, so this
+   * is the only way the embed rule can tell a shared mockup from a shared
+   * markdown doc -- it becomes the `embedType` attribute on the inserted node
+   * and travels with the link through markdown (NIM-2473).
+   */
+  embedType?: string;
+  /** Material symbol shown beside it; a team page's `groups` when absent. */
+  icon?: string;
 }
 
 /**
- * Injected by the host when the current editor is a collaborative document.
- * When present, the `@` typeahead lists shared documents instead of local
- * workspace files, and reference clicks open the shared document.
+ * Injected by the host when the current editor is a page (team or Personal),
+ * or to add pages to a local file's list. When present, the `@` typeahead
+ * lists this source's pages, and reference clicks on their targets open them.
  */
 export interface CollabReferenceSource {
-  /** Enumerate the shareable documents (already excludes the current doc). */
+  /** Enumerate the linkable pages (already excludes the current one). */
   listOptions(): CollabReferenceOption[];
-  /** Open a shared document from its reference target (deep link / collab URI). */
-  openReference(target: string): void;
+  /** Open a page from its reference target (deep link / collab URI / console link). */
+  /** `newTab` when the click asked for one (Cmd/Ctrl, or the middle button). */
+  openReference(target: string, options?: { newTab: boolean }): void;
+  /** Whether a reference target is one of this source's; a shared-doc link when absent. */
+  ownsTarget?(target: string): boolean;
+  /** List the workspace's files after this source's pages (a local file's `@`). */
+  includeLocalFiles?: boolean;
+}
+
+function sourceOwnsTarget(source: CollabReferenceSource, target: string | null | undefined): boolean {
+  if (!target) return false;
+  return source.ownsTarget ? source.ownsTarget(target) : isCollabReferenceHref(target);
+}
+
+/**
+ * Insert a shared-document reference at the selection.
+ *
+ * Shared by the `@` typeahead and by pasting a copied link, so the two produce
+ * the same node rather than two things that merely look alike. A shared
+ * document whose type an extension can render inline gets the same block embed
+ * a local file of that type would. The deep link has no extension, so the embed
+ * rule is driven by the host-supplied `embedType`, which is also recorded on
+ * the node so the hint survives export to markdown and the Y.Doc round trip
+ * (NIM-2473).
+ */
+function $insertCollabReference(
+  selection: RangeSelection,
+  doc: ReferenceDoc,
+  collabTarget: string,
+): void {
+  if (isEmbeddableUrl(collabTarget, doc.collabEmbedType)) {
+    $insertEmbedBlock(selection, {
+      src: collabTarget,
+      label: doc.name,
+      attrs: doc.collabEmbedType ? { embedType: doc.collabEmbedType } : {},
+    });
+    return;
+  }
+
+  const collabNode = $createDocumentReferenceNode(doc.id, doc.name, collabTarget);
+  selection.insertNodes([collabNode]);
+  const trailingSpace = $createTextNode(' ');
+  collabNode.insertAfter(trailingSpace);
+  trailingSpace.select();
+}
+
+/**
+ * A pasted shared-document link becomes the reference it names.
+ *
+ * Until this existed the `@` typeahead was the only thing that ever created a
+ * `DocumentReferenceNode`, so copying a document's link and pasting it left
+ * inert text -- the one gesture a reader is most likely to try (NIM-3585).
+ *
+ * Only an exact plain-text paste is intercepted. Pasting a sentence that
+ * happens to contain a link keeps the browser's normal text behavior, matching
+ * how the message composer treats the same gesture.
+ *
+ * A link whose document this reader cannot see falls through to plain text
+ * rather than minting a node with a guessed label. The label is baked into the
+ * node and exported into markdown, so a wrong one outlives the paste; text is
+ * the honest result when the title is genuinely unknown.
+ */
+function CollabReferencePastePlugin({
+  collabReferenceSource,
+}: {
+  collabReferenceSource: CollabReferenceSource;
+}): null {
+  const [editor] = useLexicalComposerContext();
+
+  useEffect(
+    () =>
+      editor.registerCommand(
+        PASTE_COMMAND,
+        (event: ClipboardEvent) => {
+          const clipboardData = event.clipboardData;
+          if (!clipboardData || clipboardData.files.length > 0) return false;
+
+          const value = clipboardData.getData('text/plain').trim();
+          if (!sourceOwnsTarget(collabReferenceSource, value)) return false;
+
+          const documentId = parseCollabReferenceDocumentId(value);
+
+          // Read the source at paste time rather than the typeahead's cached
+          // list: `listOptions` is a synchronous read of live atoms, and the
+          // cached list is only populated once a typeahead has been opened.
+          const options = collabReferenceSource.listOptions();
+          // Match on the target first -- it is the exact string the source
+          // handed out. The id is the fallback for a link copied before the
+          // target's query string changed shape.
+          const known = options.find((option) => option.target === value)
+            ?? (documentId ? options.find((option) => option.documentId === documentId) : undefined);
+          if (!known) return false;
+
+          event.preventDefault();
+          editor.update(() => {
+            const selection = $getSelection();
+            if (!$isRangeSelection(selection)) return;
+            $insertCollabReference(
+              selection,
+              {
+                id: known.documentId,
+                name: known.title,
+                path: known.folderPath ?? '',
+                collabTarget: known.target,
+                folderPath: known.folderPath,
+                collabEmbedType: known.embedType,
+                collabIcon: known.icon,
+              },
+              known.target,
+            );
+          });
+          return true;
+        },
+        COMMAND_PRIORITY_HIGH,
+      ),
+    [editor, collabReferenceSource],
+  );
+
+  return null;
 }
 
 /** Internal unified shape feeding the typeahead option list + selection. */
@@ -57,9 +200,35 @@ interface ReferenceDoc {
   collabTarget?: string;
   /** Present only for collab references; folder breadcrumb for display. */
   folderPath?: string;
+  /** Present only for collab references; the shared document's file extension. */
+  collabEmbedType?: string;
+  /** Present only for collab references; the symbol shown beside it. */
+  collabIcon?: string;
 }
 
 const DOCUMENT_REFERENCE_STYLE_ID = 'document-reference-styles';
+
+/**
+ * Insert an embed at the caret. `EmbeddedFileNode` is block-level, so it goes
+ * in as a sibling of the current top-level block with a trailing paragraph for
+ * the caret to land in. If that block is now empty (the typeahead stripped the
+ * trigger and the line held nothing else) it is dropped, so the embed doesn't
+ * sit under a blank line.
+ */
+function $insertEmbedBlock(
+  selection: RangeSelection,
+  embed: { src: string; label: string; attrs: Record<string, string> },
+): void {
+  const embedNode = $createEmbeddedFileNode(embed);
+  const block = selection.anchor.getNode().getTopLevelElementOrThrow();
+  block.insertAfter(embedNode);
+  const trailing = $createParagraphNode();
+  embedNode.insertAfter(trailing);
+  trailing.select();
+  if (block.getChildrenSize() === 0) {
+    block.remove();
+  }
+}
 
 /**
  * Truncate a path for display, keeping the most relevant parts visible.
@@ -136,6 +305,85 @@ function getWorkspaceFileAnchor(target: Node): HTMLAnchorElement | null {
   return isWorkspaceFileHref(anchor.getAttribute('href')) ? anchor : null;
 }
 
+function getAppActionHref(
+  target: Node,
+  editor: LexicalEditor,
+): string | null {
+  const targetElement =
+    typeof Element !== 'undefined' && target instanceof Element
+      ? target
+      : target.parentElement;
+  const anchor = targetElement?.closest('a[href]');
+  if (!(anchor instanceof HTMLAnchorElement)) {
+    return null;
+  }
+
+  const renderedHref = anchor.getAttribute('href');
+  if (isAppActionHref(renderedHref)) {
+    return renderedHref;
+  }
+
+  // Lexical sanitizes non-web LinkNode schemes to `about:blank` in the DOM.
+  // Read the authored URL from the backing node so the reserved app-action
+  // namespace can still be intercepted before ClickableLink opens it.
+  return editor.read(() => {
+    let lexicalNode = $getNearestNodeFromDOMNode(anchor);
+    while (lexicalNode && !$isLinkNode(lexicalNode)) {
+      lexicalNode = lexicalNode.getParent();
+    }
+    if (!$isLinkNode(lexicalNode)) {
+      return null;
+    }
+    const authoredHref = lexicalNode.getURL();
+    return isAppActionHref(authoredHref) ? authoredHref : null;
+  });
+}
+
+/**
+ * Put the authored path back on workspace-file anchors.
+ *
+ * Lexical builds a LinkNode's `href` with `sanitizeUrl` -> `formatUrl`, which
+ * prefixes any URL that lacks a scheme and doesn't start with `/`, `.`, or `#`
+ * with `https://`. So `[brief](documents/brief.md)` renders as
+ * `href="https://documents/brief.md"`, and every DOM-level consumer then reads
+ * it as an external web link — the renderer's global link handler sends it to
+ * the user's browser as a broken URL. The node keeps the authored URL, so
+ * markdown export is unaffected; only the rendered attribute is wrong.
+ */
+function registerWorkspaceFileHrefRepair(editor: LexicalEditor): () => void {
+  const repairKeys = (keys: Iterable<string>) => {
+    editor.getEditorState().read(() => {
+      for (const key of keys) {
+        const node = $getNodeByKey(key);
+        if (!$isLinkNode(node)) continue;
+        const authoredUrl = node.getURL();
+        if (!isWorkspaceFileHref(authoredUrl)) continue;
+        const element = editor.getElementByKey(key);
+        if (
+          element instanceof HTMLAnchorElement &&
+          element.getAttribute('href') !== authoredUrl
+        ) {
+          element.setAttribute('href', authoredUrl);
+        }
+      }
+    });
+  };
+
+  return editor.registerMutationListener(
+    LinkNode,
+    (mutations) => {
+      const changed: string[] = [];
+      for (const [key, mutation] of mutations) {
+        if (mutation !== 'destroyed') changed.push(key);
+      }
+      if (changed.length > 0) repairKeys(changed);
+    },
+    // Links present in the initial editor state (every markdown document that
+    // is opened, not just ones edited afterwards) must be repaired too.
+    { skipInitialization: false },
+  );
+}
+
 interface DocumentLinkPluginProps {
   documentService: DocumentService;
   TypeaheadMenuPlugin: React.ComponentType<any>;
@@ -144,9 +392,9 @@ interface DocumentLinkPluginProps {
   // Optional anchor element to render the menu within
   anchorElem?: HTMLElement | null;
   /**
-   * When set, the editor is a collaborative document: `@` suggests shared
-   * documents (from this source) instead of local workspace files, and
-   * reference clicks open the shared document. Absent for local documents.
+   * When set, `@` suggests this source's pages (instead of local workspace
+   * files, unless it sets `includeLocalFiles`), and reference clicks on its
+   * targets open the page. Absent: local files only.
    */
   collabReferenceSource?: CollabReferenceSource | null;
 }
@@ -162,9 +410,12 @@ export function DocumentLinkPlugin({
   const { documentPath: currentDocumentPath } = useDocumentPath();
   const [queryString, setQueryString] = useState<string>('');
   const [documents, setDocuments] = useState<ReferenceDoc[]>([]);
+  const localFilesRef = useRef<ReferenceDoc[]>([]);
   const menuOpenRef = useRef(false);
   const lastFetchTimeRef = useRef<number>(0);
   const CACHE_DURATION_MS = 5000; // 5 second cache
+
+  useEffect(() => registerWorkspaceFileHrefRepair(editor), [editor]);
 
   useEffect(() => {
     const handleDocumentReferenceClick = (event: MouseEvent, allowButton: (button: number) => boolean) => {
@@ -174,6 +425,23 @@ export function DocumentLinkPlugin({
 
       const target = event.target;
       if (!isDOMNode(target)) {
+        return;
+      }
+
+      const appActionHref = getAppActionHref(target, editor);
+      if (appActionHref) {
+        const selectionPreventsNavigation = editor
+          .getEditorState()
+          .read(() => {
+            const selection = $getSelection();
+            return $isRangeSelection(selection) && !selection.isCollapsed();
+          });
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (!selectionPreventsNavigation) {
+          dispatchAppActionHref(appActionHref);
+        }
         return;
       }
 
@@ -227,35 +495,35 @@ export function DocumentLinkPlugin({
       // collab URI) instead of a workspace-relative path. Route them through
       // the collab opener; the local document-service path would fail to
       // resolve them and could spawn a blank window.
+      if (collabReferenceSource && sourceOwnsTarget(collabReferenceSource, documentPath)) {
+        collabReferenceSource.openReference(documentPath!, { newTab: event.button === 1 || event.metaKey || event.ctrlKey });
+        return;
+      }
       if (isCollabReferenceHref(documentPath)) {
-        if (collabReferenceSource) {
-          collabReferenceSource.openReference(documentPath!);
-        } else {
-          console.warn('[DocumentLinkPlugin] Collab reference clicked with no collab source available', documentPath);
-        }
+        console.warn('[DocumentLinkPlugin] Collab reference clicked with no collab source available', documentPath);
         return;
       }
 
       const workspacePath = (window as unknown as { __workspacePath?: string }).__workspacePath ?? null;
-      const resolvedPath = documentPath
-        ? resolveDocumentLinkLookupPath(documentPath, currentDocumentPath, workspacePath)
-        : undefined;
+      const candidatePaths = documentPath
+        ? resolveDocumentLinkLookupPaths(documentPath, currentDocumentPath, workspacePath)
+        : [];
+      const fallbackPath = candidatePaths[candidatePaths.length - 1];
 
       void (async () => {
-        const resolvedDoc = resolvedPath
-          ? await documentService.getDocumentByPath(resolvedPath)
-          : null;
-
-        if (resolvedDoc) {
-          await documentService.openDocument(resolvedDoc.id, {
-            path: resolvedDoc.path,
-          });
-          return;
+        for (const candidate of candidatePaths) {
+          const resolvedDoc = await documentService.getDocumentByPath(candidate);
+          if (resolvedDoc) {
+            await documentService.openDocument(resolvedDoc.id, {
+              path: resolvedDoc.path,
+            });
+            return;
+          }
         }
 
-        await documentService.openDocument(resolvedPath ? '' : (documentId ?? ''), {
-          path: resolvedPath ?? documentPath,
-          name: resolvedPath ? undefined : documentName,
+        await documentService.openDocument(fallbackPath ? '' : (documentId ?? ''), {
+          path: fallbackPath ?? documentPath,
+          name: fallbackPath ? undefined : documentName,
         });
       })().catch(error => {
           console.error('Failed to open document reference', error);
@@ -284,18 +552,22 @@ export function DocumentLinkPlugin({
 
   // Load documents only when menu opens, with cache
   const loadDocuments = useCallback(async () => {
-    // Collaborative document: suggest shared documents instead of local files.
-    // The source is already computed from live atoms, so no fetch/cache needed.
-    if (collabReferenceSource) {
-      const options = collabReferenceSource.listOptions();
-      setDocuments(options.map((opt): ReferenceDoc => ({
+    // A page: suggest the source's pages instead of local files. The source is
+    // already computed from live atoms, so no fetch/cache needed.
+    const pages = collabReferenceSource
+      ? collabReferenceSource.listOptions().map((opt): ReferenceDoc => ({
         id: opt.documentId,
         name: opt.title,
         // fuzzy matcher ranks on name + path; folder breadcrumb feeds path.
         path: opt.folderPath ?? '',
         collabTarget: opt.target,
         folderPath: opt.folderPath,
-      })));
+        collabEmbedType: opt.embedType,
+        collabIcon: opt.icon,
+      }))
+      : [];
+    if (collabReferenceSource && !collabReferenceSource.includeLocalFiles) {
+      setDocuments(pages);
       return;
     }
 
@@ -303,14 +575,16 @@ export function DocumentLinkPlugin({
     const timeSinceLastFetch = now - lastFetchTimeRef.current;
 
     // Skip fetch if cache is still valid
-    if (timeSinceLastFetch < CACHE_DURATION_MS && documents.length > 0) {
+    if (timeSinceLastFetch < CACHE_DURATION_MS && localFilesRef.current.length > 0) {
+      setDocuments([...pages, ...localFilesRef.current]);
       return;
     }
 
     const docs = await documentService.listDocuments();
-    setDocuments(docs);
+    localFilesRef.current = docs;
+    setDocuments([...pages, ...docs]);
     lastFetchTimeRef.current = now;
-  }, [documentService, documents.length, collabReferenceSource]);
+  }, [documentService, collabReferenceSource]);
 
   // triggerFn is provided by the host; ensure stable reference via useMemo
   const resolvedTriggerFn = useMemo(() => triggerFn, [triggerFn]);
@@ -334,7 +608,7 @@ export function DocumentLinkPlugin({
         secondaryText: truncatedPath || undefined,
         // Full path in tooltip for hover
         tooltip: doc.collabTarget ? (doc.folderPath || doc.name) : doc.path,
-        icon: <MaterialSymbol style={{ fontSize: 16, verticalAlign: 'middle' }} icon={doc.collabTarget ? 'groups' : 'description'}/>,
+        icon: <MaterialSymbol style={{ fontSize: 16, verticalAlign: 'middle' }} icon={doc.collabTarget ? (doc.collabIcon ?? 'groups') : 'description'}/>,
         // Don't use sections - removes the heavy uppercase headers
         // section: doc.workspace || 'Documents',
         keywords: [doc.name, doc.workspace, doc.path].filter(Boolean) as string[],
@@ -363,46 +637,20 @@ export function DocumentLinkPlugin({
       const doc = documents.find(d => d.id === docId);
       if (!doc) return;
 
-      // Collaborative reference: insert a reference node whose target is the
-      // shared-doc link (deep link). No embeddable/file-path handling applies.
+      // Collaborative reference: the target is a shared-doc deep link.
       if (doc.collabTarget) {
-        const collabNode = $createDocumentReferenceNode(
-          doc.id,
-          doc.name,
-          doc.collabTarget
-        );
-        selection.insertNodes([collabNode]);
-        const trailingSpace = $createTextNode(' ');
-        collabNode.insertAfter(trailingSpace);
-        trailingSpace.select();
+        $insertCollabReference(selection, doc, doc.collabTarget);
         return;
       }
 
       // Markdown link paths always use forward slashes regardless of OS.
       const linkPath = doc.path.replace(/\\/g, '/');
 
-      // Embeddable files (e.g. `.excalidraw`) get inserted as block-level
-      // EmbeddedFileNodes so they render inline immediately. Other files
-      // use the existing inline DocumentReferenceNode.
+      // Embeddable files use a block; other references stay inline.
       if (isEmbeddableUrl(linkPath)) {
-        const embedNode = $createEmbeddedFileNode({
-          src: linkPath,
-          label: doc.name,
-          attrs: {},
-        });
-        // EmbeddedFileNode is block-level. Insert as a sibling of the
-        // current top-level block, then add a trailing paragraph so the
-        // caret has somewhere to land. If the original block is now empty
-        // (typeahead stripped the trigger and the line had nothing else),
-        // drop it so we don't leave a blank line above the embed.
-        const block = selection.anchor.getNode().getTopLevelElementOrThrow();
-        block.insertAfter(embedNode);
-        const trailing = $createParagraphNode();
-        embedNode.insertAfter(trailing);
-        trailing.select();
-        if (block.getChildrenSize() === 0) {
-          block.remove();
-        }
+        const workspacePath = (window as unknown as { __workspacePath?: string }).__workspacePath ?? null;
+        const src = createEmbedFileHref(linkPath, currentDocumentPath, workspacePath);
+        $insertEmbedBlock(selection, { src, label: doc.name, attrs: {} });
         return;
       }
 
@@ -413,35 +661,38 @@ export function DocumentLinkPlugin({
         doc.workspace
       );
 
-      // Typeahead has already removed the trigger text; just insert at caret
       selection.insertNodes([replacementNode]);
 
-      // Add a trailing space and place cursor after it
       const spaceNode = $createTextNode(' ');
       replacementNode.insertAfter(spaceNode);
       spaceNode.select();
     });
 
     closeMenu();
-  }, [editor, documents]);
+  }, [editor, documents, currentDocumentPath]);
 
   return (
-    <TypeaheadMenuPlugin
-      options={options}
-      triggerFn={resolvedTriggerFn}
-      onQueryChange={handleQueryChange}
-      onSelectOption={handleSelectOption}
-      anchorElem={anchorElem}
-      minWidth={350}
-      maxWidth={500}
-      maxHeight={400}
-      onOpen={() => {
-        menuOpenRef.current = true;
-        loadDocuments();
-      }}
-      onClose={() => {
-        menuOpenRef.current = false;
-      }}
-    />
+    <>
+      {collabReferenceSource && (
+        <CollabReferencePastePlugin collabReferenceSource={collabReferenceSource} />
+      )}
+      <TypeaheadMenuPlugin
+        options={options}
+        triggerFn={resolvedTriggerFn}
+        onQueryChange={handleQueryChange}
+        onSelectOption={handleSelectOption}
+        anchorElem={anchorElem}
+        minWidth={350}
+        maxWidth={500}
+        maxHeight={400}
+        onOpen={() => {
+          menuOpenRef.current = true;
+          loadDocuments();
+        }}
+        onClose={() => {
+          menuOpenRef.current = false;
+        }}
+      />
+    </>
   );
 }

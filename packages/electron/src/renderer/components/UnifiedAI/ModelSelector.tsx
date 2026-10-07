@@ -10,9 +10,12 @@ import {
   useInteractions,
   useRole,
 } from '@floating-ui/react';
+import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
 import { useAtomValue, useSetAtom } from 'jotai';
-import { MaterialSymbol, getProviderIcon } from '@nimbalyst/runtime';
-import { isAgentProvider, shouldBlockStartedSessionProviderSwitch } from '@nimbalyst/runtime/ai/server/types';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { getProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
+import { isAgentProvider, shouldBlockStartedSessionProviderSwitch, type AIModel } from '@nimbalyst/runtime/ai/server/types';
+import { registerClaudeCustomModelsFromCatalog } from '@nimbalyst/runtime/ai/claudeCustomModels';
 import { getClaudeCodeModelLabel } from '../../utils/modelUtils';
 import { advancedSettingsAtom, aiProviderSettingsAtom } from '../../store/atoms/appSettings';
 import { setWindowModeAtom } from '../../store/atoms/windowMode';
@@ -21,9 +24,9 @@ import type { SettingsCategory } from '../Settings/SettingsSidebar';
 import { AlphaBadge } from '../common/AlphaBadge';
 import { HelpTooltip } from '../../help';
 import { isDirectChatProvider, isProviderVisible } from '../../utils/chatProviderVisibility';
+import { useMenuTypeahead } from '../../hooks/useMenuTypeahead';
 
-const ALPHA_PROVIDERS = new Set(['opencode', 'copilot-cli']);
-const TYPEAHEAD_RESET_MS = 700;
+const ALPHA_PROVIDERS = new Set(['opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent']);
 
 interface Model {
   id: string;
@@ -34,6 +37,8 @@ interface Model {
 type ProviderType = 'agent' | 'model';
 
 interface ModelSelectorProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   currentModel: string;  // Full provider:model ID
   onModelChange: (modelId: string) => void;
   sessionHasMessages?: boolean;  // Whether current session has any messages
@@ -56,6 +61,8 @@ interface ModelSelectorProps {
 }
 
 export function ModelSelector({
+  open,
+  onOpenChange,
   currentModel,
   onModelChange,
   sessionHasMessages = false,
@@ -65,7 +72,12 @@ export function ModelSelector({
   openRequest,
   onKeyboardDismiss,
 }: ModelSelectorProps) {
-  const [isOpen, setIsOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const isOpen = open ?? internalOpen;
+  const setIsOpen = React.useCallback((value: boolean) => {
+    if (open === undefined) setInternalOpen(value);
+    else onOpenChange?.(value);
+  }, [open, onOpenChange]);
   const [models, setModels] = useState<Record<string, Model[]>>({});
   const [providerLabels, setProviderLabels] = useState<Record<string, string>>({});
   const [providerIcons, setProviderIcons] = useState<Record<string, string>>({});
@@ -77,8 +89,7 @@ export function ModelSelector({
   const navigateToSettings = useSetAtom(navigateToSettingsAtom);
   const menuRef = React.useRef<HTMLDivElement>(null);
   const lastOpenRequestRef = React.useRef(openRequest);
-  const typeaheadQueryRef = React.useRef('');
-  const typeaheadResetTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { getTypeaheadMatch, resetTypeahead } = useMenuTypeahead(isOpen);
   const { refs, floatingStyles, context } = useFloating({
     open: isOpen,
     onOpenChange: setIsOpen,
@@ -89,6 +100,7 @@ export function ModelSelector({
       offset(4),
       flip({ fallbackPlacements: ['bottom-start', 'top-end', 'bottom-end'], padding: 8 }),
       shift({ padding: 8 }),
+      windowControlsClearance(),
     ],
   });
   const dismiss = useDismiss(context, {
@@ -99,30 +111,14 @@ export function ModelSelector({
   const role = useRole(context, { role: 'menu' });
   const { getReferenceProps, getFloatingProps } = useInteractions([dismiss, role]);
 
-  React.useLayoutEffect(() => {
-    if (openRequest === undefined || openRequest === lastOpenRequestRef.current) return;
-    lastOpenRequestRef.current = openRequest;
-    setIsOpen(true);
-  }, [openRequest]);
-
-  // Clear cached models when provider settings change so next dropdown open fetches fresh data
-  useEffect(() => {
-    setModels({});
-  }, [providers]);
-
-  // Load models when dropdown opens
-  useEffect(() => {
-    if (isOpen && Object.keys(models).length === 0) {
-      loadModels();
-    }
-  }, [isOpen]);
-
-  const loadModels = async () => {
+  const loadModels = React.useCallback(async () => {
     setLoading(true);
     try {
       const response = await window.electronAPI.aiGetModels();
       if (response.success && response.grouped) {
         setModels(response.grouped);
+        // Labels and effort/thinking support for custom Claude gateway models.
+        registerClaudeCustomModelsFromCatalog(Object.values(response.grouped).flat() as AIModel[]);
         const meta = response as {
           providerLabels?: Record<string, string>;
           providerIcons?: Record<string, string>;
@@ -135,21 +131,22 @@ export function ModelSelector({
     } finally {
       setLoading(false);
     }
-  };
-
-  const resetTypeahead = React.useCallback(() => {
-    typeaheadQueryRef.current = '';
-    if (typeaheadResetTimerRef.current) {
-      clearTimeout(typeaheadResetTimerRef.current);
-      typeaheadResetTimerRef.current = null;
-    }
   }, []);
 
-  useEffect(() => resetTypeahead, [resetTypeahead]);
+  React.useLayoutEffect(() => {
+    if (openRequest === undefined || openRequest === lastOpenRequestRef.current) return;
+    lastOpenRequestRef.current = openRequest;
+    setIsOpen(true);
+  }, [openRequest, setIsOpen]);
 
+  // Preload before the user opens the picker. The main process serves its last
+  // successful catalog immediately and refreshes stale providers in the
+  // background, so mounting a new session input never turns a click into a
+  // network/CLI discovery boundary.
   useEffect(() => {
-    if (!isOpen) resetTypeahead();
-  }, [isOpen, resetTypeahead]);
+    setModels({});
+    void loadModels();
+  }, [providers, loadModels]);
 
   const handleModelSelect = (modelId: string) => {
     resetTypeahead();
@@ -212,41 +209,12 @@ export function ModelSelector({
       return;
     }
 
-    if (
-      event.key.length !== 1
-      || event.key.trim() === ''
-      || event.metaKey
-      || event.ctrlKey
-      || event.altKey
-      || event.nativeEvent.isComposing
-    ) return;
-
-    event.preventDefault();
-    typeaheadQueryRef.current += event.key.toLowerCase();
-
-    if (typeaheadResetTimerRef.current) clearTimeout(typeaheadResetTimerRef.current);
-    typeaheadResetTimerRef.current = setTimeout(resetTypeahead, TYPEAHEAD_RESET_MS);
-
-    const query = typeaheadQueryRef.current;
-    const matches = getEnabledModelOptions()
-      .map(option => {
-        const name = option.dataset.modelName?.toLowerCase() ?? '';
-        const id = option.dataset.modelId?.toLowerCase() ?? '';
-        const searchable = `${name} ${id}`;
-        const tokens = searchable.split(/[^a-z0-9]+/).filter(Boolean);
-        const score = name.startsWith(query)
-          ? 0
-          : tokens.some(token => token.startsWith(query))
-            ? 1
-            : searchable.includes(query)
-              ? 2
-              : -1;
-        return { option, score };
-      })
-      .filter(match => match.score >= 0)
-      .sort((a, b) => a.score - b.score);
-
-    matches[0]?.option.focus();
+    const options = getEnabledModelOptions();
+    const match = getTypeaheadMatch(event, options.map(option => ({
+      label: option.dataset.modelName ?? '',
+      keywords: option.dataset.modelId,
+    })));
+    options[match]?.focus();
   };
 
   const getSettingsCategoryForModel = (modelId: string): SettingsCategory => {
@@ -258,6 +226,9 @@ export function ModelSelector({
       case 'openai-codex':
       case 'opencode':
       case 'copilot-cli':
+      case 'grok-build':
+      case 'cursor-agent':
+      case 'antigravity-gemini-agent':
       case 'lmstudio':
         return provider;
       case 'openai-codex-acp':
@@ -305,13 +276,19 @@ export function ModelSelector({
     if (providerLabels[provider]) return providerLabels[provider];
     switch (provider) {
       case 'claude': return 'Claude Chat';
-      case 'claude-code': return 'Claude Agent (Claude Code Based)';
-      case 'claude-code-cli': return 'Claude Code CLI (Subscription)';
+      // The default agent, and the one a Claude subscription runs on without any
+      // extra setup. What it's built on lives in the hover help, so the
+      // parenthetical here is spent steering the choice instead.
+      case 'claude-code': return 'Claude Agent (Recommended)';
+      case 'claude-code-cli': return 'Claude Code CLI';
       case 'openai': return 'OpenAI';
       case 'openai-codex': return 'OpenAI Codex';
       case 'openai-codex-acp': return 'OpenAI Codex (ACP)';
       case 'opencode': return 'OpenCode';
       case 'copilot-cli': return 'GitHub Copilot';
+      case 'grok-build': return 'Grok Build';
+      case 'cursor-agent': return 'Cursor Agent';
+      case 'antigravity-gemini-agent': return 'Gemini';
       case 'lmstudio': return 'LMStudio';
       default: {
         // Extension-contributed providers carry their contribution id here
@@ -406,7 +383,7 @@ export function ModelSelector({
         aria-label={`Current model: ${getCurrentModelName()}`}
         data-testid="model-picker"
         {...getReferenceProps({
-          onClick: () => setIsOpen(open => !open),
+          onClick: () => setIsOpen(!isOpen),
         })}
       >
         <span className="model-selector-label overflow-hidden text-ellipsis">{getCurrentModelName()}</span>

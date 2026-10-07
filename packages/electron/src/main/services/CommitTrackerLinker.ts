@@ -4,18 +4,33 @@
  * Three linking mechanisms:
  * 1. Session-based: After proposal-widget commits, links to session's tracker items
  * 2. Issue key parsing: Parses NIM-123 from any commit message detected by GitRefWatcher
- * 3. Auto-close: Fixes/Closes/Resolves keywords change tracker item status to "done"
+ * 3. Auto-close: Fixes/Closes/Resolves keywords move the item to whichever status
+ *    its own type completes on (see `trackerStatusCategory`)
  *
- * All behaviors gated by TrackerAutomation settings (opt-in, per-project overridable).
+ * The passive GitRefWatcher path is opt-in (`enabled`, per-project overridable),
+ * because it reacts to every commit in the repo including ones no agent was part
+ * of. The session path is not: the user linked the session to the item and then
+ * approved a commit message that says it closes the item, which is as explicit a
+ * sign-off as exists. Only `autoCloseOnCommit` gates it.
  */
 
-import Store from 'electron-store';
+import { execFile } from 'child_process';
+import Store from '../utils/privateSettingsStore';
 import { logger } from '../utils/logger';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
+import { isLocalIssueKey } from '../../shared/localIssueKey';
 import type { CommitDetectedEvent } from '../file/GitRefWatcher';
 import type { TrackerAutomationSettings } from '../utils/store';
 import { getEffectiveTrackerAutomation } from '../utils/store';
+import { getCurrentIdentity } from './TrackerIdentityService';
+import { appendActivity } from './tracker/trackerActivity';
 import type { LinkedCommit } from '@nimbalyst/runtime';
+import type { TrackerIdentity } from '@nimbalyst/runtime/core/DocumentService';
+import {
+  getDoneStatusValue,
+  getWorkflowStatusFieldName,
+  isTerminalStatus,
+} from '@nimbalyst/tracker-schema';
 
 // ---------------------------------------------------------------------------
 // Issue key parsing
@@ -46,6 +61,14 @@ export function parseIssueKeys(commitMessage: string, prefix?: string): IssueKey
     const closingKeyword = match[1];
     const issueKey = match[2].toUpperCase();
 
+    // A provisional local key is not a real issue reference -- it exists only
+    // until the tracker room acks the item and hands back its own key. Closing
+    // an item off one would resolve to whatever LC-### happens to be unclaimed
+    // in the reader's workspace.
+    if (isLocalIssueKey(issueKey)) {
+      continue;
+    }
+
     // If a prefix filter is provided, only match that prefix
     if (prefix && !issueKey.startsWith(prefix.toUpperCase() + '-')) {
       continue;
@@ -73,6 +96,67 @@ export function getIssueKeyPrefix(issueKey: string | null | undefined): string |
   if (separatorIndex <= 0) return undefined;
 
   return trimmed.slice(0, separatorIndex).toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// Commit author
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a commit's author name and email. The callback form of `execFile` is
+ * used rather than `promisify` so a mocked `execFile` still sees the call.
+ */
+function readCommitAuthor(
+  workspacePath: string,
+  commitHash: string,
+): Promise<{ name: string; email: string } | null> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['show', '-s', '--format=%an%n%ae', commitHash],
+      { cwd: workspacePath },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const [name = '', email = ''] = String(stdout).split('\n').map((line) => line.trim());
+        resolve(name || email ? { name, email } : null);
+      },
+    );
+  });
+}
+
+function sameEmail(left: string | null | undefined, right: string | null | undefined): boolean {
+  return Boolean(left && right && left.trim().toLowerCase() === right.trim().toLowerCase());
+}
+
+/**
+ * Who to attribute a commit-driven activity entry to.
+ *
+ * The local identity wins whenever the commit's author is this machine's git
+ * user: it carries the signed-in email and display name, which is what every
+ * other activity writer stamps, so the entry coalesces and filters with them.
+ * A commit by anyone else is attributed to its author from git, and a commit
+ * whose author cannot be read at all falls back to the local identity rather
+ * than going unattributed.
+ */
+async function resolveCommitAuthorIdentity(
+  workspacePath: string,
+  commitHash: string,
+): Promise<TrackerIdentity> {
+  const local = getCurrentIdentity(workspacePath);
+  const author = await readCommitAuthor(workspacePath, commitHash);
+  if (!author) return local;
+  if (sameEmail(author.email, local.gitEmail) || sameEmail(author.email, local.email)) {
+    return local;
+  }
+  return {
+    email: author.email || null,
+    displayName: author.name || author.email,
+    gitName: author.name || null,
+    gitEmail: author.email || null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -121,16 +205,23 @@ export class CommitTrackerLinker {
    * Always runs when a session has linked tracker items -- no opt-in required.
    * The user already explicitly linked the session to tracker items via tracker_link_session,
    * so linking the commit back is the expected, natural behavior.
+   *
+   * A closing keyword in the approved message ("Fixes NIM-123") also promotes
+   * that item to `done`. An agent may not write `done` itself, so without this
+   * every finished bug stalls in `in-review` even after the user has reviewed
+   * the diff and committed it. A bare `NIM-123` still only links.
+   *
+   * @returns ids of the items this commit closed (empty when it closed none)
    */
   async linkBySession(
     commitHash: string,
     commitMessage: string,
     sessionId: string,
     workspacePath: string,
-  ): Promise<void> {
+  ): Promise<{ closedItemIds: string[] }> {
 
     const db = this.getDb();
-    if (!db) return;
+    if (!db) return { closedItemIds: [] };
 
     try {
       // Look up session's linked tracker items
@@ -139,7 +230,7 @@ export class CommitTrackerLinker {
         [sessionId]
       );
 
-      if (sessionResult.rows.length === 0) return;
+      if (sessionResult.rows.length === 0) return { closedItemIds: [] };
 
       // SQLite returns metadata as a raw JSON string (NIM-829); an unparsed
       // read sees no linked items and session-based commit linking no-ops.
@@ -147,7 +238,9 @@ export class CommitTrackerLinker {
       const linkedTrackerItemIds: string[] = Array.isArray(metadata.linkedTrackerItemIds)
         ? metadata.linkedTrackerItemIds
         : [];
-      if (linkedTrackerItemIds.length === 0) return;
+      // Skip file: references (these are plan file links, not tracker item IDs)
+      const trackerIds = linkedTrackerItemIds.filter((id) => !id.startsWith('file:'));
+      if (trackerIds.length === 0) return { closedItemIds: [] };
 
       const commit: LinkedCommit = {
         sha: commitHash,
@@ -156,13 +249,29 @@ export class CommitTrackerLinker {
         timestamp: new Date().toISOString(),
       };
 
-      for (const trackerId of linkedTrackerItemIds) {
-        // Skip file: references (these are plan file links, not tracker item IDs)
-        if (trackerId.startsWith('file:')) continue;
+      for (const trackerId of trackerIds) {
         await this.appendCommitToItem(trackerId, commit, workspacePath);
       }
+
+      if (!this.getSettings(workspacePath).autoCloseOnCommit) {
+        return { closedItemIds: [] };
+      }
+
+      const closingKeys = new Set(
+        parseIssueKeys(commitMessage)
+          .filter((match) => match.shouldClose)
+          .map((match) => match.issueKey),
+      );
+      if (closingKeys.size === 0) return { closedItemIds: [] };
+
+      const closedItemIds = await this.resolveClosableIds(trackerIds, closingKeys, workspacePath);
+      for (const itemId of closedItemIds) {
+        await this.closeTrackerItem(itemId, commitHash, workspacePath);
+      }
+      return { closedItemIds };
     } catch (error) {
       logger.main.error('[CommitTrackerLinker] Error linking by session:', error);
+      return { closedItemIds: [] };
     }
   }
 
@@ -290,7 +399,38 @@ export class CommitTrackerLinker {
   }
 
   /**
-   * Set a tracker item's status to "done" via a commit closing keyword.
+   * Of the session's linked items, which ones does this message name with a
+   * closing keyword. One query rather than one per linked id -- a long-running
+   * session can accumulate a lot of linked items.
+   */
+  private async resolveClosableIds(
+    trackerIds: string[],
+    closingKeys: Set<string>,
+    workspacePath: string,
+  ): Promise<string[]> {
+    const db = this.getDb();
+    if (!db) return [];
+
+    const placeholders = trackerIds.map((_, index) => `$${index + 2}`).join(', ');
+    const result = await db.query(
+      `SELECT id, issue_key FROM tracker_items
+       WHERE workspace = $1 AND id IN (${placeholders})`,
+      [workspacePath, ...trackerIds]
+    );
+
+    return (result.rows as Array<{ id: string; issue_key?: string | null }>)
+      .filter((row) => typeof row.issue_key === 'string' && closingKeys.has(row.issue_key.toUpperCase()))
+      .map((row) => row.id);
+  }
+
+  /**
+   * Close a tracker item via a commit closing keyword.
+   *
+   * The status written is the one the item's OWN type closes into, not the
+   * literal `'done'`. Every type ends on a different value -- a plan on
+   * `completed`, a release on `released` -- so hardcoding `'done'` stamped a
+   * status that was not in the type's option list at all, surviving only
+   * because the validator downgrades unknown select values to warnings.
    */
   private async closeTrackerItem(
     itemId: string,
@@ -301,7 +441,7 @@ export class CommitTrackerLinker {
     if (!db) return;
 
     const result = await db.query(
-      `SELECT data FROM tracker_items WHERE id = $1 AND workspace = $2`,
+      `SELECT type, data FROM tracker_items WHERE id = $1 AND workspace = $2`,
       [itemId, workspacePath]
     );
     if (result.rows.length === 0) return;
@@ -310,26 +450,37 @@ export class CommitTrackerLinker {
       ? JSON.parse(result.rows[0].data)
       : result.rows[0].data || {};
 
-    if (data.status === 'done') return; // Already closed
+    const type = String(result.rows[0].type ?? data.type ?? '');
+    const statusField = getWorkflowStatusFieldName(type);
+    const oldStatus = data[statusField];
 
-    const oldStatus = data.status;
-    data.status = 'done';
+    // Already terminal -- including cancelled. A commit must not reopen an
+    // abandoned item by "closing" it.
+    if (isTerminalStatus(type, oldStatus)) return;
 
-    // Add activity log entry
-    const activity: any[] = data.activity || [];
-    activity.push({
-      action: 'status_changed',
-      field: 'status',
+    const closingStatus = getDoneStatusValue(type);
+    if (!closingStatus) {
+      // A type with no done-category status (an idea ends cancelled or
+      // converted, never "done") cannot be closed by a commit. Leaving the
+      // status alone is right; inventing one is how the out-of-schema write
+      // this method used to make got started.
+      logger.main.info(
+        `[CommitTrackerLinker] ${itemId} (${type}) has no completed status; leaving it open`,
+      );
+      return;
+    }
+
+    data[statusField] = closingStatus;
+
+    // Through the shared writer, never a raw push: sync merges the trail on
+    // entry `id` and sorts on a numeric `timestamp`, so a hand-built entry
+    // collapses with its siblings the first time the item syncs.
+    appendActivity(data, await resolveCommitAuthorIdentity(workspacePath, commitHash), 'status_changed', {
+      field: statusField,
       oldValue: oldStatus,
-      newValue: 'done',
-      timestamp: new Date().toISOString(),
+      newValue: closingStatus,
       note: `Closed via commit ${commitHash.slice(0, 7)}`,
     });
-    // Cap activity at 100
-    if (activity.length > 100) {
-      activity.splice(0, activity.length - 100);
-    }
-    data.activity = activity;
 
     await db.query(
       `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,

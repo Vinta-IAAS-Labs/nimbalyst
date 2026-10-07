@@ -1,5 +1,6 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { getFolderContents } from '../FileTree';
+import { getFolderContents, listFolderFilesRecursive } from '../FileTree';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -13,6 +14,16 @@ describe('FileTree All Files Mode', () => {
 
     afterEach(() => {
         fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('discards a scan cancelled while directory I/O is pending', async () => {
+        fs.mkdirSync(path.join(tempDir, 'nested'));
+        fs.writeFileSync(path.join(tempDir, 'nested', 'document.md'), '# test');
+        const controller = new AbortController();
+        const scan = getFolderContents(tempDir, 0, controller.signal);
+        controller.abort();
+        expect(await scan).toEqual([]);
+        expect((await getFolderContents(tempDir))[0].children).toHaveLength(1);
     });
 
     it('should return all folders including those without known file extensions', async () => {
@@ -133,6 +144,45 @@ describe('FileTree All Files Mode', () => {
         expect(names).not.toContain('node_modules');
         expect(names).not.toContain('.git');
         expect(names).not.toContain('.venv');
+    });
+});
+
+describe('listFolderFilesRecursive', () => {
+    let tempDir: string;
+
+    beforeEach(() => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'filetree-recursive-'));
+    });
+
+    afterEach(() => {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('returns folder-relative paths at any depth and prunes excluded directories', async () => {
+        fs.mkdirSync(path.join(tempDir, 'a', 'b', 'c'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'node_modules'));
+        fs.writeFileSync(path.join(tempDir, 'root.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'a', 'one.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'a', 'b', 'c', 'deep.md'), '');
+        fs.writeFileSync(path.join(tempDir, 'node_modules', 'ignored.md'), '');
+
+        const result = await listFolderFilesRecursive(tempDir);
+
+        expect(result.files).toEqual(['a/b/c/deep.md', 'a/one.md', 'root.md']);
+        expect(result.truncated).toBe(false);
+    });
+
+    it('reports truncation rather than silently dropping files past the cap', async () => {
+        // The sidebar walk caps at 200 per directory with no signal. A share
+        // promote that dropped files without saying so would look complete.
+        for (let index = 0; index < 12; index += 1) {
+            fs.writeFileSync(path.join(tempDir, `file-${index}.md`), '');
+        }
+
+        const result = await listFolderFilesRecursive(tempDir, { limit: 5 });
+
+        expect(result.files).toHaveLength(5);
+        expect(result.truncated).toBe(true);
     });
 });
 

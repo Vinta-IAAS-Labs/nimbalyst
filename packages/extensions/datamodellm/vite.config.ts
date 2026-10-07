@@ -35,9 +35,10 @@ export default defineConfig({
         'react-dom',
         'react/jsx-runtime',
         'react/jsx-dev-runtime',
-        // Lexical - extensions contribute nodes to host's editor
-        'lexical',
-        /^@lexical\//,
+        // No Lexical externals: this extension contributes no editor nodes.
+        // Inline embedding of a data model in a markdown document goes through
+        // the host's editor-neutral EmbeddedFileNode, which needs nothing from
+        // this bundle beyond the `.prisma` custom editor contribution.
         // Nimbalyst services
         /^@nimbalyst\/runtime/,
         '@nimbalyst/editor-context',
@@ -47,7 +48,7 @@ export default defineConfig({
         'yjs',
         /^y-protocols(\/.*)?$/,
       ],
-      // NOTE: zustand, html2canvas, @xyflow/react are bundled by the extension
+      // NOTE: zustand, @xyflow/react are bundled by the extension
       // This gives the extension control over its own versions
       output: {
         // Provide global variables for externals

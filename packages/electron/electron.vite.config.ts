@@ -1,11 +1,17 @@
 import { resolve } from 'path'
+import { createRequire } from 'node:module'
 import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import viteNimbalystPlugin from '../shared/viteNimbalystPlugin.ts'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
-import { nodePolyfills } from 'vite-plugin-node-polyfills'
+import inject from '@rollup/plugin-inject'
 import fs from 'fs'
 import { findMainBundleGraphViolations } from '../../scripts/main-bundle-graph-policy.mjs'
+import {
+  findRequireCacheSelfEviction,
+  stripRequireCacheSelfEviction,
+} from '../../scripts/main-bundle-require-policy.mjs'
+import dedupeWatcherAddsPlugin from './scripts/dedupeWatcherAddsPlugin.mjs'
 
 // Plugin to optimize Shiki language imports
 const optimizeShikiPlugin = () => {
@@ -111,10 +117,39 @@ const claudeAgentSdkVersion = (() => {
   }
   return 'unknown';
 })();
+const trackerSchemaSrcDir = resolve(__dirname, '../tracker-schema/src');
+const trackerEngineSrcDir = resolve(__dirname, '../tracker-engine/src');
+const trackerCoreSrcDir = resolve(__dirname, '../tracker-core/src');
+const collabProtocolSrcDir = resolve(__dirname, '../collab-protocol/src');
 const runtimeSrcDir = resolve(__dirname, '../runtime/src');
+const configRequire = createRequire(resolve(__dirname, 'package.json'));
+
+// Locates a file inside an installed package the way Node would from this
+// package, bypassing the package's `exports` map (several of these do not
+// export the asset we copy). Throws so a missing asset fails the build instead
+// of shipping an app without it.
+function installedPackageFile(pkg: string, file: string): string {
+  for (const dir of configRequire.resolve.paths(pkg) ?? []) {
+    const candidate = resolve(dir, pkg, file);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(`[electron.vite.config] ${pkg}/${file} is not installed`);
+}
+const browserPath = configRequire.resolve('path-browserify/index.js');
+const browserProcess = configRequire.resolve('process/browser.js');
 const runtimeDistDir = resolve(__dirname, '../runtime/dist');
 const runtimeElectronMainEntry = resolve(runtimeSrcDir, 'electronMain.ts');
-const extensionSdkElectronMainEntry = resolve(__dirname, '../extension-sdk/src/electronMain.ts');
+const extensionSdkSrcDir = resolve(__dirname, '../extension-sdk/src');
+const extensionSdkElectronMainEntry = resolve(extensionSdkSrcDir, 'electronMain.ts');
+/**
+ * `@nimbalyst/extension-sdk` is not a declared dependency of this package, so a
+ * subpath import would otherwise resolve through the workspace symlink into
+ * `dist/` and silently serve a stale build. Point the subpaths this app imports
+ * at source, matching what tsconfig's `paths` already typechecks against.
+ */
+const extensionSdkSourceSubpaths = [
+  { find: /^@nimbalyst\/extension-sdk\/git-operation-log$/, replacement: resolve(extensionSdkSrcDir, 'gitOperationLog.ts') },
+];
 
 // Plugin to resolve workspace package subpaths correctly in production
 const resolveWorkspaceSubpaths = () => {
@@ -160,7 +195,100 @@ const guardMainBundleGraph = () => ({
   },
 });
 
-export default defineConfig({
+/**
+ * `conf` (via electron-store) ships `delete require.cache[__filename]`. In its
+ * own module that removes only conf's entry; inlined into our bundle,
+ * `__filename` is the main entry, so the entry evicts ITSELF from the module
+ * cache at startup. Any lazy chunk then re-enters via `require("../index.js")`,
+ * re-evaluates the whole main process, and dies re-registering electron-log.
+ *
+ * Strip it at the source module, then assert nothing put it back into the
+ * emitted output. See scripts/main-bundle-require-policy.mjs and #1389.
+ */
+const neutralizeRequireCacheSelfEviction = () => {
+  let stripped = 0;
+  return {
+    name: 'neutralize-require-cache-self-eviction',
+    transform(code: string, id: string) {
+      if (!id.replace(/\\/g, '/').includes('/node_modules/conf/')) return null;
+      const result = stripRequireCacheSelfEviction(code);
+      if (result.count === 0) return null;
+      stripped += result.count;
+      return { code: result.code, map: null };
+    },
+    generateBundle(
+      this: { error(message: string): never },
+      _options: unknown,
+      bundle: Record<string, { type: string; code?: string; fileName: string }>,
+    ) {
+      const offenders = Object.values(bundle)
+        .filter((output) => output.type === 'chunk'
+          && findRequireCacheSelfEviction(output.code ?? '').length > 0)
+        .map((output) => output.fileName);
+      if (offenders.length > 0) {
+        this.error(
+          'Electron main bundle still evicts itself from require.cache ' +
+          `(delete require.cache[__filename]) in: ${offenders.join(', ')}.\n` +
+          'A lazy chunk requiring the entry will then evaluate the main process ' +
+          'twice. Extend stripRequireCacheSelfEviction to cover the new source.',
+        );
+      }
+      console.log(`[require-policy] main entry keeps its require.cache entry (${stripped} self-eviction(s) stripped).`);
+    },
+  };
+};
+
+/**
+ * jimp 1.6.1 moved `@jimp/core` onto `file-type ^21`, which it reaches with
+ * `await import("file-type")` inside `Jimp.fromBuffer` — so every image read in
+ * the main process went through a lazy chunk. Rewrite it to a static import so
+ * the image path stays in the main chunk, per the no-dynamic-imports-in-main
+ * rule. #1389.
+ */
+const staticFileTypeInJimp = () => {
+  let rewrites = 0;
+  let sawJimpCore = false;
+  return {
+    name: 'static-file-type-in-jimp',
+    transform(code: string, id: string) {
+      const normalized = id.replace(/\\/g, '/');
+      if (!/\/node_modules\/@jimp\/core\/dist\/(esm|commonjs)\/index\.js$/.test(normalized)) {
+        return null;
+      }
+      sawJimpCore = true;
+      const dynamicImport = /await\s+import\(\s*["']file-type["']\s*\)/g;
+      if (!dynamicImport.test(code)) return null;
+      rewrites += 1;
+      if (normalized.includes('/dist/esm/')) {
+        return {
+          code: 'import * as __nimbalystFileType from "file-type";\n'
+            + code.replace(dynamicImport, '__nimbalystFileType'),
+          map: null,
+        };
+      }
+      return { code: code.replace(dynamicImport, 'require("file-type")'), map: null };
+    },
+    buildEnd(this: { error(message: string): never }, error?: Error) {
+      if (error) return;
+      if (sawJimpCore && rewrites === 0) {
+        this.error(
+          '@jimp/core is in the main bundle but its `await import("file-type")` was not ' +
+          'found, so this rewrite silently did nothing. jimp probably changed how it ' +
+          'loads file-type — re-read @jimp/core/dist/esm/index.js and update the pattern, ' +
+          'or drop this plugin if the dynamic import is gone. See #1389.',
+        );
+      }
+    },
+  };
+};
+
+// `dev-loop.sh` keeps the renderer dev server alive across `/restart` in its
+// own process (scripts/renderer-dev-server.mjs), so the per-restart
+// `electron-vite dev` builds main and preload only. Without this, every restart
+// recompiled ~2,600 renderer modules cold, ~30s before any window could paint.
+const externalRenderer = process.env.NIMBALYST_EXTERNAL_RENDERER === '1';
+
+const config = {
   main: {
     define: {
       'process.env.OFFICIAL_BUILD': JSON.stringify(isOfficialBuild ? 'true' : 'false'),
@@ -172,6 +300,8 @@ export default defineConfig({
     plugins: [
       resolveWorkspaceSubpaths(),
       guardMainBundleGraph(),
+      neutralizeRequireCacheSelfEviction(),
+      staticFileTypeInJimp(),
       {
         name: 'copy-sqlite-schemas',
         // Use options.dir so this works regardless of the active outDir
@@ -201,13 +331,19 @@ export default defineConfig({
         { find: /^@nimbalyst\/runtime$/, replacement: runtimeElectronMainEntry },
         // Explicit subpath imports still resolve straight to runtime source.
         { find: '@nimbalyst/runtime', replacement: runtimeSrcDir },
+        { find: '@nimbalyst/tracker-core', replacement: trackerCoreSrcDir },
+        { find: '@nimbalyst/tracker-schema', replacement: trackerSchemaSrcDir },
+        { find: '@nimbalyst/tracker-engine', replacement: trackerEngineSrcDir },
+        { find: '@nimbalyst/collab-protocol', replacement: collabProtocolSrcDir },
         // The public SDK barrel includes renderer hooks which import the public
         // runtime barrel. Main only needs validation and protocol helpers.
         { find: /^@nimbalyst\/extension-sdk$/, replacement: extensionSdkElectronMainEntry },
+        ...extensionSdkSourceSubpaths,
       ]
     },
     build: {
-      target: 'node16',
+      // Target modern Node syntax supported by the bundled Electron runtime.
+      target: 'node22',
       sourcemap: isDev,
       rollupOptions: {
         input: {
@@ -246,7 +382,10 @@ export default defineConfig({
   preload: {
     resolve: {
       alias: {
-        '@nimbalyst/runtime': runtimeSrcDir
+        '@nimbalyst/runtime': runtimeSrcDir,
+        '@nimbalyst/tracker-core': trackerCoreSrcDir,
+        '@nimbalyst/tracker-schema': trackerSchemaSrcDir,
+        '@nimbalyst/tracker-engine': trackerEngineSrcDir
       }
     },
     build: {
@@ -254,7 +393,11 @@ export default defineConfig({
       sourcemap: isDev,
       rollupOptions: {
         input: {
-          index: resolve(__dirname, 'src/preload/index.ts')
+          index: resolve(__dirname, 'src/preload/index.ts'),
+          // The hidden window that encodes an animation to H.264. A separate
+          // entry because it must not carry the main preload's surface into a
+          // window whose only job is to hold a VideoEncoder.
+          animationVideo: resolve(__dirname, 'src/preload/animationVideo.ts')
         }
       }
     }
@@ -268,18 +411,7 @@ export default defineConfig({
       '__CLAUDE_AGENT_SDK_VERSION__': JSON.stringify(claudeAgentSdkVersion),
     },
     plugins: [
-      // Process polyfill for packaged builds - handles dependencies that access process globals.
-      // Must be first so transforms run before other plugins.
-      // Only polyfills in production builds; dev mode works fine with Vite's built-in handling.
-      nodePolyfills({
-        globals: {
-          Buffer: false,
-          global: false,
-          process: 'build',
-        },
-        include: [],
-        protocolImports: false,
-      }),
+      dedupeWatcherAddsPlugin(),
       // The Anthropic SDK's agent-toolset (server-side file tools, added in
       // @anthropic-ai/sdk 0.100.x) is dragged into the renderer bundle via the
       // runtime barrel (ai/models.ts value-imports the SDK for the model
@@ -326,7 +458,15 @@ export default defineConfig({
         };
       })(),
       viteNimbalystPlugin(),
-      react(),
+      // The debug-label plugin names every module-level atom and atomFamily
+      // (`fooAtom.debugLabel = 'fooAtom'`). Without it the atom-write profiler
+      // and the Developer Dashboard's AtomFamily tab can only show `atom42` /
+      // `(unnamed)`. Dev only — it adds an assignment per atom declaration.
+      react(
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : { babel: { plugins: ['jotai/babel/plugin-debug-label'] } },
+      ),
       optimizeExcalidrawPlugin(),
       optimizeShikiPlugin(),
       // Monaco workers are configured in monacoConfig.ts using Vite's native ?worker imports
@@ -340,6 +480,7 @@ export default defineConfig({
         const icon = resolve(__dirname, 'icon.png');
         const logo = resolve(__dirname, 'nimbalyst-logo.png');
         const about = resolve(__dirname, 'about.html');
+        const animationVideo = resolve(__dirname, 'animation-video.html');
         const onboardingDir = resolve(__dirname, 'resources/onboarding');
 
         if (fs.existsSync(icon)) {
@@ -351,20 +492,19 @@ export default defineConfig({
         if (fs.existsSync(about)) {
           targets.push({ src: toPosix(about), dest: '', overwrite: true });
         }
+        if (fs.existsSync(animationVideo)) {
+          targets.push({ src: toPosix(animationVideo), dest: '', overwrite: true });
+        }
         // Copy onboarding images for feature walkthrough
         if (fs.existsSync(onboardingDir)) {
           targets.push({ src: toPosix(resolve(onboardingDir, '*')), dest: 'onboarding', overwrite: true });
         }
         // Copy es-module-shims for extension loading (enables dynamic import maps)
-        const esModuleShims = resolve(__dirname, '../../node_modules/es-module-shims/dist/es-module-shims.js');
-        if (fs.existsSync(esModuleShims)) {
-          targets.push({ src: toPosix(esModuleShims), dest: '', overwrite: true });
-        }
+        const esModuleShims = installedPackageFile('es-module-shims', 'dist/es-module-shims.js');
+        targets.push({ src: toPosix(esModuleShims), dest: '', overwrite: true });
         // Copy ghostty-web WASM file for terminal emulation
-        const ghosttyWasm = resolve(__dirname, '../../node_modules/ghostty-web/ghostty-vt.wasm');
-        if (fs.existsSync(ghosttyWasm)) {
-          targets.push({ src: toPosix(ghosttyWasm), dest: '', overwrite: true });
-        }
+        const ghosttyWasm = installedPackageFile('ghostty-web', 'ghostty-vt.wasm');
+        targets.push({ src: toPosix(ghosttyWasm), dest: '', overwrite: true });
         // Copy prismjs core so index.html can load it as a classic <script>
         // BEFORE any ESM module evaluates. Vite/esbuild's prebundling of
         // @lexical/code (which transitively imports @lexical/code-prism) ends
@@ -372,10 +512,8 @@ export default defineConfig({
         // before prismjs main, which the language files need to have set
         // `window.Prism`. Loading prismjs as a classic script in the HTML
         // sidesteps the reorder.
-        const prismCore = resolve(__dirname, '../../node_modules/prismjs/prism.js');
-        if (fs.existsSync(prismCore)) {
-          targets.push({ src: toPosix(prismCore), dest: '', overwrite: true });
-        }
+        const prismCore = installedPackageFile('prismjs', 'prism.js');
+        targets.push({ src: toPosix(prismCore), dest: '', overwrite: true });
         return viteStaticCopy({ targets });
       })()
     ].filter(Boolean),
@@ -404,15 +542,24 @@ export default defineConfig({
       target: 'chrome109',
       sourcemap: isDev,
       rollupOptions: {
+        // Rollup options also reach worker builds; inject only the free identifier.
+        plugins: [inject({ process: browserProcess })],
         input: {
-          index: resolve(__dirname, 'src/renderer/index.html')
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          island: resolve(__dirname, 'src/renderer/island.html'),
         }
       }
     },
     resolve: {
       alias: [
+        { find: /^path$/, replacement: browserPath },
+        { find: /^process$/, replacement: browserProcess },
         // Ensure renderer also points runtime imports at source
         { find: '@nimbalyst/runtime', replacement: runtimeSrcDir },
+        { find: '@nimbalyst/tracker-core', replacement: trackerCoreSrcDir },
+        { find: '@nimbalyst/tracker-schema', replacement: trackerSchemaSrcDir },
+        { find: '@nimbalyst/tracker-engine', replacement: trackerEngineSrcDir },
+        ...extensionSdkSourceSubpaths,
         // Redirect `import ... from 'prismjs'` (exact match only) to a shim
         // that returns the window.Prism instance loaded by the classic
         // <script> tag in index.html. Avoids a second IIFE run on the ESM
@@ -435,6 +582,7 @@ export default defineConfig({
         // which cause "registerNodeTransform: Type Class not in this Editor" errors
         '@lexical/clipboard',
         '@lexical/code',
+        '@lexical/code-core',
         '@lexical/devtools-core',
         '@lexical/dragon',
         '@lexical/file',
@@ -456,7 +604,10 @@ export default defineConfig({
         '@lexical/text',
         '@lexical/utils',
         '@lexical/yjs',
-        '@nimbalyst/runtime'
+        '@nimbalyst/runtime',
+        '@nimbalyst/tracker-schema',
+        '@nimbalyst/tracker-engine',
+        '@nimbalyst/tracker-core'
       ]
     },
     optimizeDeps: {
@@ -476,6 +627,7 @@ export default defineConfig({
         '@floating-ui/react',
         '@lexical/clipboard',
         '@lexical/code',
+        '@lexical/code-core',
         '@lexical/dragon',
         '@lexical/extension',
         '@lexical/hashtag',
@@ -529,6 +681,9 @@ export default defineConfig({
         '@lexical/utils',
         '@lexical/yjs',
         '@monaco-editor/react',
+        // Project Canvas loads lazily; without this entry Vite discovers React
+        // Flow mid-session, re-optimizes, and serves a second React.
+        '@xyflow/react',
         'diff',
         'electron-log/renderer',
         'fast-deep-equal',
@@ -591,6 +746,9 @@ export default defineConfig({
         '@shikijs/langs',
         'prettier',
         '@nimbalyst/runtime',
+        '@nimbalyst/tracker-schema',
+        '@nimbalyst/tracker-engine',
+        '@nimbalyst/tracker-core',
         // RevoGrid is a Stencil bundle: its runtime lazy-imports its own
         // component entry chunks at render time. Pre-bundled, those dynamic
         // imports are emitted WITHOUT a `?v=` query, so Vite re-transforms them
@@ -609,4 +767,6 @@ export default defineConfig({
       }
     }
   }
-})
+};
+
+export default defineConfig(externalRenderer ? { ...config, renderer: undefined } : config);

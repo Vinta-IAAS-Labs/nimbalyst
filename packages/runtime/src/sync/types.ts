@@ -5,8 +5,32 @@
  * It's designed to be completely optional - the app works without it.
  */
 
+import type { FleetActivitySnapshot, PushRejectionCause, SkipReason } from '@nimbalyst/collab-protocol';
+
 import type { AgentMessage } from '../ai/server/types';
+import type { PersonalJwt, PersonalMemberId } from '../auth/jwtScopes';
 import type { SyncedReadReceipt } from '../readReceipts/readReceipts';
+import type { PersonalSyncWriteGateSnapshot } from './personalSyncWriteGate';
+
+/** Caller-side knobs for {@link SyncProvider.requestMobilePush}. */
+export interface MobilePushOptions {
+  /**
+   * Explicit user-authorized attention request. Bypasses the server's presence
+   * suppression so the notification lands even when the user is at a desktop.
+   */
+  force?: boolean;
+  /** Short machine-readable cause, e.g. 'agent_error'. Recorded server-side. */
+  reason?: string;
+}
+
+/** The server's acknowledgement of a push request. */
+export interface MobilePushResult {
+  accepted: boolean;
+  attemptedCount: number;
+  deliveredCount: number;
+  skipped: Array<{ deviceId: string; reason: SkipReason }>;
+  rejection?: PushRejectionCause;
+}
 
 export interface SyncConfig {
   /** WebSocket server URL (e.g., ws://localhost:8787 or wss://sync.nimbalyst.com) */
@@ -17,7 +41,7 @@ export interface SyncConfig {
    * Called before each WebSocket connection to ensure the JWT isn't expired.
    * JWTs typically expire in ~5 minutes, so this must return a fresh one.
    */
-  getJwt: () => Promise<string>;
+  getJwt: () => Promise<PersonalJwt>;
 
   /** B2B organization ID for org-scoped room IDs. */
   orgId: string;
@@ -29,7 +53,7 @@ export interface SyncConfig {
    * but sync room IDs must use the personal org member ID to stay consistent
    * across devices. If provided, this takes precedence over extracting from JWT.
    */
-  userId?: string;
+  personalMemberId: PersonalMemberId;
 
   /** Optional encryption key for E2E encryption */
   encryptionKey?: CryptoKey;
@@ -43,6 +67,19 @@ export interface SyncConfig {
    * If provided, takes precedence over static deviceInfo.
    */
   getDeviceInfo?: () => DeviceInfo;
+
+  /**
+   * Factory for every WebSocket this provider opens (the index room and each
+   * session room). Defaults to the global `WebSocket` constructor.
+   *
+   * Hosts that cannot use the global supply their own: the desktop renderer
+   * needs sockets proxied through the main process (a browser `Origin` header
+   * is rejected by the collab server), and a headless host may want to inject
+   * one rather than mutate `globalThis`. The returned object only has to
+   * satisfy the standard `WebSocket` interface this module uses --
+   * `readyState`, `send`, `close`, and the four `on*` handlers.
+   */
+  createWebSocket?: (url: string) => WebSocket;
 }
 
 /**
@@ -52,10 +89,12 @@ export interface SyncConfig {
 export interface DeviceInfo {
   /** Unique device ID (stable across sessions, generated per device) */
   deviceId: string;
+  /** Server-owned inventory visibility; never affects session ownership. */
+  inventoryHidden?: boolean;
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+  type: 'desktop' | 'mobile' | 'tablet' | 'headless' | 'unknown';
   /** Platform (e.g., "macos", "ios", "windows", "android", "web") */
   platform: string;
   /** App version */
@@ -81,6 +120,66 @@ export interface SyncStatus {
   error: string | null;
 }
 
+/**
+ * What became of a `pushChange`.
+ *
+ * Providers report failures by RETURNING this rather than throwing, so the
+ * fire-and-forget callers that have always ignored the result keep behaving
+ * exactly as they did -- no new rejection paths, no timing change. A caller that
+ * needs to know (the headless node, which must retain an unpublished transcript
+ * row and retry it) reads the outcome.
+ */
+/** Local guards never cross the wire; they are checked at the actual send boundary. */
+export interface PushChangeOptions { isCurrent?: () => boolean }
+export interface HierarchyIndexRow {
+  sessionId: string;
+  parentSessionId?: string | null;
+  createdBySessionId?: string | null;
+  hostDeviceId?: string;
+}
+export type HierarchySnapshotListener = (rows: readonly HierarchyIndexRow[], isCurrent: () => boolean) => void | Promise<void>;
+
+export interface PushChangeOutcome {
+  /** True when the change was handed to the transport. */
+  published: boolean;
+  /** Why not. Present only when `published` is false. */
+  reason?: string;
+  /**
+   * False when the change was deliberately not sent -- filtered content, sync
+   * disabled for the session -- and re-sending it later would be wrong. Absent
+   * or true means the attempt failed and may be worth another.
+   */
+  retryable?: boolean;
+  /**
+   * True when the change was not published yet but is held in the message
+   * outbox, which will send it and then publish its index timestamp.
+   */
+  queued?: boolean;
+}
+
+/**
+ * What became of a bulk index publish (`syncSessionsToIndex`).
+ *
+ * Separate from `PushChangeOutcome` because a bulk publish covers a batch: it
+ * reports which session rows actually reached the transport, so a caller that
+ * acknowledges a single session (the mobile create-session/create-worktree
+ * responses) can tell "your row is on the wire" from "it is queued for a
+ * reconnect that may never come".
+ */
+export interface IndexPublishOutcome {
+  /** True when every eligible session in the batch was handed to the transport. */
+  published: boolean;
+  /** Why not. Present only when `published` is false. */
+  reason?: string;
+  /**
+   * False when the batch was deliberately not sent -- filtered out of personal
+   * sync, outside index retention -- and re-sending it later would be wrong.
+   */
+  retryable?: boolean;
+  /** Session ids that reached the transport. Empty when nothing was sent. */
+  publishedSessionIds: string[];
+}
+
 export interface SyncProvider {
   /** Connect to sync server for a session */
   connect(sessionId: string): Promise<void>;
@@ -95,7 +194,7 @@ export interface SyncProvider {
   isConnected(sessionId: string): boolean;
 
   /**
-   * Returns true when the provider has latched a JWT/userId mismatch
+   * Returns true when the provider has latched a JWT/personal-member mismatch
    * (server-rejected, locally refused). Callers in hot paths (e.g.
    * MessageSyncHandler running on every agent message) should consult
    * this before attempting connect() to avoid log floods and CPU spin.
@@ -118,10 +217,38 @@ export interface SyncProvider {
     callback: (change: SessionChange) => void
   ): () => void;
 
-  /** Push local changes to sync */
-  pushChange(sessionId: string, change: SessionChange): void;
+  /**
+   * Push local changes to sync.
+   *
+   * Implementations that encrypt or send asynchronously return a promise that
+   * settles when the change has actually been handed to the transport, and may
+   * resolve with a `PushChangeOutcome` describing what happened. Callers that
+   * only fire-and-forget may ignore both; a caller that has to know the row
+   * reached the wire before it disconnects (the headless node's shutdown flush)
+   * awaits it and inspects the outcome.
+   */
+  pushChange(
+    sessionId: string,
+    change: SessionChange,
+    options?: PushChangeOptions,
+  ): void | Promise<void | PushChangeOutcome>;
 
-  /** Bulk update the sessions index with existing sessions */
+  /**
+   * Append transcript rows over a socket opened for this write alone, for a
+   * session that has no permanent room socket. Refuses (non-retryable) after
+   * `disconnectAll` until the provider is reconnected.
+   */
+  sendSessionMessages?(sessionId: string, messages: AgentMessage[]): Promise<PushChangeOutcome>;
+
+  /**
+   * Bulk update the sessions index with existing sessions.
+   *
+   * Resolves with an `IndexPublishOutcome` once the batch has been handed to
+   * the transport (or refused). The `void` arm keeps the fire-and-forget
+   * callers -- and any provider that does not report -- source-compatible; a
+   * caller that acknowledges the publish to another device awaits it and reads
+   * the outcome instead of acking a row that never left the machine.
+   */
   syncSessionsToIndex?(sessions: SessionIndexData[], options?: {
     syncMessages?: boolean;
     /** Per-session sinceTimestamp for lazy message loading. Provider loads messages
@@ -130,7 +257,7 @@ export interface SyncProvider {
     /** Callback to load messages for a batch of sessions. Called lazily by the provider
      *  so PGLite isn't blocked loading all messages upfront. */
     getMessagesForSync?: (requests: Array<{ sessionId: string; sinceTimestamp: number }>) => Promise<Map<string, any[]>>;
-  }): void;
+  }): void | Promise<IndexPublishOutcome>;
 
   /** Sync projects to the ProjectsIndex (tells mobile which projects exist and are enabled) */
   syncProjectsToIndex?(projects: ProjectIndexEntry[]): void;
@@ -140,6 +267,11 @@ export interface SyncProvider {
 
   /** Fetch the current server index to compare with local state */
   fetchIndex?(): Promise<{
+    /** Absent on older providers. Partial coverage never permits absence-based reconciliation. */
+    complete?: boolean;
+    indexProtocolVersion?: 1 | 2;
+    /** Explicit server tombstones, including those retained across a full bootstrap. */
+    deletedSessionIds?: string[];
     sessions: Array<{
       sessionId: string;
       projectId: string;
@@ -148,8 +280,10 @@ export interface SyncProvider {
       model?: string;
       mode?: 'agent' | 'planning';
       sessionType?: string;
-      parentSessionId?: string;
+      parentSessionId?: string | null;
+      createdBySessionId?: string | null;
       worktreeId?: string;
+      hostDeviceId?: string;
       isArchived?: boolean;
       isPinned?: boolean;
       messageCount: number;
@@ -177,9 +311,17 @@ export interface SyncProvider {
     }>;
   }>;
 
-  /** Subscribe to index changes (session updates broadcast to all connected clients) */
+  /** Verified server rows only, grouped into a complete proposed graph. */
+  onHierarchySnapshot?(callback: HierarchySnapshotListener): () => void;
+
+  /** Live changes and queue recovery; replayHierarchy opts into verified bootstrap hierarchy reconciliation. */
   onIndexChange?(callback: (sessionId: string, entry: {
     sessionId: string;
+    /** Hierarchy placement in a complete index row; undefined means omitted. */
+    parentSessionId?: string | null;
+    createdBySessionId?: string | null;
+    /** Stable device ID of the host that owns this session. */
+    hostDeviceId?: string;
     title?: string;
     provider?: string;
     model?: string;
@@ -203,7 +345,7 @@ export interface SyncProvider {
     draftInput?: string;
     /** Epoch ms when draftInput was last updated by the sending device */
     draftUpdatedAt?: number;
-  }) => void): () => void;
+  }) => void, options?: { replayHierarchy?: boolean }): () => void;
 
   /** Get cached metadata for a session (populated from syncResponse and metadataBroadcast) */
   getCachedMetadata?(sessionId: string): {
@@ -220,6 +362,10 @@ export interface SyncProvider {
    * Note: Returns decrypted values - title is always present after decryption */
   getCachedIndexEntry?(sessionId: string): {
     sessionId: string;
+    parentSessionId?: string | null;
+    createdBySessionId?: string | null;
+    /** Stable device ID of the host that owns this session. */
+    hostDeviceId?: string;
     projectId: string;
     /** Decrypted title (always present in cache) */
     title: string;
@@ -283,13 +429,43 @@ export interface SyncProvider {
 
   /**
    * Request the sync server to send a push notification to mobile devices.
-   * Used when agent completes execution and user should be notified on mobile.
-   * The server will check device presence before sending (suppresses if mobile is active).
+   *
+   * The server decides who to notify: routine requests are suppressed when the
+   * user is demonstrably at a connected desktop, while `force` marks an explicit
+   * attention alert that bypasses that suppression (subject to a server-side
+   * rate limit). Do not gate a forced call site on local presence -- the whole
+   * point of `force` is that the server makes the call.
+   *
+   * Resolves with the server's acknowledgement, or with `rejection: 'no_ack'`
+   * if none arrives. Callers that don't care may ignore the result.
    */
-  requestMobilePush?(sessionId: string, title: string, body: string): Promise<void>;
+  requestMobilePush?(
+    sessionId: string,
+    title: string,
+    body: string,
+    options?: MobilePushOptions
+  ): Promise<MobilePushResult>;
+
+  /**
+   * Push the ambient fleet snapshot to the user's Live Activity.
+   *
+   * Fire-and-forget by design, and unlike `requestMobilePush` it is not
+   * acknowledged: this lane is ambient, it carries no alert, and the phone's own
+   * stale date is what covers a desktop that has stopped sending. Callers must
+   * coalesce -- see `FleetActivityPublisher`. Sending one of these per streaming
+   * tick would get the activity silently throttled by ActivityKit, which looks
+   * identical to the feature being broken.
+   *
+   * Resolves `true` only when the frame was written to an open index socket.
+   * `false` means it was dropped locally and the server never saw it.
+   */
+  sendFleetActivity?(activity: FleetActivitySnapshot, shownOnDesktop?: boolean): Promise<boolean>;
 
   /** Get list of currently connected devices */
   getConnectedDevices?(): DeviceInfo[];
+
+  /** Get this provider's current device identity for routing and attribution. */
+  getLocalDeviceInfo?(): DeviceInfo | undefined;
 
   /** Subscribe to device status changes (devices joining/leaving) */
   onDeviceStatusChange?(callback: (devices: DeviceInfo[]) => void): () => void;
@@ -338,12 +514,50 @@ export interface SyncProvider {
    */
   isIndexReady?(): boolean;
 
+  /** Persistent transport readiness updates, including disconnects. */
+  onIndexReadyChange?(callback: (ready: boolean) => void): () => void;
+
+  /**
+   * A counter that increases every time the index socket becomes usable again.
+   *
+   * The server binds a create-session claim to the SOCKET that received the
+   * broadcast: a response sent on a later socket is rejected and the requester
+   * is told the host vanished. Sampling `isIndexReady()` cannot detect that,
+   * because a full down-and-up cycle between two samples reads as "still
+   * ready". A caller that must not act on a claim it may no longer hold records
+   * this value when the broadcast arrives and compares it before responding.
+   *
+   * Monotonic within a provider instance; never reset.
+   */
+  getConnectionGeneration?(): number;
+
+  /**
+   * Subscribe to "the index socket is usable again", with the generation then
+   * in force. Returns an unsubscribe.
+   *
+   * Fires on every reconnect, including ones this process did not initiate --
+   * which is the point. Work that could not be sent on the socket that went
+   * away has to be retried when a socket comes back, not when the caller next
+   * happens to do something.
+   */
+  onConnectionGenerationChange?(callback: (generation: number) => void): () => void;
+
   /**
    * Wait for the index to reach the `ready` state (open + stable). Resolves
    * immediately if already ready. Rejects after `timeoutMs` otherwise. Used by
    * the reconnect cascade to gate other providers on a verified-healthy index.
    */
   waitForIndexReady?(timeoutMs?: number): Promise<void>;
+
+  /**
+   * Whether this device may publish personal-sync ciphertext. Closed until a
+   * complete index read, which may skip unreadable rows. A server update
+   * requirement still blocks writes. See `personalSyncWriteGate.ts`.
+   */
+  getPersonalSyncWriteGate?(): PersonalSyncWriteGateSnapshot;
+
+  /** Fires when the personal-sync write gate changes state. */
+  onPersonalSyncWriteGateChange?(callback: (snapshot: PersonalSyncWriteGateSnapshot) => void): () => void;
 
   /** Push a file index entry to the IndexRoom (for mobile markdown sync) */
   syncFileToIndex?(file: FileIndexData): void;
@@ -376,9 +590,11 @@ export interface SessionIndexData {
   /** Structural type: 'session' (normal), 'workstream' (parent container), 'blitz' (quick task) */
   sessionType?: string;
   /** Parent session ID for workstream/worktree hierarchy */
-  parentSessionId?: string;
+  parentSessionId?: string | null;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -398,12 +614,31 @@ export interface SessionIndexData {
   workspaceId?: string;
   workspacePath?: string;
   messageCount: number;
+  /** False when a metadata-only query intentionally did not count messages. */
+  messageCountKnown?: boolean;
   updatedAt: number;
   createdAt: number;
   /** Raw metadata from PGLite - CollabV3Sync extracts what it needs for encrypted client metadata */
   metadata?: Record<string, any>;
   /** Optional messages to sync to the session Y.Doc */
   messages?: AgentMessage[];
+}
+
+/**
+ * Tutorial fixtures are local examples, not user conversations. Keep them out
+ * of personal device sync even when a caller supplies an unfiltered session
+ * list directly to a sync provider.
+ */
+export function isSessionEligibleForPersonalSync(
+  session: Pick<SessionIndexData, 'metadata'>
+): boolean {
+  return session.metadata?.tutorial !== true;
+}
+
+export function filterSessionsForPersonalSync<T extends Pick<SessionIndexData, 'metadata'>>(
+  sessions: T[]
+): T[] {
+  return sessions.filter(isSessionEligibleForPersonalSync);
 }
 
 /** Types of changes that can be synced */
@@ -416,7 +651,14 @@ export type SessionChange =
 // We sync the raw database format; rendering uses canonical ai_transcript_events
 
 /** Queued prompt for cross-device sync */
+export interface RemoteTurnOptions {
+  mode?: "agent" | "planning";
+  model?: string;
+  effortLevel?: import("../ai/server/effortLevels").EffortLevel;
+}
+
 export interface SyncedQueuedPrompt {
+  options?: RemoteTurnOptions;
   id: string;           // Unique ID for this queued item
   prompt: string;       // The user's message
   timestamp: number;    // When queued
@@ -452,13 +694,15 @@ export interface SyncedSessionMetadata {
   /** Structural type: 'session' | 'workstream' | 'blitz' */
   sessionType?: string;
   /** Parent session ID for workstream/worktree hierarchy */
-  parentSessionId?: string;
+  parentSessionId?: string | null;
   /** Worktree association (mirrored from ai_sessions.worktree_id). */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
-  createdBySessionId?: string;
+  createdBySessionId?: string | null;
   provider?: string;
   model?: string;
   workspaceId?: string;
@@ -514,13 +758,15 @@ export interface SessionIndexEntry {
   model?: string;
   mode?: 'agent' | 'planning';
   /** Parent session ID for workstream/worktree hierarchy */
-  parentSessionId?: string;
+  parentSessionId?: string | null;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
-  createdBySessionId?: string;
+  createdBySessionId?: string | null;
   /** Whether the session is archived */
   isArchived?: boolean;
   /** Whether the session is pinned */
@@ -584,6 +830,13 @@ export interface ProjectConfig {
   lastCommandsUpdate: number;
   /** SHA-256 hash of the normalized git remote URL (for server-side project identity lookup) */
   gitRemoteHash?: string;
+  /**
+   * Action prompts from the workspace's ai-actions.md. Absent on desktops that
+   * predate this field, so consumers must treat "missing" as "none".
+   */
+  actions?: SyncedActionPrompt[];
+  /** Timestamp of last actions update */
+  lastActionsUpdate?: number;
 }
 
 /**
@@ -594,6 +847,34 @@ export interface SyncedSlashCommand {
   name: string;
   description?: string;
   source: 'builtin' | 'project' | 'user' | 'plugin';
+}
+
+/**
+ * An action prompt as mobile receives it.
+ *
+ * Unlike SyncedSlashCommand, this carries the prompt `body`. A slash command's
+ * content is a desktop-side file the desktop executes, so mobile only needs its
+ * name; an action prompt's body IS the artifact, and the desktop's own behavior
+ * is to paste it into the composer for the user to edit before sending. Mobile
+ * cannot reproduce that without the text. The blob is encrypted with the user's
+ * key, so this is the same exposure class as synced session titles and drafts.
+ *
+ * `foreground` is deliberately absent -- it is a desktop window concept.
+ */
+export interface SyncedActionPrompt {
+  /** kebab-case slug derived from the heading; stable across edits to the body */
+  id: string;
+  label: string;
+  /** The prompt text, verbatim. May be truncated -- see `truncated`. */
+  body: string;
+  /** Set when `body` was cut to fit the payload budget. */
+  truncated?: boolean;
+  /** Only present for launcher actions; same-session actions omit it. */
+  launch?: 'new-session';
+  /** provider:variant the action pins, when it declares one. */
+  model?: string;
+  autoSubmit?: boolean;
+  worktree?: boolean;
 }
 
 /**
@@ -617,8 +898,22 @@ export interface CreateSessionRequest {
   model?: string;
   /** Agent role (e.g., "meta-agent", "standard"). Falls back to "standard" if omitted. */
   agentRole?: string;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
   /** Timestamp when request was created */
   timestamp: number;
+  /**
+   * `getConnectionGeneration()` as it was when this broadcast ARRIVED, before
+   * the provider decrypted it.
+   *
+   * The server binds the claim to the socket that received the broadcast, and
+   * decryption is asynchronous -- so a disconnect during that await delivers a
+   * request whose claim is already gone, and a listener that samples the
+   * generation on delivery reads the NEW one and concludes it still holds the
+   * claim. Compare against this instead. Absent from providers that do not
+   * track a generation.
+   */
+  receiptGeneration?: number;
 }
 
 /**
@@ -680,6 +975,8 @@ export interface CreateWorktreeRequest {
   requestId: string;
   /** Project/workspace ID to create the worktree in */
   projectId: string;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
   /** Timestamp when request was created */
   timestamp: number;
 }
@@ -712,12 +1009,19 @@ export interface SessionControlMessage {
   timestamp: number;
   /** Device that sent the message */
   sentBy: 'desktop' | 'mobile';
+  /** Stable ID of the sending device. Absent on legacy clients. */
+  sentByDeviceId?: string;
+  /** Deliver to this device only. Absent preserves legacy broadcast routing. */
+  targetDeviceId?: string;
 }
 
 /**
  * Voice mode settings synced from desktop.
  */
 export interface SyncedVoiceModeSettings {
+  engine?: string;
+  liveVoice?: string;
+  liveControllerModel?: string;
   /** Which voice to use (OpenAI Realtime API voices) */
   voice?: 'alloy' | 'ash' | 'ballad' | 'coral' | 'echo' | 'sage' | 'shimmer' | 'verse' | 'marin' | 'cedar';
   /** Delay before auto-submitting voice commands (ms) */
@@ -730,6 +1034,7 @@ export interface SyncedVoiceModeSettings {
  */
 export interface SyncedSettings {
   /** OpenAI API key for voice transcription */
+  /** Omitted: unchanged. Empty string: delete the previously synced key. */
   openaiApiKey?: string;
   /** Voice mode settings */
   voiceMode?: SyncedVoiceModeSettings;

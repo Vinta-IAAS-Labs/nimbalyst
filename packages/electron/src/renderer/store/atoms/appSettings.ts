@@ -1,3 +1,5 @@
+import { changeProviderCredential } from '../providerCredentials';
+import { SAVED_CREDENTIAL } from '../../../shared/providerCredentials';
 /**
  * App Settings Atoms
  *
@@ -17,7 +19,7 @@
 
 import { atom, type Atom } from 'jotai';
 import posthog from 'posthog-js';
-import { copyToClipboard } from '@nimbalyst/runtime';
+import { copyToClipboard } from '@nimbalyst/runtime/utils/clipboard';
 import { store } from '@nimbalyst/runtime/store';
 import { type EffortLevel, type ThinkingMode, DEFAULT_EFFORT_LEVEL, DEFAULT_THINKING_MODE, parseEffortLevel, parseThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import { AlphaFeatureTag, getDefaultAlphaFeatures } from '../../../shared/alphaFeatures';
@@ -32,6 +34,25 @@ import {
   HIDDEN_GUTTER_ITEMS_KEY,
   GUTTER_ITEM_ORDER_KEY,
 } from '../../components/NavigationGutter/navGutterItems';
+
+// This module cannot survive a hot update. Every `atom(...)` below is created at
+// module scope, but the jotai store that holds their values lives in a different
+// package (`@nimbalyst/runtime/store`) and survives HMR. A re-execution would
+// hand every component brand-new atom identities sitting at their *defaults*
+// while the one-time IPC seeding in `renderer/index.tsx` never re-runs, silently
+// reverting the app to unconfigured settings until the next full reload.
+//
+// Today this is latent rather than live: `renderer/index.tsx` imports this
+// module and is not self-accepting, so propagation already escalates to a full
+// reload. That is an accident of the import graph, not a guarantee -- if this
+// module ever stops being reachable from a non-accepting entry, the failure
+// returns silently. Self-accept and immediately invalidate so the reload is the
+// documented behavior instead.
+if (import.meta.hot) {
+  import.meta.hot.accept(() => {
+    import.meta.hot?.invalidate('appSettings atoms cannot be re-seeded after a hot update');
+  });
+}
 
 // Voice type - all available OpenAI Realtime voices
 export type VoiceId = 'alloy' | 'ash' | 'ballad' | 'coral' | 'echo' | 'sage' | 'shimmer' | 'verse' | 'marin' | 'cedar';
@@ -57,8 +78,15 @@ export interface SystemPromptConfig {
   append?: string;
 }
 
+/**
+ * Which speech transport voice mode connects to. GPT-Live is the default.
+ */
+export type VoiceEngineSetting = 'realtime' | 'live';
+
 export interface VoiceModeSettings {
   enabled: boolean;
+  /** Speech transport. Default 'live'. */
+  engine: VoiceEngineSetting;
   voice: VoiceId;
   /** OpenAI Realtime speech-to-speech model. Default 'gpt-realtime-2'. */
   model: RealtimeModel;
@@ -77,6 +105,7 @@ export interface VoiceModeSettings {
  */
 const defaultVoiceModeSettings: VoiceModeSettings = {
   enabled: false,
+  engine: 'live',
   voice: 'alloy',
   model: 'gpt-realtime-2',
   reasoningEffort: 'low',
@@ -209,6 +238,7 @@ export async function initVoiceModeSettings(): Promise<VoiceModeSettings> {
     if (settings) {
       return {
         enabled: settings.enabled || false,
+        engine: settings.engine ?? defaultVoiceModeSettings.engine,
         voice: settings.voice || 'alloy',
         model: settings.model ?? defaultVoiceModeSettings.model,
         reasoningEffort: settings.reasoningEffort ?? defaultVoiceModeSettings.reasoningEffort,
@@ -1200,6 +1230,9 @@ const defaultProviders: Record<string, ProviderConfig> = {
   'openai-codex-acp': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   opencode: { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   'copilot-cli': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
+  'grok-build': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
+  'cursor-agent': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
+  'antigravity-gemini-agent': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   lmstudio: { enabled: false, baseUrl: 'http://127.0.0.1:8234', testStatus: 'idle' },
 };
 
@@ -1382,8 +1415,15 @@ async function flushAIProviderPersist(): Promise<void> {
       const value = snapshot.apiKeys[name];
       if (value === undefined) continue;
       writes.push(
-        window.electronAPI.settingsSet(`ai.apiKey.${name}`, value).catch((err) => {
-          console.error(`[appSettings] settingsSet(ai.apiKey.${name}) failed:`, err);
+        (name === 'lmstudio_url'
+          ? window.electronAPI.settingsSet('ai.apiKey.lmstudio_url', value)
+          : changeProviderCredential(name, value)
+        ).then(() => {
+          if (name === 'lmstudio_url') return;
+          const latest = store.get(aiProviderSettingsAtom);
+          if (latest.apiKeys[name] === value) store.set(aiProviderSettingsAtom, { ...latest, apiKeys: { ...latest.apiKeys, [name]: value ? SAVED_CREDENTIAL : '' } });
+        }).catch(() => {
+          if (store.get(aiProviderSettingsAtom).apiKeys[name] === value) pendingApiKeyNames.add(name);
         }),
       );
     }
@@ -1572,6 +1612,27 @@ export async function initAIProviderSettings(): Promise<AIProviderSettings> {
     });
   }
 
+  // Grok, Cursor and Gemini default to on when their tool is present and
+  // usable. That default lives in the main process (it needs to spawn a CLI or
+  // stat a vendor install), and the table above cannot tell "user turned it
+  // off" from "never touched" -- so seed the untouched ones from main. Without
+  // this the settings toggle renders OFF while the model picker shows the
+  // provider ON.
+  try {
+    const availability = await window.electronAPI.aiGetHeadlessAgentAvailability?.();
+    if (availability) {
+      for (const [id, state] of Object.entries(availability)) {
+        const persisted = settings?.providerSettings?.[id] as { enabled?: boolean } | undefined;
+        if (providers[id] && persisted?.enabled === undefined) {
+          providers[id] = { ...providers[id], enabled: state.defaultEnabled };
+        }
+      }
+    }
+  } catch {
+    // Detection unavailable -- fall back to the off default rather than
+    // blocking settings hydration on a subprocess probe.
+  }
+
   const sanitizedProviders = sanitizeProvidersForPersistence(providers);
 
   // Merge loaded API keys
@@ -1634,6 +1695,7 @@ function ensureProviderBroadcastBridge(): void {
       }
     } else if (key.startsWith('ai.apiKey.')) {
       const keyName = key.slice('ai.apiKey.'.length);
+      if (pendingApiKeyNames.has(keyName)) return;
       const current = store.get(aiProviderSettingsAtom);
       if (typeof value === 'string') {
         store.set(aiProviderSettingsAtom, {
@@ -2078,12 +2140,19 @@ export async function initDeveloperFeatureSettings(): Promise<DeveloperFeatureSe
       window.electronAPI.invoke('developer-features:get'),
     ]);
 
+    // A missing/undefined read is indistinguishable from a genuine `false` in
+    // the resulting atom, and the difference is the whole app flipping to
+    // Standard Mode. Say which one happened.
+    if (developerMode === undefined || developerMode === null) {
+      console.warn('[appSettings] developer-mode:get returned no value; defaulting to Standard Mode');
+    }
+
     return {
       developerMode: developerMode ?? false,
       developerFeatures: developerFeatures ?? defaultDeveloperFeatureSettings.developerFeatures,
     };
   } catch (error) {
-    console.error('[appSettings] Failed to load developer feature settings:', error);
+    console.error('[appSettings] Failed to load developer feature settings; defaulting to Standard Mode:', error);
   }
 
   return defaultDeveloperFeatureSettings;
@@ -2388,4 +2457,11 @@ export async function initGutterCustomization(): Promise<GutterCustomizationStat
     console.error('[appSettings] Failed to load gutter customization:', error);
     return DEFAULT_GUTTER_CUSTOMIZATION;
   }
+}
+
+/** Cancel a queued edit before an explicit clear so it cannot recreate the key. */
+export function cancelPendingProviderKey(name: string): void {
+  pendingApiKeyNames.delete(name);
+  const current = store.get(aiProviderSettingsAtom);
+  store.set(aiProviderSettingsAtom, { ...current, apiKeys: { ...current.apiKeys, [name]: '' } });
 }

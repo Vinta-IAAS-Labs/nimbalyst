@@ -6,6 +6,10 @@
  */
 
 import { toMillis } from '../utils/timestampUtils';
+import type {
+  AgentWakePromptOrigin,
+  PromptProvenance,
+} from '@nimbalyst/runtime/ai/server/types';
 
 export interface QueuedPrompt {
   id: string;
@@ -19,6 +23,8 @@ export interface QueuedPrompt {
     fileType?: string;
     /** Identifies the origin of this queued prompt (e.g. 'wakeup_resume' for ScheduleWakeup). */
     promptOrigin?: string;
+    promptProvenance?: PromptProvenance;
+    agentWakeOrigin?: AgentWakePromptOrigin;
   };
   createdAt: number;  // epoch ms
   claimedAt?: number; // epoch ms
@@ -37,6 +43,8 @@ export interface CreateQueuedPromptInput {
     fileType?: string;
     /** Identifies the origin of this queued prompt (e.g. 'wakeup_resume' for ScheduleWakeup). */
     promptOrigin?: string;
+    promptProvenance?: PromptProvenance;
+    agentWakeOrigin?: AgentWakePromptOrigin;
   };
 }
 
@@ -52,6 +60,22 @@ export interface QueuedPromptsStore {
 
   /** List pending prompts for a session (ready to execute) */
   listPending(sessionId: string): Promise<QueuedPrompt[]>;
+
+  /**
+   * Distinct session ids that currently have at least one `pending` row.
+   * Boot recovery uses this to re-drive every stranded queue: the boot sweep
+   * buckets `executing` rows back to `pending` and, before this existed,
+   * nothing ever claimed them (#962).
+   */
+  listSessionIdsWithPending(): Promise<string[]>;
+
+  /**
+   * Mark every pending row for a session failed. Used when delivery is
+   * terminally impossible (the project folder is gone), where deferring
+   * forever would leave the prompt silently stuck.
+   * Returns the number of rows failed.
+   */
+  failAllPendingForSession(sessionId: string, errorMessage: string): Promise<number>;
 
   /**
    * Atomically claim a pending prompt for execution.
@@ -234,7 +258,7 @@ export function createPGLiteQueuedPromptsStore(
       if (!includeCompleted) {
         query += ` AND status NOT IN ('completed', 'failed')`;
       }
-      query += ` ORDER BY created_at ASC`;
+      query += ` ORDER BY created_at ASC, id ASC`;
 
       const { rows } = await db.query<any>(query, [sessionId]);
       return rows.map(rowToQueuedPrompt);
@@ -246,11 +270,41 @@ export function createPGLiteQueuedPromptsStore(
       const { rows } = await db.query<any>(
         `SELECT * FROM queued_prompts
          WHERE session_id = $1 AND status = 'pending'
-         ORDER BY created_at ASC`,
+         ORDER BY created_at ASC, id ASC`,
         [sessionId]
       );
 
       return rows.map(rowToQueuedPrompt);
+    },
+
+    async listSessionIdsWithPending(): Promise<string[]> {
+      await ensureReady();
+
+      const { rows } = await db.query<{ session_id: string }>(
+        `SELECT DISTINCT session_id FROM queued_prompts WHERE status = 'pending'`
+      );
+
+      return rows.map((row) => row.session_id);
+    },
+
+    async failAllPendingForSession(sessionId: string, errorMessage: string): Promise<number> {
+      await ensureReady();
+
+      const { rows } = await db.query<any>(
+        `UPDATE queued_prompts
+         SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $2
+         WHERE session_id = $1 AND status = 'pending'
+         RETURNING id`,
+        [sessionId, errorMessage]
+      );
+
+      if (rows.length > 0) {
+        console.log(
+          `[QueuedPromptsStore] Marked ${rows.length} pending prompt(s) for session ${sessionId} as failed: ${errorMessage}`
+        );
+      }
+
+      return rows.length;
     },
 
     async claim(id: string): Promise<QueuedPrompt | null> {
@@ -284,7 +338,7 @@ export function createPGLiteQueuedPromptsStore(
       await db.query(
         `UPDATE queued_prompts
          SET status = 'completed', completed_at = CURRENT_TIMESTAMP, error_message = NULL
-         WHERE id = $1`,
+         WHERE id = $1 AND document_context->'inboxDelivery' IS NULL`,
         [id]
       );
 
@@ -297,7 +351,7 @@ export function createPGLiteQueuedPromptsStore(
       await db.query(
         `UPDATE queued_prompts
          SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $2
-         WHERE id = $1`,
+         WHERE id = $1 AND document_context->'inboxDelivery' IS NULL`,
         [id, errorMessage]
       );
 
@@ -307,11 +361,12 @@ export function createPGLiteQueuedPromptsStore(
     async delete(id: string): Promise<void> {
       await ensureReady();
 
-      await db.query(
-        `DELETE FROM queued_prompts WHERE id = $1`,
+      const deleted = await db.query(
+        `DELETE FROM queued_prompts WHERE id = $1 AND status = 'pending' RETURNING id`,
         [id]
       );
 
+      if (!deleted.rows.length) throw new Error('Queued prompt was already claimed or removed; refresh the queue before editing it');
       console.log(`[QueuedPromptsStore] Deleted prompt ${id}`);
     },
 
@@ -321,7 +376,7 @@ export function createPGLiteQueuedPromptsStore(
       const { rows } = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'pending', claimed_at = NULL
-         WHERE session_id = $1 AND status = 'executing'
+         WHERE session_id = $1 AND status = 'executing' AND document_context->'inboxDelivery' IS NULL
          RETURNING id`,
         [sessionId]
       );
@@ -338,7 +393,7 @@ export function createPGLiteQueuedPromptsStore(
       const { rows } = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'pending', claimed_at = NULL
-         WHERE status = 'executing'
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NULL
          RETURNING id`
       );
 
@@ -350,6 +405,12 @@ export function createPGLiteQueuedPromptsStore(
 
     async sweepExecutingOnBoot(): Promise<{ completed: number; failed: number; rolledBack: number }> {
       await ensureReady();
+      const inboxResult = await db.query(
+        `UPDATE queued_prompts SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $1
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NOT NULL RETURNING id`,
+        ['Inbox reports were recorded during an interrupted turn; delivery is uncertain and will not be replayed automatically.'],
+      );
+
 
       // Pass 1: rows whose user message was already logged to
       // ai_agent_messages AND that have agent output after the claim --
@@ -383,7 +444,7 @@ export function createPGLiteQueuedPromptsStore(
       const completedResult = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-         WHERE (
+         WHERE document_context->'inboxDelivery' IS NULL AND (
            (status = 'executing' AND claimed_at IS NOT NULL
             AND EXISTS (
               SELECT 1 FROM ai_agent_messages m
@@ -398,7 +459,7 @@ export function createPGLiteQueuedPromptsStore(
                 AND m.created_at >= queued_prompts.claimed_at
             ))
            OR
-           (status = 'pending'
+           (status = 'pending' AND document_context->'promptProvenance'->>'messageKind' IS NULL
             AND EXISTS (
               SELECT 1 FROM ai_agent_messages m
               WHERE m.session_id = queued_prompts.session_id
@@ -407,7 +468,7 @@ export function createPGLiteQueuedPromptsStore(
                 AND POSITION(queued_prompts.prompt IN m.content) > 0
             ))
            OR
-           (status = 'pending'
+           (status = 'pending' AND document_context->'promptProvenance'->>'messageKind' IS NULL
             AND created_at < NOW() - INTERVAL '1 day')
          )
          RETURNING id`
@@ -446,12 +507,12 @@ export function createPGLiteQueuedPromptsStore(
       const rolledBackResult = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'pending', claimed_at = NULL
-         WHERE status = 'executing'
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NULL
          RETURNING id`
       );
 
       const completed = completedResult.rows.length;
-      const failed = failedResult.rows.length;
+      const failed = failedResult.rows.length + inboxResult.rows.length;
       const rolledBack = rolledBackResult.rows.length;
 
       if (completed > 0 || failed > 0 || rolledBack > 0) {
@@ -465,6 +526,12 @@ export function createPGLiteQueuedPromptsStore(
 
     async sweepExecutingForSession(sessionId: string): Promise<{ completed: number; failed: number; rolledBack: number }> {
       await ensureReady();
+      const inboxResult = await db.query(
+        `UPDATE queued_prompts SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $1
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NOT NULL AND session_id = $2 RETURNING id`,
+        ['Inbox reports were recorded during an interrupted turn; delivery is uncertain and will not be replayed automatically.', sessionId],
+      );
+
 
       // Pass 1: same delivery + output-evidence check as
       // sweepExecutingOnBoot, but scoped to a single session. Used on
@@ -473,7 +540,7 @@ export function createPGLiteQueuedPromptsStore(
       const completedResult = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-         WHERE status = 'executing'
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NULL
            AND session_id = $1
            AND claimed_at IS NOT NULL
            AND EXISTS (
@@ -503,7 +570,7 @@ export function createPGLiteQueuedPromptsStore(
       const failedResult = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $2
-         WHERE status = 'executing'
+         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NULL
            AND session_id = $1
            AND claimed_at IS NOT NULL
            AND EXISTS (
@@ -527,13 +594,13 @@ export function createPGLiteQueuedPromptsStore(
       const rolledBackResult = await db.query<{ id: string }>(
         `UPDATE queued_prompts
          SET status = 'pending', claimed_at = NULL
-         WHERE status = 'executing' AND session_id = $1
+         WHERE status = 'executing' AND session_id = $1 AND document_context->'inboxDelivery' IS NULL
          RETURNING id`,
         [sessionId]
       );
 
       const completed = completedResult.rows.length;
-      const failed = failedResult.rows.length;
+      const failed = failedResult.rows.length + inboxResult.rows.length;
       const rolledBack = rolledBackResult.rows.length;
 
       if (completed > 0 || failed > 0 || rolledBack > 0) {

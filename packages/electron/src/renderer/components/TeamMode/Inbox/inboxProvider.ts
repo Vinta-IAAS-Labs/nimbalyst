@@ -1,3 +1,4 @@
+import type { DocumentFeedbackInboxDelivery } from '../../../store/atoms/documentFeedbackInbox';
 /**
  * The Inbox data seam.
  *
@@ -12,6 +13,7 @@
  * tests and the design-review harness, so no fixture reaches a packaged build.
  */
 
+import type { ActivityRef } from '@nimbalyst/collab-protocol';
 import type {
   TeamInboxMaterializedDelivery,
   TeamInboxSnapshot,
@@ -19,7 +21,9 @@ import type {
 import type { Store } from 'jotai/vanilla/store';
 import { createContext, useContext } from 'react';
 
-import { teamInboxSnapshotAtom } from '../../../store/atoms/teamInbox';
+import { feedbackAwareTeamInboxSnapshotAtom as teamInboxSnapshotAtom } from '../../../store/atoms/teamInbox';
+import { buildConversationDeepLink } from '../../../../shared/conversationDeepLinks';
+import { buildFeedbackRequestDeepLink } from '../../../../shared/feedbackRequestLinks';
 import type {
   HydratedInboxDelivery,
   InboxRowView,
@@ -80,9 +84,31 @@ export const EMPTY_INBOX_PROVIDER: InboxProvider = {
  * Activity deliveries name a resource rather than a comment, so they are
  * normalized onto the comment-ref shape the surface renders. Comment refs
  * already speak the protocol's source kinds and pass through untouched.
+ *
+ * Exhaustive on purpose. A ternary here is what let a resource kind added to
+ * the protocol land silently in the wrong bucket; with the `never` binding a
+ * new kind is a compile error in this function instead of a type error at some
+ * call site, or worse, a row that quietly claims to be a document.
  */
-function activitySourceKind(resourceKind: 'tracker' | 'document'): InboxSourceKind {
-  return resourceKind === 'tracker' ? 'trackerComment' : 'documentInlineComment';
+function activitySourceKind(source: ActivityRef): InboxSourceKind {
+  const { resourceKind } = source;
+  if (resourceKind === 'document' && source.eventClass.startsWith('documentDecision')) return 'documentDecision';
+  switch (resourceKind) {
+    case 'tracker':
+      return 'trackerComment';
+    case 'document':
+      return 'documentInlineComment';
+    case 'feedbackRequest':
+      return 'feedbackRequest';
+    default: {
+      // Unreachable by the types. It survives only a server that is ahead of
+      // this client: an unknown kind renders as a generic room row rather than
+      // taking the whole snapshot down with it.
+      const unhandled: never = resourceKind;
+      void unhandled;
+      return 'roomMessage';
+    }
+  }
 }
 
 function mapDelivery(
@@ -94,23 +120,24 @@ function mapDelivery(
     ? 'sourceId' in source ? source.sourceId : source.resourceId
     : '';
   const commentId = source
-    ? 'commentId' in source ? source.commentId : source.sourceEventId
+    ? 'resourceKind' in source ? source.commentId ?? (source.blockId ? '' : source.sourceEventId) : source.commentId
     : '';
   const preview = delivery.preview;
   return {
     id: delivery.id,
-    recipientUserId: delivery.recipientUserId,
+    teamMemberId: delivery.teamMemberId,
     orgId: delivery.orgId,
     orgName: delivery.orgName,
     source: {
       orgId: delivery.orgId,
       sourceKind: source
         ? 'resourceKind' in source
-          ? activitySourceKind(source.resourceKind)
+          ? activitySourceKind(source)
           : source.sourceKind
         : 'roomMessage',
       sourceId,
       commentId,
+      ...(source?.blockId ? { blockId: source.blockId } : {}),
       ...(
         source
         && 'threadId' in source
@@ -133,6 +160,7 @@ function mapDelivery(
           preview: {
             sourceTitle: preview.sourceTitle,
             snippet: preview.snippet,
+            itemType: preview.itemType,
             capturedAt: delivery.createdAt,
           },
         }
@@ -140,9 +168,13 @@ function mapDelivery(
     createdAt: delivery.createdAt,
     readAt: delivery.readAt,
     dismissedAt: delivery.dismissedAt,
+    documentDecisionNeedsResponse: (delivery as DocumentFeedbackInboxDelivery).documentDecisionNeedsResponse,
     availability: unavailable ? 'accessRemoved' : 'available',
     subscription: delivery.subscription,
     hasUnreadActivity: delivery.hasUnreadActivity,
+    agentDispatch: delivery.agentDispatch,
+    agentSessionIds: delivery.agentSessionIds,
+    agentDispatchedSessionIds: delivery.agentDispatchedSessionIds,
     capabilities: { comment: !unavailable },
   };
 }
@@ -182,20 +214,27 @@ function deepLinkForRow(row: InboxRowView): string | null {
   if (
     row.sourceKind === 'documentInlineComment'
     || row.sourceKind === 'documentDiscussion'
+    || row.sourceKind === 'documentDecision'
   ) {
     const url = new URL(
       `nimbalyst://doc/${encodeURIComponent(row.sourceId)}`,
     );
     url.searchParams.set('orgId', row.orgId);
+    if (row.blockId) url.searchParams.set('blockId', row.blockId);
     if (row.threadId) url.searchParams.set('threadId', row.threadId);
     if (row.commentId) url.searchParams.set('commentId', row.commentId);
     return url.toString();
   }
+  if (row.sourceKind === 'feedbackRequest') {
+    // A feedback request is not a conversation, so the conversation fallback
+    // below would mint a link that opens something else entirely. Its own link
+    // lands on this row in the organization window's Inbox, where the respond
+    // card renders — deliberately not the `virtual://feedback-request/` tab,
+    // which is the author's results view.
+    return buildFeedbackRequestDeepLink(row.orgId, row.sourceId);
+  }
   if (!row.commentId) return null;
-  return (
-    `nimbalyst://conversation/${encodeURIComponent(row.sourceId)}` +
-    `/message/${encodeURIComponent(row.commentId)}`
-  );
+  return buildConversationDeepLink(row.orgId, row.sourceId, row.commentId);
 }
 
 export function createAtomInboxProvider(store: Store): InboxProvider {

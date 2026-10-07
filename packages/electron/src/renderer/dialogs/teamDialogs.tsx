@@ -1,228 +1,82 @@
 /**
  * Team Dialogs Registration
  *
- * Dialogs for team management (create team, etc.).
+ * Dialogs for team management. Organization creation has exactly one surface —
+ * `OrgCreationWizard` — since the one-field `CreateTeamDialog` was folded into
+ * it; every entry point opens `DIALOG_IDS.ORG_CREATION_WIZARD`.
  */
 
-import React, { useState } from 'react';
+import React from 'react';
 import { registerDialog } from '../contexts/DialogContext';
 import type { DialogConfig } from '../contexts/DialogContext.types';
-import { MaterialSymbol } from '@nimbalyst/runtime';
 import { DIALOG_IDS } from './registry';
 import { ShareToTeamDialog } from '../components/ShareToTeamDialog';
-import { AlphaBadge } from '../components/common/AlphaBadge';
-import { TEAM_ALPHA_TOOLTIP, TeamAlphaNotice } from '../components/common/TeamAlphaNotice';
+import { ShareFolderToTeamDialog } from '../components/ShareToTeamDialog/ShareFolderToTeamDialog';
+import { FeedbackDestinationDialog } from '../components/ShareToTeamDialog/FeedbackDestinationDialog';
+import { OrgCreationWizard } from '../components/TeamMode/onboarding/OrgCreationWizard';
+import { OrgManagementDialog } from '../components/OrgManagement/OrgManagementDialog';
+import {
+  OrgProjectWalkDialog,
+  type ProjectWalkOutcome,
+} from '../components/TeamMode/onboarding/OrgProjectWalkDialog';
+import type { ProjectWalkOrg } from '../../shared/orgProjectWalk';
+import type { AdminTab } from '../components/TeamMode/orgWindowState';
 import type { CollaborativeDocumentTypeDescriptor } from '../services/CollaborativeDocumentTypeCatalog';
 import type { EmbeddedDocumentCandidate } from '../services/embeddedDocumentShare';
+import type { FolderShareSkippedFile } from '../services/folderShareCandidates';
+import type { FeedbackComposeDestination } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets/InteractiveWidgetHost';
 
 // ============================================================================
 // Types
 // ============================================================================
-
-export interface AccountInfo {
-  personalOrgId: string;
-  email: string | null;
-  isSyncAccount: boolean;
-}
-
-export interface CreateTeamData {
-  gitRemote: string;
-  suggestedName: string;
-  accounts: AccountInfo[];
-  onCreateTeam: (name: string, accountOrgId?: string) => void;
-}
-
-export function getDefaultCreateTeamAccountId(accounts: AccountInfo[]): string {
-  return accounts.find((account) => account.isSyncAccount)?.personalOrgId
-    ?? accounts[0]?.personalOrgId
-    ?? '';
-}
 
 export interface ShareToTeamData {
   fileName: string;
   sourceRelPath: string;
   descriptor: CollaborativeDocumentTypeDescriptor;
   embeddedDocuments?: EmbeddedDocumentCandidate[];
+  /** Pre-selects a folder the caller already got an answer for. */
+  initialFolderId?: string | null;
+  /** Pages sections offered; Team only when absent. */
+  sections?: readonly ('team' | 'personal')[];
+  initialSection?: 'team' | 'personal';
   onConfirm: (params: {
+    section: 'team' | 'personal';
     folderId: string | null;
     folderPath: string;
     sharedName: string;
     selectedEmbeddedDocumentPaths: string[];
   }) => void;
+  /**
+   * Fires when the dialog closes, confirmed or not -- `DialogProvider` calls it
+   * on removal. A caller awaiting the author's answers needs the dismissal too;
+   * without it a cancelled share is indistinguishable from one still waiting.
+   */
+  onDismiss?: () => void;
 }
 
-// ============================================================================
-// Create Team Dialog
-// ============================================================================
+export interface ShareFolderToTeamData {
+  folderName: string;
+  sourceRelPath: string;
+  candidateCount: number;
+  skipped: FolderShareSkippedFile[];
+  subfolderCount: number;
+  truncated: boolean;
+  onConfirm: (params: {
+    folderId: string | null;
+    folderPath: string;
+    sharedFolderName: string;
+  }) => void;
+  /** Same contract as `ShareToTeamData.onDismiss`: closing is not an answer. */
+  onDismiss?: () => void;
+}
 
-function CreateTeamDialogWrapper({
-  isOpen,
-  onClose,
-  data,
-}: {
-  isOpen: boolean;
-  onClose: () => void;
-  data: CreateTeamData;
-}) {
-  const [teamName, setTeamName] = useState(data.suggestedName);
-  const [selectedAccountOrgId, setSelectedAccountOrgId] = useState(
-    getDefaultCreateTeamAccountId(data.accounts),
-  );
-
-  if (!isOpen) return null;
-
-  const handleCreate = () => {
-    if (teamName.trim()) {
-      data.onCreateTeam(teamName.trim(), selectedAccountOrgId || undefined);
-      onClose();
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      handleCreate();
-    }
-    if (e.key === 'Escape') {
-      onClose();
-    }
-  };
-
-  const showAccountPicker = data.accounts.length > 1;
-
-  return (
-    <div
-      className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        className="w-[400px] bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-xl shadow-2xl overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="px-6 pt-5 pb-0">
-          <h3 className="flex items-center gap-2 text-lg font-semibold text-[var(--nim-text)] mb-1">
-            Create organization
-            <AlphaBadge size="sm" tooltip={TEAM_ALPHA_TOOLTIP} />
-          </h3>
-          <p className="text-[13px] text-[var(--nim-text-faint)] mb-3">
-            Members of an organization can collaborate on shared tracker items and documents.
-          </p>
-          <TeamAlphaNotice className="mb-5" />
-        </div>
-
-        {/* Body */}
-        <div className="px-6">
-          {/* Account Picker (only shown with multiple accounts) */}
-          {showAccountPicker && (
-            <div className="mb-4">
-              <label className="block text-[12px] font-medium text-[var(--nim-text-muted)] mb-1.5">
-                Account
-              </label>
-              <div className="create-team-account-picker flex flex-col gap-2">
-                {data.accounts.map((account) => (
-                  <label key={account.personalOrgId} className={`create-team-account-option flex cursor-pointer items-center gap-2 rounded-md border p-2.5 ${
-                    selectedAccountOrgId === account.personalOrgId
-                      ? 'border-[var(--nim-primary)] bg-[color-mix(in_srgb,var(--nim-primary)_8%,transparent)]'
-                      : 'border-[var(--nim-border)] bg-[var(--nim-bg-secondary)]'
-                  }`}>
-                    <input
-                      type="radio"
-                      name="create-team-account"
-                      checked={selectedAccountOrgId === account.personalOrgId}
-                      onChange={() => setSelectedAccountOrgId(account.personalOrgId)}
-                    />
-                    <span className="min-w-0 flex-1 truncate select-text text-[13px] text-[var(--nim-text)]">
-                      {account.email || account.personalOrgId}
-                    </span>
-                    {account.isSyncAccount && <span className="text-[10px] text-[var(--nim-text-muted)]">Used for sync</span>}
-                  </label>
-                ))}
-              </div>
-              <div className="text-[11px] text-[var(--nim-text-disabled)] mt-1">
-                The organization will be created under this account.
-              </div>
-            </div>
-          )}
-
-          {/* Team Name */}
-          <div className="mb-4">
-            <label className="block text-[12px] font-medium text-[var(--nim-text-muted)] mb-1.5">
-              Organization name
-            </label>
-            <input
-              type="text"
-              value={teamName}
-              onChange={(e) => setTeamName(e.target.value)}
-              onKeyDown={handleKeyDown}
-              className="w-full px-3 py-2 border border-[var(--nim-border)] rounded-md bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] text-[13px] outline-none focus:border-[var(--nim-primary)]"
-              autoFocus
-            />
-            <div className="text-[11px] text-[var(--nim-text-disabled)] mt-1">
-              Visible to everyone in the organization.
-            </div>
-          </div>
-
-          {/* Git Remote */}
-          <div className="mb-4">
-            <label className="block text-[12px] font-medium text-[var(--nim-text-muted)] mb-1.5">
-              Git Remote
-            </label>
-            <div className="w-full px-3 py-2 border border-[var(--nim-bg-tertiary)] rounded-md bg-[var(--nim-bg-secondary)] text-[var(--nim-text-faint)] text-[12px] font-mono">
-              {data.gitRemote}
-            </div>
-            <div className="flex items-center gap-1.5 mt-1">
-              <div className="w-1.5 h-1.5 rounded-full bg-[var(--nim-success)]" />
-              <span className="text-[11px] text-[var(--nim-success)]">
-                Detected from git remote origin
-              </span>
-            </div>
-            <div className="text-[11px] text-[var(--nim-text-disabled)] mt-1.5">
-              Any member who opens a clone of this repo will be automatically connected.
-            </div>
-          </div>
-
-          {/* Encryption Info */}
-          <div className="mb-0">
-            <label className="block text-[12px] font-medium text-[var(--nim-text-muted)] mb-1.5">
-              Encryption
-            </label>
-            <div className="flex items-start gap-2 p-3 bg-[var(--nim-bg-secondary)] rounded-md border border-[var(--nim-bg-tertiary)]">
-              <MaterialSymbol icon="lock" size={16} className="text-[var(--nim-success)] shrink-0 mt-0.5" />
-              <div>
-                <div className="text-[12px] font-medium text-[var(--nim-text)] mb-0.5">Encrypted at rest</div>
-                <div className="text-[11px] text-[var(--nim-text-faint)] leading-snug">
-                  Organization data is encrypted at rest, with keys managed by the service. Members can access shared content as soon as they join, with no key exchange or need to be online at the same time.
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div className="flex justify-end gap-2 px-6 py-5 border-t border-[var(--nim-border)] mt-2">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-transparent border border-[var(--nim-border)] rounded-md text-[var(--nim-text-muted)] text-[13px] cursor-pointer hover:bg-[var(--nim-bg-hover)]"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleCreate}
-            disabled={!teamName.trim()}
-            className={`px-5 py-2 bg-[var(--nim-primary)] border-none rounded-md text-white text-[13px] font-medium ${
-              teamName.trim()
-                ? 'cursor-pointer opacity-100'
-                : 'cursor-not-allowed opacity-50'
-            }`}
-          >
-            Create organization
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+export interface FeedbackDestinationData {
+  initialFolderId: string | null;
+  subjectCount: number;
+  onConfirm: (destination: FeedbackComposeDestination) => void;
+  /** Same contract as `ShareToTeamData.onDismiss`: closing is not an answer. */
+  onDismiss?: () => void;
 }
 
 // ============================================================================
@@ -246,23 +100,194 @@ function ShareToTeamDialogWrapper({
       sourceRelPath={data.sourceRelPath}
       descriptor={data.descriptor}
       embeddedDocuments={data.embeddedDocuments}
+      initialFolderId={data.initialFolderId}
+      sections={data.sections}
+      initialSection={data.initialSection}
       onConfirm={data.onConfirm}
     />
   );
 }
 
+function ShareFolderToTeamDialogWrapper({
+  isOpen,
+  onClose,
+  data,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  data: ShareFolderToTeamData;
+}) {
+  return (
+    <ShareFolderToTeamDialog
+      isOpen={isOpen}
+      onClose={onClose}
+      folderName={data.folderName}
+      sourceRelPath={data.sourceRelPath}
+      candidateCount={data.candidateCount}
+      skipped={data.skipped}
+      subfolderCount={data.subfolderCount}
+      truncated={data.truncated}
+      onConfirm={data.onConfirm}
+    />
+  );
+}
+
+function FeedbackDestinationDialogWrapper({
+  isOpen,
+  onClose,
+  data,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  data: FeedbackDestinationData;
+}) {
+  return (
+    <FeedbackDestinationDialog
+      isOpen={isOpen}
+      onClose={onClose}
+      initialFolderId={data.initialFolderId}
+      subjectCount={data.subjectCount}
+      onConfirm={data.onConfirm}
+    />
+  );
+}
+
+/**
+ * The organization creation wizard. Registered here so every window sharing
+ * this registry — the project window, Account settings, the org window — opens
+ * the same one.
+ */
+export interface OrgCreationWizardData {
+  onOrganizationCreated?: (orgId: string) => void;
+  /** Set by the Sharing entry point: the new org adopts this project. */
+  workspacePath?: string;
+  /** Pre-fills the name field, e.g. with the project's folder name. */
+  suggestedName?: string;
+  /** Which surface opened it; reported on the wizard's analytics events. */
+  entryPoint?: 'organization_manager' | 'project_sharing';
+}
+
+function OrgCreationWizardWrapper({
+  isOpen,
+  onClose,
+  data,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  data?: OrgCreationWizardData;
+}) {
+  return (
+    <OrgCreationWizard
+      isOpen={isOpen}
+      onClose={onClose}
+      workspacePath={data?.workspacePath}
+      suggestedName={data?.suggestedName}
+      entryPoint={data?.entryPoint}
+      onOrganizationCreated={data?.onOrganizationCreated}
+    />
+  );
+}
+
+/**
+ * Organization administration. Registered here for the same reason the wizard
+ * is: both windows share this registry, so the project window and the
+ * organization window open the same dialog rather than one of them starting a
+ * new OS window to administer an org (NIM-2322).
+ */
+export interface OrgManagementDialogData {
+  orgId: string;
+  /** Which administration panel to land on; defaults to Members. */
+  initialTab?: AdminTab;
+}
+
+function OrgManagementDialogWrapper({
+  isOpen,
+  onClose,
+  data,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  data: OrgManagementDialogData;
+}) {
+  return (
+    <OrgManagementDialog
+      isOpen={isOpen}
+      onClose={onClose}
+      orgId={data.orgId}
+      initialTab={data.initialTab}
+    />
+  );
+}
+
+/**
+ * The post-sign-in project walk. Registered next to the creation wizard because
+ * it answers the mirror-image question: the wizard is for someone who has no
+ * organization, this is for someone who has one but no folder bound to it.
+ */
+export interface OrgProjectWalkData {
+  org: ProjectWalkOrg;
+  onFinished?: (outcome: ProjectWalkOutcome) => void;
+}
+
+function OrgProjectWalkDialogWrapper({
+  isOpen,
+  onClose,
+  data,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  data: OrgProjectWalkData;
+}) {
+  return (
+    <OrgProjectWalkDialog
+      isOpen={isOpen}
+      onClose={onClose}
+      org={data.org}
+      onFinished={data.onFinished}
+    />
+  );
+}
+
 export function registerTeamDialogs() {
-  registerDialog<CreateTeamData>({
-    id: DIALOG_IDS.CREATE_TEAM,
+  registerDialog<OrgProjectWalkData>({
+    id: DIALOG_IDS.ORG_PROJECT_WALK,
     group: 'system',
-    component: CreateTeamDialogWrapper as DialogConfig<CreateTeamData>['component'],
-    priority: 100,
+    component: OrgProjectWalkDialogWrapper as DialogConfig<OrgProjectWalkData>['component'],
+    priority: 150,
+  });
+
+  registerDialog<OrgManagementDialogData>({
+    id: DIALOG_IDS.ORG_MANAGEMENT,
+    group: 'system',
+    component: OrgManagementDialogWrapper as DialogConfig<OrgManagementDialogData>['component'],
+    priority: 150,
+  });
+
+  registerDialog<OrgCreationWizardData>({
+    id: DIALOG_IDS.ORG_CREATION_WIZARD,
+    group: 'system',
+    component: OrgCreationWizardWrapper as DialogConfig<OrgCreationWizardData>['component'],
+    priority: 150,
   });
 
   registerDialog<ShareToTeamData>({
     id: DIALOG_IDS.SHARE_TO_TEAM,
     group: 'system',
     component: ShareToTeamDialogWrapper as DialogConfig<ShareToTeamData>['component'],
+    priority: 200,
+  });
+
+  registerDialog<ShareFolderToTeamData>({
+    id: DIALOG_IDS.SHARE_FOLDER_TO_TEAM,
+    group: 'system',
+    component: ShareFolderToTeamDialogWrapper as DialogConfig<ShareFolderToTeamData>['component'],
+    priority: 200,
+  });
+
+  registerDialog<FeedbackDestinationData>({
+    id: DIALOG_IDS.FEEDBACK_DESTINATION,
+    group: 'system',
+    component: FeedbackDestinationDialogWrapper as DialogConfig<FeedbackDestinationData>['component'],
     priority: 200,
   });
 }

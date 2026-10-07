@@ -7,9 +7,10 @@
  * runtime uses, so it catches the failure class where build is green but
  * the feature is broken because runtime resolution would fail.
  *
- * Why this exists: validate-extra-resources.js only checks INPUTS (do the
- * source paths exist before electron-builder runs). That answers "did the
- * config look right" but NOT "did the packaging actually work". Every
+ * Why this exists: the pre-pack validation in validate-extra-resources.js
+ * checks INPUTS (do the source paths exist before electron-builder runs).
+ * That answers "did the config look right" but NOT "did the SDK packaging
+ * actually work". Every
  * recurring "build green, feature broken in production" bug we've shipped
  * has been a packaging-output failure that input validation cannot catch.
  *
@@ -42,6 +43,7 @@
  */
 
 const fs = require('fs');
+const { validateClaudeRuntime, locations: claudeLocations } = require('./claude-runtime.js');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -255,13 +257,11 @@ function nativeBinaryChecks() {
   const out = [];
   const nmRel = (...parts) => path.join(nodeModulesPath, ...parts);
 
-  // 1. claude binary -- @anthropic-ai/claude-agent-sdk-<plat>-<arch>/claude(.exe)
-  const claudePlatDir = `claude-agent-sdk-${targetPlatform === 'win32' ? 'win32' : targetPlatform}-${targetArch}`;
+  // #1476: the executable must be outside node_modules/@anthropic-ai.
+  validateClaudeRuntime(resourcesRoot, targetPlatform, targetArch);
   out.push({
-    label: 'claude binary (@anthropic-ai/claude-agent-sdk)',
-    candidates: [
-      nmRel('@anthropic-ai', claudePlatDir, targetPlatform === 'win32' ? 'claude.exe' : 'claude'),
-    ],
+    label: 'claude bundled runtime',
+    candidates: [claudeLocations(resourcesRoot, targetPlatform, targetArch).destination],
   });
 
   // 2. codex binary -- @openai/codex-<plat>-<arch>/vendor/<triple>/<bin|codex>/codex(.exe)
@@ -397,10 +397,65 @@ const WORKER_BUNDLES = [
     ],
   },
   {
+    // Spawned by the SQLite worker to verify a backup file off its thread. It
+    // resolves better-sqlite3 from its own location, same as its parent, so a
+    // missing bundle or missing binding here silently degrades backup
+    // verification back to blocking the query loop.
+    name: 'sqlite-verify-worker',
+    bundle: 'sqlite-verify-worker.bundle.js',
+    externals: ['better-sqlite3'],
+    nativeBinaries: [
+      {
+        candidateRelPaths: [
+          `node_modules/better-sqlite3/prebuilds/${targetPlatform}-${targetArch}.node`,
+          ...(targetPlatform === 'linux'
+            ? [`node_modules/better-sqlite3/prebuilds/linuxmusl-${targetArch}.node`]
+            : []),
+          'node_modules/better-sqlite3/build/Release/better_sqlite3.node',
+        ],
+      },
+    ],
+  },
+  {
+    // Spawned to run the full integrity/schema/content check that authorizes
+    // replacing a live database during recovery. If this bundle or its binding
+    // is missing the check falls back to running inline, which is exactly the
+    // multi-GB main-thread stall the worker exists to avoid -- and it degrades
+    // silently, so it has to be validated in the packaged output.
+    name: 'sqlite-recovery-verify-worker',
+    bundle: 'sqlite-recovery-verify-worker.bundle.js',
+    externals: ['better-sqlite3'],
+    nativeBinaries: [
+      {
+        candidateRelPaths: [
+          `node_modules/better-sqlite3/prebuilds/${targetPlatform}-${targetArch}.node`,
+          ...(targetPlatform === 'linux'
+            ? [`node_modules/better-sqlite3/prebuilds/linuxmusl-${targetArch}.node`]
+            : []),
+          'node_modules/better-sqlite3/build/Release/better_sqlite3.node',
+        ],
+      },
+    ],
+  },
+  {
     name: 'pglite-worker',
     bundle: 'worker.bundle.js',
     externals: [],
     nativeBinaries: [],
+  },
+  {
+    // The memory backend is a utility-process module under Resources/extensions.
+    // Its local embedder is externalized and must resolve from Resources/node_modules.
+    name: 'memory-backend',
+    bundle: 'extensions/nimbalyst-memory/dist/backend.js',
+    externals: ['@huggingface/transformers', 'onnxruntime-node', 'onnxruntime-common'],
+    nativeBinaries: (targetArch === 'universal' ? ['x64', 'arm64'] : [targetArch]).map(
+      (arch) => ({
+        candidateRelPaths: [
+          `node_modules/onnxruntime-node/bin/napi-v3/${targetPlatform}/${arch}/onnxruntime_binding.node`,
+        ],
+      }),
+    ),
   },
 ];
 
@@ -541,6 +596,12 @@ if (canBootCheck) {
         const r = db.prepare('select sqlite_version() as v').get();
         db.close();
         if (!r || !r.v) throw new Error('better-sqlite3 returned no sqlite_version');
+      `,
+      'onnxruntime-node': `
+        const ort = req('onnxruntime-node');
+        if (!ort || typeof ort.InferenceSession !== 'function') {
+          throw new Error('onnxruntime-node did not expose InferenceSession');
+        }
       `,
     };
 

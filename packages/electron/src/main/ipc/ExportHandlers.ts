@@ -3,11 +3,16 @@ import { safeHandle } from '../utils/ipcRegistry';
 import { writeFile } from 'fs/promises';
 import { logger } from '../utils/logger';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
-import { AISessionsRepository } from '@nimbalyst/runtime';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import type { SessionData } from '@nimbalyst/runtime/ai/server/types';
 import { exportSessionToHtml, getExportFilename } from '../services/SessionHtmlExporter';
 import { loadViewMessages } from '../utils/transcriptHelpers';
 import { getDialogDefaultPath, rememberDialogSelection } from '../utils/dialogPaths';
+import { recordAnimationGif, type AnimationGifRequest } from '../services/AnimationGifRecorder';
+import {
+  recordAnimationVideo,
+  type AnimationVideoRequest,
+} from '../services/AnimationVideoRecorder';
 
 /**
  * Registers IPC handlers for export functionality.
@@ -112,15 +117,12 @@ export function registerExportHandlers() {
           generateTaggedPDF,
           margins: margins
             ? {
-                marginType: 'custom',
                 top: margins.top ?? 0.4,
                 bottom: margins.bottom ?? 0.4,
                 left: margins.left ?? 0.4,
                 right: margins.right ?? 0.4,
               }
-            : {
-                marginType: 'default',
-              },
+            : undefined,
         });
 
         // Write the PDF to file
@@ -138,6 +140,66 @@ export function registerExportHandlers() {
         if (hiddenWindow && !hiddenWindow.isDestroyed()) {
           hiddenWindow.close();
         }
+      }
+    }
+  );
+
+  /**
+   * Record a self-playing HTML animation to an animated GIF.
+   *
+   * The caller supplies the HTML (built with capture hooks) and the animation's
+   * own duration; everything about how the scene draws stays in the extension
+   * that owns the format.
+   */
+  safeHandle(
+    'export:animationGif',
+    async (
+      _event,
+      options: AnimationGifRequest
+    ): Promise<{ success: boolean; error?: string; result?: unknown }> => {
+      try {
+        if (!options?.html || !options?.outputPath) {
+          return { success: false, error: 'html and outputPath are required.' };
+        }
+        if (!(options.durationMs > 0)) {
+          return { success: false, error: 'durationMs must be greater than zero.' };
+        }
+        const result = await recordAnimationGif(options);
+        return { success: true, result };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.file.error(`[ExportHandlers] GIF export failed: ${message}`);
+        return { success: false, error: message };
+      }
+    }
+  );
+
+  /**
+   * Record a self-playing HTML animation to an H.264 MP4.
+   *
+   * Preferred over the GIF for anywhere that can play video, which is now
+   * everywhere that matters: an uploaded GIF is transcoded to H.264 by the
+   * destination anyway, so the palette is lost for nothing.
+   */
+  safeHandle(
+    'export:animationMp4',
+    async (
+      _event,
+      options: AnimationVideoRequest
+    ): Promise<{ success: boolean; error?: string; result?: unknown }> => {
+      try {
+        if (!options?.html || !options?.outputPath) {
+          return { success: false, error: 'html and outputPath are required.' };
+        }
+        if (!(options.durationMs > 0)) {
+          return { success: false, error: 'durationMs must be greater than zero.' };
+        }
+        const result = await recordAnimationVideo(options);
+        return { success: true, result };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.file.error(`[ExportHandlers] MP4 export failed: ${message}`);
+        return { success: false, error: message };
       }
     }
   );

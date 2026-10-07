@@ -1,19 +1,30 @@
+// @vitest-environment node
+import { execFile } from 'child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import { promisify } from 'util';
 import {
+  discardGitChanges,
   explainGitPushFailure,
+  getWorkingChanges,
   isDetachedHeadState,
   normalizeBranchSelection,
   normalizeCurrentBranch,
   resolveGitDiffTarget,
 } from '../GitHandlers';
+import { GitOperationLogService } from '../../services/GitOperationLogService';
+import { assertGitSandbox, gitSandboxEnv } from '../../services/testSupport/gitTestSandbox';
+
+const execFileAsync = promisify(execFile);
 
 let tmpRoot: string;
+const testTempRoot = process.env.NIMBALYST_TEST_TEMP_DIR ?? os.tmpdir();
 
 beforeEach(async () => {
-  tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'nim-git-handlers-test-'));
+  await fs.mkdir(testTempRoot, { recursive: true });
+  tmpRoot = await fs.mkdtemp(path.join(testTempRoot, 'nim-git-handlers-test-'));
 });
 
 afterEach(async () => {
@@ -33,6 +44,59 @@ async function makeGitFile(target: string): Promise<void> {
   await mkdirp(target);
   await fs.writeFile(path.join(target, '.git'), 'gitdir: /tmp/shared.git/worktrees/test\n');
 }
+
+async function git(args: string[], cwd: string): Promise<void> {
+  if (args[0] !== 'init') assertGitSandbox(cwd, testTempRoot);
+  await execFileAsync('git', args, { cwd, env: gitSandboxEnv(testTempRoot) });
+}
+
+async function initScratchRepo(cwd: string): Promise<void> {
+  await git(['init', '-q'], cwd);
+  await git(['config', 'user.email', 'test@example.com'], cwd);
+  await git(['config', 'user.name', 'Test User'], cwd);
+  await git(['config', 'commit.gpgsign', 'false'], cwd);
+  assertGitSandbox(cwd, testTempRoot);
+}
+
+describe('working tree mutations', () => {
+  it('does not expand a pathspec-magic filename while discarding changes', async () => {
+    await initScratchRepo(tmpRoot);
+    const magicPath = path.join(tmpRoot, ':(glob)**');
+    const unrelatedPath = path.join(tmpRoot, 'unrelated.txt');
+    await fs.writeFile(magicPath, 'baseline magic\n');
+    await fs.writeFile(unrelatedPath, 'baseline unrelated\n');
+    await git(['add', '--', ':(glob)**', 'unrelated.txt'], tmpRoot);
+    await git(['commit', '-q', '-m', 'baseline'], tmpRoot);
+
+    await fs.writeFile(magicPath, 'changed magic\n');
+    await fs.writeFile(unrelatedPath, 'changed unrelated\n');
+
+    const operationLog = new GitOperationLogService({
+      rootDir: path.join(tmpRoot, 'operation-logs'),
+      broadcast: () => undefined,
+    });
+    const result = await discardGitChanges(tmpRoot, [':(glob)**'], operationLog);
+
+    expect(result.success).toBe(false);
+    expect(await fs.readFile(magicPath, 'utf8')).toBe('changed magic\n');
+    expect(await fs.readFile(unrelatedPath, 'utf8')).toBe('changed unrelated\n');
+  });
+
+  it('reports a staged rename as a deletion plus an addition', async () => {
+    await initScratchRepo(tmpRoot);
+    await fs.writeFile(path.join(tmpRoot, 'old.ts'), 'export const value = 1;\n');
+    await git(['add', 'old.ts'], tmpRoot);
+    await git(['commit', '-q', '-m', 'baseline'], tmpRoot);
+    await git(['mv', 'old.ts', 'new.ts'], tmpRoot);
+
+    const changes = await getWorkingChanges(tmpRoot);
+
+    expect(changes.staged).toEqual([
+      { path: 'old.ts', status: 'D' },
+      { path: 'new.ts', status: 'A' },
+    ]);
+  });
+});
 
 describe('resolveGitDiffTarget', () => {
   it('keeps workspace-root files relative to the workspace repo', async () => {
@@ -151,5 +215,50 @@ describe('explainGitPushFailure', () => {
   it('passes through empty and missing errors', () => {
     expect(explainGitPushFailure(undefined, context)).toBeUndefined();
     expect(explainGitPushFailure('', context)).toBe('');
+  });
+});
+
+describe('benign local Git operand semantics', () => {
+  it('accepts revision checkout/creation/cherry-pick/rebase and remote separators in isolated repos', async () => {
+    const source = path.join(tmpRoot, 'source repo');
+    const receiver = path.join(tmpRoot, 'receiver repo');
+    await mkdirp(source);
+    await mkdirp(receiver);
+    for (const repo of [source, receiver]) {
+      await initScratchRepo(repo);
+      await git(['branch', '-M', repo === source ? 'main' : 'receiver'], repo);
+      await fs.writeFile(path.join(repo, 'baseline.txt'), 'baseline\n');
+      await git(['add', 'baseline.txt'], repo);
+      await git(['commit', '-q', '-m', 'baseline'], repo);
+    }
+    await fs.writeFile(path.join(source, 'second.txt'), 'second\n');
+    await git(['add', 'second.txt'], source);
+    await git(['commit', '-q', '-m', 'second'], source);
+
+    await git(['checkout', '-b', 'topic/日本語', 'HEAD~1'], source);
+    await git(['cherry-pick', 'main'], source);
+    expect(await fs.readFile(path.join(source, 'second.txt'), 'utf8')).toBe('second\n');
+    await git(['checkout', 'refs/heads/main'], source);
+    await git(['checkout', '@{-1}'], source);
+    const current = await execFileAsync('git', ['branch', '--show-current'], { cwd: source, env: gitSandboxEnv(testTempRoot) });
+    expect(current.stdout.trim()).toBe('topic/日本語');
+    await git(['checkout', 'HEAD^'], source);
+    await git(['checkout', '-b', 'from-revision', 'HEAD'], source);
+    await git(['rebase', 'main'], source);
+    expect(await fs.readFile(path.join(source, 'second.txt'), 'utf8')).toBe('second\n');
+
+    // Both ends are disposable local repositories. No network transports or hooks.
+    assertGitSandbox(receiver, testTempRoot);
+    await git(['push', '--', receiver, 'main'], source);
+    await git(['push', '--force-with-lease', '--', receiver, 'main'], source);
+    await git(['fetch', '--', receiver], source);
+    await git(['push', '--set-upstream', '--', receiver, 'main'], source);
+    const upstream = await execFileAsync('git', ['config', 'branch.main.remote'], { cwd: source, env: gitSandboxEnv(testTempRoot) });
+    expect(upstream.stdout.trim()).toBe(receiver);
+    const [sourceHead, receiverMain] = await Promise.all([
+      execFileAsync('git', ['rev-parse', 'main'], { cwd: source, env: gitSandboxEnv(testTempRoot) }),
+      execFileAsync('git', ['rev-parse', 'main'], { cwd: receiver, env: gitSandboxEnv(testTempRoot) }),
+    ]);
+    expect(receiverMain.stdout).toBe(sourceHead.stdout);
   });
 });

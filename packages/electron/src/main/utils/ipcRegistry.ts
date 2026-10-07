@@ -80,6 +80,20 @@ const IPC_SLOW_THRESHOLD_MS = (() => {
   return Number.isFinite(v) && v > 0 ? v : 1000;
 })();
 
+/**
+ * Channels whose duration is the length of an agent turn, not handler latency.
+ * A multi-minute `ai:sendMessage` is the feature working, so timing these only
+ * buries the handlers that are genuinely slow under a permanent top row of
+ * noise (and fires `[IpcSlow]` on every message the user sends).
+ *
+ * Only add a channel here when a long call is *expected*, not merely possible.
+ */
+const UNTIMED_IPC_CHANNELS = new Set<string>([
+  'ai:sendMessage',
+  'ai:triggerQueueProcessing',
+  'ai:compactSession',
+]);
+
 function ipcSlowLog(channel: string, durationMs: number): void {
   // Avoid pulling the main logger here (would tangle this module's
   // dependency graph at import time during tests); console.warn is captured
@@ -132,6 +146,7 @@ function percentile(sortedValues: number[], pct: number): number {
  *
  * Also wraps the handler with slow-call instrumentation: any invocation
  * longer than `IPC_SLOW_THRESHOLD_MS` logs `[IpcSlow] <channel> took ...ms`.
+ * Channels in `UNTIMED_IPC_CHANNELS` are registered unwrapped.
  */
 export function safeHandle(
   channel: string,
@@ -150,7 +165,7 @@ export function safeHandle(
   // Wrap so we can time every invocation. We can't observe how long the
   // promise takes from outside `ipcMain.handle`, so the wrap is the only
   // place to measure end-to-end main-side handler latency.
-  const instrumented = async (event: IpcMainInvokeEvent, ...args: any[]) => {
+  const timed = async (event: IpcMainInvokeEvent, ...args: any[]) => {
     const stats = getOrCreateIpcStats(channel);
     const t0 = performance.now();
     stats.callCount += 1;
@@ -175,6 +190,8 @@ export function safeHandle(
     }
   };
 
+  const instrumented = UNTIMED_IPC_CHANNELS.has(channel) ? handler : timed;
+
   // Special case: electron-log registers its own '__ELECTRON_LOG__' handler
   // If we try to register after electron-log has already initialized, we'll get an error
   // This can happen during HMR or if the module is bundled multiple times
@@ -192,6 +209,32 @@ export function safeHandle(
       throw error;
     }
   }
+}
+
+/**
+ * Fire-and-forget listeners have no caller to reject to, so a throw (or a
+ * rejected promise from an async listener) escapes to Electron, which shows
+ * the native "JavaScript error in the main process" dialog. Log it with the
+ * channel instead and never rethrow. `safeHandle` is deliberately not wrapped:
+ * invoke errors must still reject to the renderer.
+ */
+function containListenerErrors(
+  channel: string,
+  handler: (event: Electron.IpcMainEvent, ...args: any[]) => unknown,
+): (event: Electron.IpcMainEvent, ...args: any[]) => void {
+  const logError = (error: unknown) => {
+    console.error(`[IPC] Listener for ${channel} threw:`, error);
+  };
+  return (event, ...args) => {
+    try {
+      const result = handler(event, ...args);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).then(undefined, logError);
+      }
+    } catch (error) {
+      logError(error);
+    }
+  };
 }
 
 /**
@@ -223,7 +266,7 @@ export function safeOn(
     return;
   }
   handlers.add(handler);
-  ipcMain.on(channel, handler);
+  ipcMain.on(channel, containListenerErrors(channel, handler));
 }
 
 /**
@@ -253,9 +296,10 @@ export function safeOnce(
   handlers.add(handler);
 
   // Wrap to remove from our tracking when the handler fires
+  const contained = containListenerErrors(channel, handler);
   const wrappedHandler = (event: Electron.IpcMainEvent, ...args: any[]) => {
     handlers.delete(handler);
-    handler(event, ...args);
+    contained(event, ...args);
   };
   ipcMain.once(channel, wrappedHandler);
 }

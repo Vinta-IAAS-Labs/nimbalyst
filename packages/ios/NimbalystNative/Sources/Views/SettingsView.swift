@@ -4,6 +4,7 @@ import SwiftUI
 public struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject private var notificationManager = NotificationManager.shared
+    @ObservedObject private var fleetActivityController = FleetActivityController.shared
     @State private var analyticsEnabled = AnalyticsManager.shared.isEnabled
     @State private var showUnpairConfirmation = false
     @State private var showSignOutConfirmation = false
@@ -155,11 +156,29 @@ public struct SettingsView: View {
                     }
                 }
             ))
+            // Independent of push on purpose: a Live Activity needs no
+            // notification permission and makes no sound, so someone who has
+            // declined alerts may still want the ambient card, and vice versa.
+            Toggle("Session Fleet Live Activity", isOn: Binding(
+                get: { fleetActivityController.isEnabled },
+                set: { fleetActivityController.setEnabled($0) }
+            ))
+            .disabled(!fleetActivityController.areActivitiesEnabled)
         } header: {
             Text("Notifications")
         } footer: {
-            Text(notificationFooterText)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(notificationFooterText)
+                Text(liveActivityFooterText)
+            }
         }
+    }
+
+    private var liveActivityFooterText: String {
+        if !fleetActivityController.areActivitiesEnabled {
+            return "Live Activities are turned off for Nimbalyst in iOS Settings."
+        }
+        return "Show running sessions and what needs you on the Lock Screen and in the Dynamic Island. It appears when something is happening and disappears when nothing is."
     }
 
     private var notificationFooterText: String {
@@ -210,13 +229,24 @@ public struct SettingsView: View {
                 hasOpenAIApiKey = KeychainManager.getOpenAIApiKey() != nil
             }
 
-            // Voice picker
-            Picker("Voice", selection: $voiceSettings.voice) {
-                ForEach(Self.voiceOptions, id: \.self) { voice in
-                    Text(voice.capitalized).tag(voice)
-                }
+            Picker("Engine", selection: Binding(get: { voiceSettings.effectiveEngine.rawValue }, set: { voiceSettings.engine = $0; saveVoiceSettings() })) {
+                Text("Realtime").tag("realtime")
+                Text("GPT-Live (Preview)").tag("live")
             }
-            .onChange(of: voiceSettings.voice) { _, _ in saveVoiceSettings() }
+            if voiceSettings.effectiveEngine == .live {
+                Picker("Live Voice", selection: Binding(get: { voiceSettings.effectiveLiveVoice }, set: { voiceSettings.liveVoice = $0; saveVoiceSettings() })) {
+                    ForEach(VoiceModeSettings.liveVoices, id: \.self) { Text($0.capitalized).tag($0) }
+                }
+                Picker("Live Controller", selection: Binding(get: { voiceSettings.effectiveLiveController }, set: { voiceSettings.liveControllerModel = $0; saveVoiceSettings() })) {
+                    Text("GPT-5.6 Terra").tag("gpt-5.6-terra")
+                    Text("GPT-5.6 Luna").tag("gpt-5.6-luna")
+                }
+            } else {
+                Picker("Voice", selection: $voiceSettings.voice) {
+                    ForEach(Self.voiceOptions, id: \.self) { voice in Text(voice.capitalized).tag(voice) }
+                }
+                .onChange(of: voiceSettings.voice) { _, _ in saveVoiceSettings() }
+            }
 
             // Idle timeout
             Stepper(

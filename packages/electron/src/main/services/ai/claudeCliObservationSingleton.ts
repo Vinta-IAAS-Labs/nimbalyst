@@ -41,6 +41,7 @@ import { classifyClaudeCliUpstreamError } from './claudeCliErrorClassifier';
 import { createClaudeCliErrorSurfacePolicy } from './claudeCliErrorSurfacePolicy';
 import { logClaudeCliUpstreamError } from './claudeCliErrorLog';
 import { extractToolResults } from './claudeCliObservation/claudeApiRequestParser';
+import { buildProxyPassthroughEnv } from './claudeCliObservation/proxyPassthroughEnv';
 import {
   isSubAgentTurnInFlight,
   noteAssistantTaskCalls,
@@ -59,10 +60,14 @@ import {
 } from './claudeCliTurnSummary';
 import { AnalyticsService } from '../analytics/AnalyticsService';
 import { notificationService } from '../NotificationService';
+import { composeNotificationTitle } from '../../../shared/notificationTitle';
 import { SoundNotificationService } from '../SoundNotificationService';
-import { getSyncProvider, isDesktopTrulyAway } from '../SyncManager';
+import { isDesktopTrulyAway } from '../SyncManager';
+import { requestMobilePush } from './mobilePushRequest';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { getClaudeCodeApiUpstreamUrl } from '../../utils/store';
+import { ClaudeSettingsManager } from '../ClaudeSettingsManager';
+import { resolveClaudeCliProxyUpstream } from './claudeCliObservation/proxyUpstream';
 import type { AssembledAssistantMessage } from './claudeCliObservation/claudeApiMessageAssembler';
 
 /**
@@ -88,10 +93,12 @@ async function notifyClaudeCliTurnComplete(
     }
 
     await notificationService.showNotification({
-      title: `${title} -- Response Ready`,
+      title: composeNotificationTitle(title, 'Response Ready'),
       body,
+      kind: 'agent-complete',
       sessionId,
       workspacePath,
+      sourceLabel: title,
       provider: 'claude-code-cli',
     });
 
@@ -99,7 +106,7 @@ async function notifyClaudeCliTurnComplete(
     // locked / idle past threshold) — otherwise the OS notification above
     // already covers it and a push would duplicate via Continuity.
     if (isDesktopTrulyAway()) {
-      getSyncProvider()?.requestMobilePush?.(sessionId, title, body);
+      void requestMobilePush(sessionId, title, body, { reason: 'cli_turn_complete' });
     }
   } catch (err) {
     console.warn('[ClaudeCliObservation] Failed to fire turn-complete notification:', err);
@@ -183,7 +190,7 @@ async function persistAssistantTurn(
 export async function startClaudeCliProxyObservation(opts: {
   sessionId: string;
   workspacePath: string;
-}): Promise<{ baseUrl: string; stop: () => void } | null> {
+}): Promise<{ baseUrl: string; env: Record<string, string>; stop: () => void } | null> {
   const { sessionId, workspacePath } = opts;
 
   // tool_result blocks re-appear in every subsequent request body — dedup so each
@@ -209,7 +216,14 @@ export async function startClaudeCliProxyObservation(opts: {
   // Undefined → direct to api.anthropic.com (unchanged default). Observation of
   // the ORIGINAL request body / response SSE is unaffected — we only change where
   // the bytes are forwarded.
-  const apiUpstreamUrl = getClaudeCodeApiUpstreamUrl();
+  // A loopback ANTHROPIC_BASE_URL in Claude's own settings is followed too.
+  const { upstreamUrl: apiUpstreamUrl, ignoredClaudeSettingsBaseUrl } = resolveClaudeCliProxyUpstream(
+    getClaudeCodeApiUpstreamUrl(),
+    await ClaudeSettingsManager.getInstance().getEffectiveEnvValue(workspacePath, 'ANTHROPIC_BASE_URL'),
+  );
+  if (ignoredClaudeSettingsBaseUrl) {
+    console.warn(`[ClaudeCliObservation] not following non-loopback ANTHROPIC_BASE_URL from Claude settings: ${ignoredClaudeSettingsBaseUrl}`);
+  }
 
   const observation = new ClaudeCliProxyObservation({
     sessionId,
@@ -272,9 +286,21 @@ export async function startClaudeCliProxyObservation(opts: {
         statusCode === 529
           ? 'Anthropic is overloaded. Claude will retry shortly.'
           : `Rate limited by Anthropic${retryAfter ? ` (retry after ${retryAfter}s)` : ''}.`;
-      void notificationService
-        .showNotification({ title: 'Claude CLI -- paused', body, sessionId, workspacePath, provider: 'claude-code-cli' })
-        .catch(() => {});
+      void (async () => {
+        const session = await AISessionsRepository.get(sessionId).catch(() => null);
+        const sourceLabel = session?.title || session?.provider || `Session ${sessionId.slice(0, 8)}`;
+        await notificationService.showNotification({
+          // A rate-limit pause is the agent stopping until something changes,
+          // not a finished turn.
+          title: composeNotificationTitle(sourceLabel, 'Claude CLI paused'),
+          body,
+          kind: 'needs-input',
+          sessionId,
+          workspacePath,
+          sourceLabel,
+          provider: 'claude-code-cli',
+        });
+      })().catch(() => {});
     },
     onUpstreamError: ({ statusCode, body, retryAfter }) => {
       // Render a failed turn IN the rich transcript so a rate-limited / failed
@@ -294,9 +320,15 @@ export async function startClaudeCliProxyObservation(opts: {
   });
 
   const { baseUrl } = await observation.start();
+  // Sitting on ANTHROPIC_BASE_URL makes the CLI read us as an inference gateway
+  // and withhold first-party-only behavior, which breaks WebSearch/WebFetch at
+  // effort `max`. Declare the proxy first-party, but only when it really
+  // does forward to Anthropic. See proxyPassthroughEnv.ts.
+  const env = buildProxyPassthroughEnv(apiUpstreamUrl);
   console.log(`[ClaudeCliObservation] proxy started for ${sessionId} at ${baseUrl}`);
   return {
     baseUrl,
+    env,
     stop: () => {
       observation.stop();
       // Drop the per-session seen-set so a later relaunch re-seeds from the DB.

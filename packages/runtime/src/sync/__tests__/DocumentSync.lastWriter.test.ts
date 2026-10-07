@@ -1,3 +1,4 @@
+// @vitest-environment node
 /**
  * Last-writer attribution (NIM-953 / NIM-955).
  *
@@ -9,16 +10,16 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { asTeamJwt, asTeamMemberId } from '../../auth/jwtScopes';
 import { DocumentSyncProvider } from '../DocumentSync';
 
 function provider(): DocumentSyncProvider {
   return new DocumentSyncProvider({
     serverUrl: 'ws://example.test',
-    getJwt: async () => 'token',
+    getJwt: async () => asTeamJwt('token'),
     orgId: 'org-1',
-    userId: 'user-1',
+    teamMemberId: asTeamMemberId('user-1'),
     documentId: 'doc-1',
-    reviewGateEnabled: false,
   });
 }
 

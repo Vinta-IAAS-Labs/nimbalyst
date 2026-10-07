@@ -15,10 +15,13 @@ import type {
   EditorMenuItem,
   EditorHostFileSystem,
 } from '@nimbalyst/runtime';
-import { registerEditorAPI, unregisterEditorAPI } from '@nimbalyst/runtime';
+import { createEditorAPIOwnerToken, registerEditorAPI, unregisterEditorAPI } from '@nimbalyst/runtime';
 import { normalizeExternalHttpsUrl } from './externalUrl';
+import { nimAssetUrl } from '../../utils/assetUrl';
 
 export interface EditorHostOptions {
+  /** Instance-local API notifications; never look up another tab's buffer. */
+  onEditorAPIChange?: (api: unknown | null) => void;
   /** Absolute path to the file being edited */
   filePath: string;
 
@@ -89,6 +92,9 @@ export interface EditorHostOptions {
   /** Optional: Subscribe to diff being cleared externally */
   subscribeToDiffCleared?: (callback: () => void) => () => void;
 
+  /** Optional: Subscribe to the app's Find command (see EditorHost.onFindRequested) */
+  subscribeToFindRequests?: (callback: () => void) => () => void;
+
   // ============ SOURCE MODE (OPTIONAL) ============
 
   /** Whether this editor supports source mode */
@@ -136,6 +142,7 @@ export interface EditorHostOptions {
  * by wiring up to TabEditor's existing save/load/watch machinery.
  */
 export function createEditorHost(options: EditorHostOptions): EditorHost {
+  const editorAPIOwnerToken = createEditorAPIOwnerToken(`visible:${options.filePath}`);
   return {
     // ============ FILE INFO ============
     filePath: options.filePath,
@@ -183,7 +190,7 @@ export function createEditorHost(options: EditorHostOptions): EditorHost {
     },
 
     // ============ SAVE REQUESTS ============
-    onSaveRequested(callback: () => void): () => void {
+    onSaveRequested(callback: () => void | Promise<void>): () => void {
       return options.subscribeToSaveRequests(callback);
     },
 
@@ -200,6 +207,15 @@ export function createEditorHost(options: EditorHostOptions): EditorHost {
         }
       : undefined,
 
+    // ============ ASSET URL ============
+    // Virtual tabs have no file behind them, so there is nothing to serve.
+    // `nim-asset://` itself re-validates the path against the allowlisted
+    // roots, so minting a URL here grants no access on its own.
+    getAssetUrl(): string | null {
+      if (options.filePath.startsWith('virtual://')) return null;
+      return nimAssetUrl(options.filePath);
+    },
+
     // ============ DIFF MODE (OPTIONAL) ============
     onDiffRequested: options.subscribeToDiffRequests
       ? (callback: (config: DiffConfig) => void) => options.subscribeToDiffRequests!(callback)
@@ -215,6 +231,11 @@ export function createEditorHost(options: EditorHostOptions): EditorHost {
 
     onDiffCleared: options.subscribeToDiffCleared
       ? (callback: () => void) => options.subscribeToDiffCleared!(callback)
+      : undefined,
+
+    // ============ FIND (OPTIONAL) ============
+    onFindRequested: options.subscribeToFindRequests
+      ? (callback: () => void) => options.subscribeToFindRequests!(callback)
       : undefined,
 
     // ============ SOURCE MODE (OPTIONAL) ============
@@ -246,10 +267,14 @@ export function createEditorHost(options: EditorHostOptions): EditorHost {
 
     // ============ EDITOR API REGISTRATION ============
     registerEditorAPI(api: unknown | null): void {
+      options.onEditorAPIChange?.(api);
       if (api) {
-        registerEditorAPI(options.filePath, api, options.triggerSave);
+        registerEditorAPI(options.filePath, api, options.triggerSave, {
+          ownerToken: editorAPIOwnerToken,
+          priority: 'visible',
+        });
       } else {
-        unregisterEditorAPI(options.filePath);
+        unregisterEditorAPI(options.filePath, editorAPIOwnerToken);
       }
     },
 

@@ -9,6 +9,7 @@
  */
 
 import { KeyboardShortcuts } from '../../shared/KeyboardShortcuts';
+import { CANVAS_HELP_CONTENT } from '@nimbalyst/runtime/canvas/canvasHelpContent';
 import { getRegisteredPanels } from '../extensions/panels/PanelRegistry';
 import { getRegisteredKeybindings } from '../extensions/commands/ExtensionCommandRegistry';
 
@@ -28,6 +29,7 @@ export interface HelpEntry {
  * Central registry of help content, keyed by data-testid
  */
 export const HelpContent: Record<string, HelpEntry> = {
+  ...CANVAS_HELP_CONTENT,
   // ============================================================================
   // Teams - Security & encryption (Epic H2)
   // ============================================================================
@@ -35,6 +37,60 @@ export const HelpContent: Record<string, HelpEntry> = {
   'h2-security-encryption-section': {
     title: 'Security & encryption',
     body: 'Controls how your team\'s shared data is encrypted. End-to-end encrypted teams (desktop & mobile only) can be migrated to server-managed keys to unlock web, CLI, and AI-agent access — encrypted, isolated per team, and audit-logged, but no longer zero-knowledge. Your personal sync always stays end-to-end encrypted. Only owners and admins can migrate.',
+  },
+
+  // ============================================================================
+  // Organization window - sidebar, rooms and direct messages
+  // ============================================================================
+
+  'team-tab-inbox': {
+    title: 'Inbox',
+    body: 'Mentions, assignments, replies, and activity in conversations you follow across this organization. Tracker and document activity land here too, so the Inbox stays useful even when rooms are turned off.',
+  },
+  'org-rooms-section-add': {
+    title: 'Rooms',
+    body: 'Create a room or browse the directory.\n\nRooms are organization-wide conversations. **Public** rooms are open to everyone in the organization; **private** rooms are limited to the people you add. An organization can restrict room creation to admins in its settings — browsing stays open to everyone.',
+  },
+  'org-dms-section-add': {
+    title: 'Start a direct message',
+    body: 'A private conversation with up to seven other people. Direct messages cannot be renamed or joined later — pick the participants up front.',
+  },
+  'org-browse-rooms': {
+    title: 'Browse rooms',
+    body: 'Every room you can see: public rooms across the organization plus the private ones you belong to. Joining a public room makes its activity follow you into your Inbox.',
+  },
+  'org-rooms-create': {
+    title: 'Create a room',
+    body: 'Add a new organization room. Public rooms are open to everyone; private rooms are limited to the members you add.',
+  },
+  'org-room-notifications': {
+    title: 'Notifications for this conversation',
+    body: 'Choose what reaches your Inbox from here:\n\n- **All messages** — every message\n- **Mentions only** — messages that @mention you\n- **Nothing** — nothing at all\n\nThe setting is per conversation and follows you across devices.',
+  },
+  'org-room-actions': {
+    title: 'Room actions',
+    body: 'Invite members and open room settings — rename, edit the topic, manage membership and room admins, allow or block agent posting, or archive the room. Available to room admins and organization admins.',
+  },
+  'org-window-status-bar': {
+    title: 'Nimbalyst Teams is in beta',
+    body: 'Expect bugs.\n\nOrganizations are free during beta and will require a paid Nimbalyst Teams subscription after launch; existing organizations get advance notice before any pricing change.',
+  },
+
+  // ============================================================================
+  // Organization window - settings panel
+  // ============================================================================
+
+  'organization-settings-rooms-toggle': {
+    title: 'Rooms',
+    body: 'Turn organization rooms off for an organization that chats elsewhere. The rooms section, the directory and room creation disappear for everyone; existing rooms are kept and come back if you turn this on again. The Inbox, document comments and tracker comments are unaffected.',
+  },
+  'organization-settings-dms-toggle': {
+    title: 'Direct messages',
+    body: 'Turn direct messages off for this organization. The direct-messages section and every compose path to a person disappear; existing conversations are kept and come back if you turn this on again.',
+  },
+  'organization-settings-room-creation': {
+    title: 'Who can create rooms',
+    body: 'Any member can create rooms by default. Restricting creation to organization admins leaves everyone else able to read, post in, and join the rooms that exist.',
   },
 
   // ============================================================================
@@ -68,9 +124,9 @@ export const HelpContent: Record<string, HelpEntry> = {
   // Files Mode - Unified Header
   // ============================================================================
 
-  'ai-sessions-button': {
-    title: 'Past AI Sessions',
-    body: 'See AI sessions that edited this file. Jump back to continue a conversation or review changes.',
+  'document-session-control': {
+    title: 'AI Sessions for This Document',
+    body: 'Jump straight back into the last session on this document, or use the arrow to pick another session or start a new one.',
   },
   'file-history-button': {
     title: 'Document History',
@@ -245,12 +301,12 @@ export const HelpContent: Record<string, HelpEntry> = {
     body: 'Choose which AI model to use. Different models have different capabilities and speeds.',
   },
   'model-picker-provider-claude-code': {
-    title: 'Claude Agent (Claude Code Based)',
-    body: 'The in-app agent built on Claude Code with full Nimbalyst integration: it sees your active document and selection, renders the rich inline transcript, and tracks every file it edits. Uses your configured Anthropic API key.',
+    title: 'Claude Agent (Recommended)',
+    body: 'The in-app agent built on Claude Code with full Nimbalyst integration: it sees your active document and selection, renders the rich inline transcript, and tracks every file it edits. Runs on your Claude subscription when you sign in with your Claude plan, or on your Anthropic API key.',
   },
   'model-picker-provider-claude-code-cli': {
     title: 'Claude Code CLI (Terminal Mode)',
-    body: 'Runs the genuine claude terminal binary in an embedded terminal, billed to your Claude subscription. You get native CLI behavior — its slash commands and TUI — in the Raw terminal drawer, while Nimbalyst mirrors the conversation into the rich transcript.',
+    body: 'For people who prefer the command-line tool itself: runs the genuine claude binary in an embedded terminal, so you get its slash commands and TUI in the Raw terminal drawer while Nimbalyst mirrors the conversation into the rich transcript. You do not need this to use your Claude subscription.',
   },
   'action-prompts-dropdown': {
     title: 'Action Prompts',
@@ -291,10 +347,6 @@ export const HelpContent: Record<string, HelpEntry> = {
     title: 'Agent Permissions',
     body: 'Configure which tools the AI agent can use. Control file access, command execution, and more.',
   },
-  'gutter-sync-button': {
-    title: 'Session Sync',
-    body: 'Check sync status for this project and manage sync settings.',
-  },
   'gutter-extension-dev-button': {
     title: 'Extension Dev Mode',
     body: 'Open extension development tools, logs, and rebuild options.',
@@ -322,13 +374,18 @@ export const HelpContent: Record<string, HelpEntry> = {
     shortcut: KeyboardShortcuts.view.trackerMode,
   },
   'collab-mode-button': {
-    title: 'Shared Documents',
-    body: 'Browse and edit documents shared with your team in real-time. Collaborate on markdown, spreadsheets, and diagrams.',
+    title: 'Pages',
+    body: 'Browse and edit pages shared with your team in real-time. Collaborate on markdown, spreadsheets, diagrams, and placed tracker types.',
     shortcut: KeyboardShortcuts.view.collabMode,
   },
+  'org-mode-button': {
+    title: 'Organization',
+    body: "Your organization's inbox, rooms and direct messages, for the organization this project belongs to.",
+    shortcut: KeyboardShortcuts.view.orgMode,
+  },
   'pr-review-mode-button': {
-    title: 'Pull Requests',
-    body: 'Review GitHub pull requests without leaving the app: browse the list, read diffs and conversation, and approve or merge.',
+    title: 'GitHub',
+    body: 'Work this project\'s GitHub without leaving the app: browse pull requests and issues, read diffs and conversation, and hand either to an agent.',
     shortcut: KeyboardShortcuts.view.prReviewMode,
   },
 

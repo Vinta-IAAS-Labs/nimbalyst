@@ -14,6 +14,11 @@ export type ClaudeCodeSettingsLoader = () => Promise<{ projectCommandsEnabled: b
 export type ClaudeSettingsEnvLoader = () => Promise<Record<string, string>>;
 export type ShellEnvironmentLoader = () => Record<string, string> | null;
 export type AdditionalDirectoriesLoader = (workspacePath: string) => string[];
+export type AttachmentStagingLoader = (workspacePath: string) => {
+  root: string;
+  mode: 'temp' | 'workspace' | 'custom';
+};
+export type AttachmentDenyRulesLoader = (workspacePath: string) => Promise<string[]>;
 export type PatternSaver = (workspacePath: string, pattern: string) => Promise<void>;
 export type PatternChecker = (workspacePath: string, pattern: string) => Promise<boolean>;
 export type ImageCompressor = (
@@ -22,6 +27,41 @@ export type ImageCompressor = (
   options?: { targetSizeBytes?: number }
 ) => Promise<{ buffer: Buffer; mimeType: string; wasCompressed: boolean }>;
 export type ExtensionFileTypesLoader = () => Set<string>;
+
+/**
+ * Document history, as the agent tool hooks consume it: snapshot a file before
+ * an edit, and tag edited files for review.
+ *
+ * This is a port because the implementation is Electron's `HistoryManager`, and
+ * ClaudeCodeProvider used to import it by a relative path that escaped the
+ * runtime package entirely (`../../../../../electron/src/main/HistoryManager`).
+ * That single edge pulled ~51 files of the desktop app -- the settings store,
+ * the credential vault, the logger -- into the graph of anything that touched
+ * session execution, which no headless host can satisfy.
+ *
+ * Deliberately optional. `AgentToolHooks` already treats an absent history
+ * manager as a supported state and guards every call site, so a host with no
+ * document history skips snapshotting rather than failing.
+ */
+export type HistoryManagerPort = {
+  createSnapshot: (
+    filePath: string,
+    content: string,
+    snapshotType: string,
+    message: string,
+    metadata?: any
+  ) => Promise<void>;
+  getPendingTags: (filePath: string) => Promise<Array<{ id: string; createdAt: Date; sessionId?: string }>>;
+  tagFile: (workspacePath: string, filePath: string, tagId: string, content: string, metadata?: any) => Promise<void>;
+  updateTagStatus: (filePath: string, tagId: string, status: string) => Promise<void>;
+};
+/**
+ * Resolves the git snapshot (branch, main branch, recent commits) stated at the
+ * top of a session's system prompt. Returns null when the workspace is not a
+ * repo or git did not answer in time — the caller freezes that "none" for the
+ * whole session rather than retrying on a later turn (#1177).
+ */
+export type GitContextLoader = (workspacePath: string) => Promise<string | null>;
 
 // ---- Dependency Store ----
 
@@ -52,6 +92,13 @@ export const ClaudeCodeDeps = {
   // Returns merged user + workspace MCP servers
   mcpConfigLoader: null as McpConfigLoader | null,
 
+  // Names `mcpConfigLoader` deliberately withheld from its last result because
+  // they failed the OAuth check. Read straight after that loader resolves, so it
+  // reports the same pass. Kept off `mcpConfigLoader`'s return value because that
+  // value IS the server map handed to the SDK -- a withheld server must not be in
+  // it. See GH #1057: without this the drop is invisible to every surface.
+  mcpWithheldNamesLoader: null as ((workspacePath?: string) => string[]) | null,
+
   // Returns plugin paths from enabled extensions with Claude plugins
   // Accepts optional workspace path to include project-scoped CLI plugins
   extensionPluginsLoader: null as ExtensionPluginsLoader | null,
@@ -72,9 +119,21 @@ export const ClaudeCodeDeps = {
   // Dock/Finder-launched Electron has a minimal PATH that omits those dirs.
   enhancedPathLoader: null as (() => string) | null,
 
+  // Returns the frozen git snapshot for a workspace. #1177: we suppress the
+  // CLI's own git-status block (CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS) because it
+  // is rebuilt from the live working tree on every resumed turn and invalidates
+  // the prompt cache; this loader supplies a Nimbalyst-owned replacement that
+  // the provider resolves once and never re-reads.
+  gitContextLoader: null as GitContextLoader | null,
+
   // Returns additional directories Claude should have access to based on workspace context
   // (e.g., SDK docs when working on an extension project)
   additionalDirectoriesLoader: null as AdditionalDirectoriesLoader | null,
+
+  // Resolves the host-owned attachment staging directory and effective Claude
+  // deny rules without making the runtime package depend on Electron storage.
+  attachmentStagingLoader: null as AttachmentStagingLoader | null,
+  attachmentDenyRulesLoader: null as AttachmentDenyRulesLoader | null,
 
   // ---- Security / Permissions ----
 
@@ -92,6 +151,10 @@ export const ClaudeCodeDeps = {
   // Returns file extensions that have custom editors registered via extensions
   // Used in planning mode to allow editing extension-registered file types (e.g., .mockup.html)
   extensionFileTypesLoader: null as ExtensionFileTypesLoader | null,
+
+  // Snapshots and review tags for files the agent edits. Null on a host with no
+  // document history, which the tool hooks handle by skipping snapshotting.
+  historyManager: null as HistoryManagerPort | null,
 
   // ---- Plan Tracking ----
 
@@ -117,6 +180,10 @@ export const ClaudeCodeDeps = {
     this.mcpConfigLoader = loader;
   },
 
+  setMcpWithheldNamesLoader(loader: ((workspacePath?: string) => string[]) | null): void {
+    this.mcpWithheldNamesLoader = loader;
+  },
+
   setExtensionPluginsLoader(loader: ExtensionPluginsLoader | null): void {
     this.extensionPluginsLoader = loader;
   },
@@ -137,8 +204,20 @@ export const ClaudeCodeDeps = {
     this.enhancedPathLoader = loader;
   },
 
+  setGitContextLoader(loader: GitContextLoader | null): void {
+    this.gitContextLoader = loader;
+  },
+
   setAdditionalDirectoriesLoader(loader: AdditionalDirectoriesLoader | null): void {
     this.additionalDirectoriesLoader = loader;
+  },
+
+  setAttachmentStagingLoader(loader: AttachmentStagingLoader | null): void {
+    this.attachmentStagingLoader = loader;
+  },
+
+  setAttachmentDenyRulesLoader(loader: AttachmentDenyRulesLoader | null): void {
+    this.attachmentDenyRulesLoader = loader;
   },
 
   setClaudeSettingsPatternSaver(saver: PatternSaver | null): void {
@@ -155,6 +234,10 @@ export const ClaudeCodeDeps = {
 
   setExtensionFileTypesLoader(loader: ExtensionFileTypesLoader | null): void {
     this.extensionFileTypesLoader = loader;
+  },
+
+  setHistoryManager(historyManager: HistoryManagerPort | null): void {
+    this.historyManager = historyManager;
   },
 
   setPlanTrackingEnabled(enabled: boolean): void {

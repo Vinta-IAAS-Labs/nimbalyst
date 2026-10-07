@@ -1,10 +1,28 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+// @vitest-environment node
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import simpleGit from 'simple-git';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { GitWorktreeService, WorkspaceHasNoCommitsError } from '../GitWorktreeService';
+import { gitOperationLock } from '../GitOperationLock';
+import * as operationLog from '../GitOperationLogService';
 import { assertGitSandbox, gitSandboxEnv } from '../testSupport/gitTestSandbox';
+
+describe('gitSandboxEnv', () => {
+  it('strips IDE-provided SSH_ASKPASS before simple-git runs a fixture command', async () => {
+    const previousAskPass = process.env.SSH_ASKPASS;
+    process.env.SSH_ASKPASS = '/mock/ide/askpass';
+    try {
+      const sandboxEnv = gitSandboxEnv(undefined, { pinConfigPaths: false });
+      expect(sandboxEnv.SSH_ASKPASS).toBeUndefined();
+      await expect(simpleGit(os.tmpdir()).env(sandboxEnv).raw(['--version'])).resolves.toMatch(/^git version /);
+    } finally {
+      if (previousAskPass === undefined) delete process.env.SSH_ASKPASS;
+      else process.env.SSH_ASKPASS = previousAskPass;
+    }
+  });
+});
 
 /**
  * Regression coverage for the empty-repo silent-failure case: when a Blitz
@@ -68,5 +86,158 @@ describe('GitWorktreeService.validateWorkspaceHasCommits', () => {
     await expect(service.validateWorkspaceHasCommits(tmpDir))
       .rejects
       .toThrow(/Not a git repository/);
+  });
+});
+
+/**
+ * getChangedFiles goes through simple-git, which runs `git status --porcelain -b
+ * -u --null` -- `-u` is `--untracked-files=all`, so ordinary untracked
+ * directories are already reported file-by-file and never need re-expanding.
+ * The one entry git still collapses is an EMBEDDED REPOSITORY, which it will not
+ * look inside. That is the case the expansion handles, now batched into a single
+ * async git call for the whole worktree instead of a synchronous child process
+ * per entry (NIM-2286).
+ *
+ * Either way git stays the authority on directory contents, so gitignored files
+ * stay out of the changed-files list and the "Commit with AI" context (NIM-1782).
+ */
+describe('GitWorktreeService.getChangedFiles untracked-directory expansion', () => {
+  let tmpDir: string;
+  const service = new GitWorktreeService();
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nimbalyst-gws-changed-'));
+    const git = simpleGit(tmpDir).env(gitSandboxEnv(undefined, { pinConfigPaths: false }));
+    await git.init();
+    await git.addConfig('user.email', 'test@example.com', false, 'local');
+    await git.addConfig('user.name', 'Test', false, 'local');
+    await git.addConfig('commit.gpgsign', 'false', false, 'local');
+    assertGitSandbox(tmpDir);
+
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), 'node_modules/\n');
+    await git.add('.gitignore');
+    await git.commit('initial');
+
+    // Three collapsed `?? dir/` entries, one holding a gitignored install.
+    for (const name of ['pkg-a', 'pkg-b', 'pkg-c']) {
+      fs.mkdirSync(path.join(tmpDir, name, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, name, 'src', 'index.ts'), 'export {};\n');
+    }
+    fs.writeFileSync(path.join(tmpDir, 'pkg-a', 'src', 'with spaces.ts'), 'export {};\n');
+    fs.mkdirSync(path.join(tmpDir, 'pkg-b', 'node_modules', 'left-pad'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pkg-b', 'node_modules', 'left-pad', 'index.js'),
+      'module.exports = () => {};\n',
+    );
+
+    // An embedded repository: the one untracked entry git still collapses, and
+    // whose contents belong to IT rather than to the outer worktree.
+    const embedded = path.join(tmpDir, 'embedded-repo');
+    fs.mkdirSync(embedded);
+    const embeddedGit = simpleGit(embedded).env(gitSandboxEnv(undefined, { pinConfigPaths: false }));
+    await embeddedGit.init();
+    await embeddedGit.addConfig('user.email', 'test@example.com', false, 'local');
+    await embeddedGit.addConfig('user.name', 'Test', false, 'local');
+    await embeddedGit.addConfig('commit.gpgsign', 'false', false, 'local');
+    fs.writeFileSync(path.join(embedded, 'inner.ts'), 'export {};\n');
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore Windows file-lock noise during teardown
+    }
+  });
+
+  it('reports untracked files individually and keeps gitignored ones out', async () => {
+    const changed = await service.getChangedFiles(tmpDir);
+    const paths = changed.map((file) => file.path).sort();
+
+    expect(paths).toContain('pkg-a/src/index.ts');
+    expect(paths).toContain('pkg-b/src/index.ts');
+    expect(paths).toContain('pkg-c/src/index.ts');
+    // NUL-separated parsing keeps filenames with spaces intact.
+    expect(paths).toContain('pkg-a/src/with spaces.ts');
+
+    // Gitignored, so it must not reach the commit context (NIM-1782).
+    expect(paths.filter((p) => p.includes('node_modules'))).toEqual([]);
+
+    // Untracked directories are not reported as entries of their own.
+    expect(paths).not.toContain('pkg-a/');
+    expect(paths).not.toContain('pkg-a');
+
+    // Every untracked path is reported as a new, unstaged file.
+    expect(changed.every((file) => file.status === 'added' && !file.staged)).toBe(true);
+  });
+
+  it('still runs when the environment contains vars simple-git treats as unsafe', async () => {
+    // The read-only status is spawned with an explicit env (to set
+    // GIT_OPTIONAL_LOCKS), which makes simple-git scan that env and refuse to
+    // spawn git at all unless the unsafe flags are opted into. A developer with
+    // GIT_EDITOR exported would otherwise see every changed-files read fail.
+    const previousEditor = process.env.GIT_EDITOR;
+    process.env.GIT_EDITOR = 'vim';
+    try {
+      const paths = (await service.getChangedFiles(tmpDir)).map((file) => file.path);
+      expect(paths).toContain('pkg-a/src/index.ts');
+    } finally {
+      if (previousEditor === undefined) delete process.env.GIT_EDITOR;
+      else process.env.GIT_EDITOR = previousEditor;
+    }
+  });
+
+  it('keeps an embedded repository as one entry without enumerating its contents', async () => {
+    const paths = (await service.getChangedFiles(tmpDir)).map((file) => file.path);
+
+    // This entry only survives the collapsed-directory branch: git reports
+    // `embedded-repo/` and the expansion asks git what is inside, which returns
+    // the embedded repo itself rather than descending into it.
+    expect(paths).toContain('embedded-repo/');
+
+    // The embedded repo owns its own untracked file; the outer worktree must
+    // not claim it.
+    expect(paths).not.toContain('embedded-repo/inner.ts');
+  });
+});
+
+describe('GitWorktreeService.rebaseFromBase input boundary', () => {
+  it('rejects malformed cwd/base operands before lock, activity, preflight or storage', async () => {
+    const service = new GitWorktreeService();
+    const lock = vi.spyOn(gitOperationLock, 'withLock');
+    const activity = vi.spyOn(operationLog, 'recordGitActivity');
+    const journal = vi.spyOn(operationLog, 'getGitOperationLogService');
+    const preflight = vi.spyOn(service, 'checkGitState');
+    try {
+      for (const value of [undefined, null, false, 0, {}, [], '', 'a\0b', '-', '--continue']) {
+        await expect(service.rebaseFromBase('/fixture', value as string)).rejects.toThrow(/baseBranch/);
+      }
+      for (const value of [undefined, null, false, 0, {}, [], '', 'a\0b']) {
+        await expect(service.rebaseFromBase(value as string, 'main')).rejects.toThrow(/worktreePath/);
+      }
+      expect(lock).not.toHaveBeenCalled();
+      expect(activity).not.toHaveBeenCalled();
+      expect(journal).not.toHaveBeenCalled();
+      expect(preflight).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('passes benign operands unchanged to the existing locked activity', async () => {
+    const service = new GitWorktreeService();
+    const result = { success: true };
+    const lock = vi.spyOn(gitOperationLock, 'withLock').mockImplementation(async (_path, _name, fn) => fn());
+    const activity = vi.spyOn(operationLog, 'recordGitActivity').mockResolvedValue(result);
+    vi.spyOn(operationLog, 'getGitOperationLogService').mockReturnValue({} as operationLog.GitOperationLogService);
+    try {
+      for (const baseBranch of ['HEAD~1', 'HEAD^', '@{-1}', 'refs/heads/topic', 'origin/topic', 'topic/日本語']) {
+        await expect(service.rebaseFromBase('-relative repo', baseBranch)).resolves.toBe(result);
+        expect(lock).toHaveBeenLastCalledWith('-relative repo', 'rebaseFromBase', expect.any(Function));
+        expect(activity).toHaveBeenLastCalledWith({}, '-relative repo', ['rebase', baseBranch], expect.any(Function), expect.any(Function));
+      }
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

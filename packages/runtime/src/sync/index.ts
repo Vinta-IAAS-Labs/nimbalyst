@@ -53,10 +53,27 @@ export type {
   SyncedAvailableModel,
   SyncedTrackerPersonalStateChange,
   EncryptedTrackerPersonalStatePayload,
+  SessionIndexData,
+  PushChangeOutcome,
+  IndexPublishOutcome,
+} from './types';
+export {
+  filterSessionsForPersonalSync,
+  isSessionEligibleForPersonalSync,
 } from './types';
 
 export { createCollabV3Sync } from './CollabV3Sync';
+export { createPersonalSyncWriteGate, describePersonalSyncWriteGate } from './personalSyncWriteGate';
+export type { PersonalSyncWriteGateSnapshot, PersonalSyncWriteGateState, PersonalSyncBlockReason } from './personalSyncWriteGate';
+export { IndexEntryDecryptionError, isIndexEntryDecryptionError } from './indexEntryDecryptionError';
+export { createExtensionAwarenessBridge } from './extensionAwarenessBridge';
+export type {
+  ExtensionAwarenessBridge,
+  ExtensionAwarenessTransport,
+  ExtensionAwarenessUser,
+} from './extensionAwarenessBridge';
 export { deriveTrackerPersonalStateKey } from './trackerPersonalStateKey';
+export { deriveEncryptionKey, personalSyncEncryptionSalt } from './encryptionKey';
 export { setSyncImageCompressor } from './syncContentTruncator';
 export type { SyncImageCompressor } from './syncContentTruncator';
 
@@ -86,6 +103,8 @@ export type {
   TeamInboxUnavailableDelivery,
   TeamInboxWatermark,
   TeamInboxWireDelivery,
+  TeamPresenceMember,
+  PresenceDesiredStatus,
 } from './TeamInboxSync';
 
 export {
@@ -99,6 +118,18 @@ export type {
   ConversationSyncEvent,
   ConversationTarget,
 } from './ConversationSync';
+
+export {
+  FeedbackRequestSync,
+  FeedbackRequestSyncError,
+} from './FeedbackRequestSync';
+export type {
+  FeedbackRequestNudgeReceipt,
+  FeedbackRequestSyncConfig,
+  FeedbackRequestSyncEvent,
+  FeedbackRequestSyncState,
+  FeedbackRequestTarget,
+} from './FeedbackRequestSync';
 
 export {
   createSyncedSessionStore,
@@ -116,13 +147,24 @@ export {
   OutboxDrainer,
   OutboxWriteRejectedError,
   isConfirmedOutboxRevocationCode,
+  outboxRetryDelayMs,
+  OUTBOX_RETRY_BASE_MS,
+  OUTBOX_RETRY_MAX_MS,
+  OUTBOX_STUCK_ATTEMPTS,
 } from './OutboxDrainer';
+export {
+  COLLAB_CLOSE_ACCESS_REVOKED,
+  COLLAB_CLOSE_REMOVED_FROM_TEAM,
+  collabAccessRevokedMessage,
+  isCollabAccessRevokedCloseCode,
+} from './collabCloseCodes';
 export type {
   OutboxDrainBatch,
   OutboxDrainSendResult,
   OutboxDrainTransport,
   OutboxDrainerOptions,
   OutboxDrainResult,
+  StuckOutboxDocument,
 } from './OutboxDrainer';
 export type {
   LocalDocumentReplicaOptions,
@@ -170,7 +212,6 @@ export type {
   DocumentSyncStatus,
   AwarenessState,
   SerializedRelativePosition,
-  ReviewGateState,
   DocClientMessage,
   DocServerMessage,
 } from './documentSyncTypes';
@@ -193,8 +234,8 @@ export type {
   TeamProjectId,
   TrackerRoomId,
   SyncId,
-  EncryptedTrackerItemEnvelope,
-  EncryptedTrackerNavigationEnvelope,
+  TrackerItemEnvelope,
+  TrackerNavigationEnvelope,
   TrackerItemPayload,
   TrackerCommentEntry,
   TrackerIdentity,
@@ -208,6 +249,7 @@ export type {
   TrackerNavigationMutationRequestMessage,
   TrackerSetConfigMessage,
   TrackerPingMessage,
+  TrackerPresenceMessage,
   TrackerSyncResponseMessage,
   TrackerDeltaMessage,
   TrackerMutationAckMessage,
@@ -217,44 +259,50 @@ export type {
   TrackerMutationRejectCode,
   TrackerConfigBroadcastMessage,
   TrackerPongMessage,
+  TrackerPresenceRosterMessage,
+  TrackerPresenceDeltaMessage,
+  TrackerPresenceMember,
   TrackerErrorMessage,
   TrackerRoomConfig,
   TrackerTransactionState,
   TrackerTransactionRow,
   TrackerItemRow,
   TrackerBodyCacheRow,
-} from './trackerProtocol';
+} from '@nimbalyst/tracker-engine';
 
 export {
   buildTrackerRoomId,
   stripLocalOnlyFields,
   LOCAL_ONLY_PAYLOAD_FIELDS,
   SYNC_ID_INITIAL,
-} from './trackerProtocol';
+} from '@nimbalyst/tracker-engine';
 
 export {
   decodeTrackerSavedViewEnvelopePlaintext,
-} from './TrackerEnvelopeCrypto';
+} from '@nimbalyst/tracker-engine';
 
 export {
+  IndexedDbTrackerPersistence,
   InMemoryTrackerPersistence,
-} from './trackerPersistence';
+} from '@nimbalyst/tracker-engine';
 
 export type {
+  IndexedDbTrackerSavedViewRow,
+  StoredTrackerItem,
   TrackerPersistence,
   TrackerRowSnapshot,
-} from './trackerPersistence';
+} from '@nimbalyst/tracker-engine';
 
 export {
   applyLabelDiff,
   mergeLabelMaps,
   normalizeLegacyLabelValues,
   projectLabelsToValues,
-} from './trackerLabels';
+} from '@nimbalyst/tracker-engine';
 
 export type {
   LabelsMap,
-} from './trackerLabels';
+} from '@nimbalyst/tracker-engine';
 
 // `CollabLexicalProvider`, `HeadlessLexicalYDoc`, and
 // `MarkdownCollabContentAdapter` are deliberately NOT re-exported here -- they
@@ -262,19 +310,24 @@ export type {
 // main process. Import them from `@nimbalyst/runtime/collab-lexical`.
 export {
   createRevisionAdapterFromCollabContent,
+  previewRevisionSnapshot,
   type CollabAdapterRevisionBridgeOptions,
 } from './revisionSnapshotBridge';
 
 export {
   TrackerSyncEngine,
-} from './TrackerSyncEngine';
+} from '@nimbalyst/tracker-engine';
 
 export type {
   TrackerSyncEngineConfig,
   TrackerSyncStatus,
+  TrackerPresenceIdentity,
+  TrackerPresenceParticipant,
   AppliedTrackerItem,
   RejectedTrackerMutation,
-} from './TrackerSyncEngine';
+  TrackerNavigationSyncHooks,
+  TrackerSchemaSyncHooks,
+} from '@nimbalyst/tracker-engine';
 
 export {
   isTrackerNavigationEntry,
@@ -284,6 +337,7 @@ export {
 export type {
   TrackerNavigationEntry,
   TrackerNavigationFolder,
+  TrackerNavigationOwnership,
   TrackerTypePlacement,
 } from './trackerNavigation';
 
@@ -297,6 +351,7 @@ export type {
   TeamState,
   MemberInfo as TeamMemberInfo,
   DocIndexEntry as TeamDocIndexEntry,
+  DocumentPlacementOptions as TeamDocumentPlacementOptions,
   FolderNode,
 } from './teamSyncTypes';
 
@@ -309,4 +364,5 @@ export type {
   ProjectSyncFileUpdate,
   ProjectSyncManifestFile,
   ProjectSyncResponse,
+  ProjectFilePushOutcome,
 } from './ProjectSyncProvider';

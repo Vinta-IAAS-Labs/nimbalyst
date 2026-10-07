@@ -1,8 +1,9 @@
+import { registerSessionPromptResponseHandler } from './sessionPromptResponseHandler';
+import { remoteSessions } from '../services/ai/remoteSessions';
+import { database } from '../database/PGLiteDatabaseWorker';
+import { projectSessionList, readSessionLaunchCounts } from './sessionListProjection';
 import { SessionManager, ProviderFactory } from '@nimbalyst/runtime/ai/server';
 import { AISessionsRepository, TranscriptMigrationRepository } from '@nimbalyst/runtime';
-import {
-    parseCodexToolLookupId,
-} from '@nimbalyst/runtime/ai/server/toolLookupIds';
 import { TranscriptProjector } from '@nimbalyst/runtime/ai/server/transcript';
 import {
     ModelIdentifier,
@@ -16,18 +17,15 @@ import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import { getCachedUncommittedFiles } from '../utils/gitUncommittedFiles';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import type { SessionCreateResult } from '../../shared/ipc/types';
-import { TrayManager } from '../tray/TrayManager';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
-import { resolveRequestUserInputPromptTargets } from '../mcp/tools/codexToolCallResolver';
-import {
-    getGitCommitProposalResponseChannel,
-    resolveGitCommitProposalPromptId,
-} from '../services/ai/gitCommitProposalPromptUtils';
-import { enrichTranscriptMessagesWithToolCallDiffs } from '../services/TranscriptToolCallEnricher';
-import { setSessionPendingPrompt } from '../services/ai/pendingPromptPersistence';
+import { trackCreateAiSession } from '../services/analytics/sessionLaunchAnalytics';
+import { SessionCommitService } from '../services/SessionCommitService';
+import { getSessionsForFile } from '../services/fileSessionLookup';
 import { normalizeSessionPhaseMetadataUpdate } from '../services/session/sessionPhaseTransition';
 import { destroyProviderForArchivedSession } from '../services/ai/archiveSessionProviderLifecycle';
 import { resolveSessionModelSelection } from '../services/ai/sessionModelSelection';
+import { inheritedOwnership, stripOwnerControlledMetadata } from '../services/extensionSessions/sessionOwnership';
+import { readSessionSubtree } from '../services/sessionHierarchy';
 
 // Initialize session manager
 const sessionManager = new SessionManager();
@@ -63,13 +61,10 @@ function trackCreateAISession(provider: AIProviderType, options?: {
     worktreeId?: string | null;
     parentSessionId?: string | null;
     agentRole?: string | null;
+    launchSource?: string | null;
+    hadPrefilledPrompt?: boolean;
 }): void {
-    analyticsService.sendEvent('create_ai_session', {
-        provider,
-        is_worktree_session: !!options?.worktreeId,
-        is_workstream_child: !!options?.parentSessionId,
-        is_meta_agent_session: options?.agentRole === 'meta-agent',
-    });
+    trackCreateAiSession({ provider, ...options });
 }
 
 function makeSessionFilesCacheKey(workspacePath: string, uncommittedFiles: Set<string>): string {
@@ -221,9 +216,18 @@ export async function registerSessionHandlers() {
     });
 
     // Create session (new format for agentic coding)
-    safeHandle('sessions:create', async (event, payload: { session: any; workspaceId: string }): Promise<SessionCreateResult> => {
+    safeHandle('sessions:create', async (event, payload: {
+        session: any;
+        workspaceId: string;
+        // Optional so an un-updated caller degrades to `unknown` rather than
+        // failing to create a session. Every renderer path that knows its
+        // surface passes it; the ones that cannot are honestly uncounted.
+        launchSource?: string;
+        /** A boolean, deliberately never the draft text itself. */
+        hadPrefilledPrompt?: boolean;
+    }): Promise<SessionCreateResult> => {
         try {
-            const { session, workspaceId } = payload;
+            const { session, workspaceId, launchSource, hadPrefilledPrompt } = payload;
 
             const requestedProvider = session.provider as AIProviderType;
             const { provider, model } = resolveSessionModelSelection(requestedProvider, session.model);
@@ -241,8 +245,15 @@ export async function registerSessionHandlers() {
                 providerConfig: session.providerConfig,
                 providerSessionId: session.providerSessionId,
                 worktreeId: session.worktreeId || null,
+                parentSessionId: session.parentSessionId ?? null,
                 agentRole: session.agentRole || 'standard',
                 createdBySessionId: session.createdBySessionId || null,
+                // Written with the row, so a directive or notifyParent is never
+                // missing when the first turn reads it. Ownership is assigned
+                // only by the host (extension session broker, spawn inheritance).
+                ...(session.metadata && typeof session.metadata === 'object'
+                    ? { metadata: normalizeSessionPhaseMetadataUpdate(stripOwnerControlledMetadata(session.metadata)) }
+                    : {}),
             };
             // console.log('[SessionHandlers] Creating session with payload:', JSON.stringify(createPayload));
 
@@ -251,12 +262,9 @@ export async function registerSessionHandlers() {
                 worktreeId: createPayload.worktreeId,
                 parentSessionId: (session.parentSessionId as string | null | undefined) ?? null,
                 agentRole: createPayload.agentRole,
+                launchSource,
+                hadPrefilledPrompt,
             });
-
-            // Update with full metadata
-            if (session.metadata) {
-                await AISessionsRepository.updateMetadata(session.id, { metadata: session.metadata });
-            }
 
             return { success: true, id: session.id };
         } catch (error) {
@@ -353,11 +361,17 @@ export async function registerSessionHandlers() {
                 }
             }
 
+            if (updates.metadata) {
+                updates.metadata = stripOwnerControlledMetadata(updates.metadata);
+            }
             await AISessionsRepository.updateMetadata(sessionId, updates);
 
             if (updates.isArchived === true) {
-                destroyProviderForArchivedSession(
-                    sessionId,
+                const subtree = currentSession.workspacePath
+                    ? await readSessionSubtree(database, sessionId, currentSession.workspacePath)
+                    : [{ id: sessionId }];
+                for (const row of subtree) destroyProviderForArchivedSession(
+                    row.id,
                     (id) => ProviderFactory.destroyProvider(id),
                     (id, cleanupError) => {
                         console.error(`[SessionHandlers] Failed to destroy provider for archived session ${id}:`, cleanupError);
@@ -398,7 +412,7 @@ export async function registerSessionHandlers() {
         try {
             // Extract sessionType and metadata from updates
             const { sessionType, ...rawMetadataFields } = updates;
-            const metadataFields = normalizeSessionPhaseMetadataUpdate(rawMetadataFields);
+            const metadataFields = normalizeSessionPhaseMetadataUpdate(stripOwnerControlledMetadata(rawMetadataFields));
 
             // Build update payload
             const updatePayload: any = {};
@@ -505,43 +519,9 @@ export async function registerSessionHandlers() {
                 console.error('[SessionHandlers] Failed to get uncommitted counts:', error);
             }
 
-            // Use entry data directly - it already has all the info we need including updatedAt
-            const sessions = entries.map(entry => {
-                const uncommittedCount = uncommittedMap.get(entry.id) || 0;
-                return {
-                    id: entry.id,
-                    createdAt: entry.createdAt,
-                    updatedAt: entry.updatedAt,
-                    name: entry.title,
-                    title: entry.title,
-                    provider: entry.provider,
-                    model: entry.model,
-                    sessionType: entry.sessionType || 'session',
-                    agentRole: entry.agentRole || 'standard',
-                    createdBySessionId: entry.createdBySessionId || null,
-                    messageCount: entry.messageCount || 0,
-                    isArchived: entry.isArchived || false,
-                    isPinned: entry.isPinned || false,  // Include isPinned from repository
-                    worktreeId: entry.worktreeId,  // Include worktreeId from repository
-                    parentSessionId: entry.parentSessionId || null,  // Hierarchical workstream support
-                    childCount: entry.childCount || 0,  // Number of child sessions
-                    uncommittedCount,  // Number of uncommitted files
-                    hasUnread: entry.hasUnread || false,  // Unread state from metadata
-                    hasPendingInteractivePrompt: (entry as any).hasPendingInteractivePrompt || false,
-                    // Branch tracking - SEPARATE from hierarchical parentSessionId
-                    branchedFromSessionId: entry.branchedFromSessionId,
-                    branchPointMessageId: entry.branchPointMessageId,
-                    branchedAt: entry.branchedAt,
-                    // Kanban board phase and tags
-                    phase: (entry as any).phase || undefined,
-                    tags: (entry as any).tags || undefined,
-                    // Linked tracker item IDs
-                    linkedTrackerItemIds: (entry as any).linkedTrackerItemIds || undefined,
-                    metadata: {}
-                };
-            });
-
-            return { success: true, sessions };
+            const launchedSessionCounts = await readSessionLaunchCounts(database, workspacePath);
+            const sessions = await remoteSessions.list(workspacePath, projectSessionList(entries, uncommittedMap).map(session => ({ ...session, workspaceId: workspacePath })));
+            return { success: true, sessions: options?.includeArchived ? sessions : sessions.filter(session => !session.isArchived), launchedSessionCounts };
         } catch (error) {
             console.error('[SessionHandlers] Failed to list sessions:', error);
             return { success: false, error: String(error), sessions: [] };
@@ -556,28 +536,26 @@ export async function registerSessionHandlers() {
         options?: { includeArchived?: boolean }
     ) => {
         try {
-            const { database } = await import('../database/PGLiteDatabaseWorker');
+            if (await remoteSessions.get(parentSessionId, workspacePath)) {
+                const sessions = await remoteSessions.list(workspacePath, []);
+                const children: typeof sessions = [];
+                const queue = [{ id: parentSessionId, depth: 0 }];
+                const seen = new Set([parentSessionId]);
+                while (queue.length) {
+                    const parent = queue.shift()!;
+                    if (parent.depth >= 8) continue;
+                    for (const session of sessions) {
+                        if (session.parentSessionId !== parent.id || seen.has(session.id)) continue;
+                        seen.add(session.id);
+                        queue.push({ id: session.id, depth: parent.depth + 1 });
+                        if (options?.includeArchived || !session.isArchived) children.push({ ...session, depth: parent.depth + 1 });
+                    }
+                }
+                return {success: true, children};
+            }
             const includeArchived = options?.includeArchived === true;
-            const archivedFilter = includeArchived
-                ? ''
-                : 'AND (s.is_archived = FALSE OR s.is_archived IS NULL)';
-
-            const { rows } = await database.query<any>(
-                `SELECT s.id, s.provider, s.model, s.session_type, s.mode, s.agent_role, s.created_by_session_id, s.title, s.workspace_id,
-                        s.worktree_id, s.parent_session_id, s.created_at, s.updated_at, s.is_archived, s.is_pinned,
-                        s.metadata,
-                        COUNT(m.id) as message_count,
-                        (SELECT COUNT(*) FROM ai_sessions cs WHERE cs.parent_session_id = s.id) as child_count
-                 FROM ai_sessions s
-                 LEFT JOIN ai_agent_messages m ON s.id = m.session_id AND m.direction = 'input' AND (m.hidden = FALSE OR m.hidden IS NULL)
-                 WHERE s.parent_session_id = $1 AND s.workspace_id = $2
-                   ${archivedFilter}
-                 GROUP BY s.id, s.provider, s.model, s.session_type, s.mode, s.agent_role, s.created_by_session_id, s.title, s.workspace_id,
-                          s.worktree_id, s.parent_session_id, s.created_at, s.updated_at, s.is_archived, s.is_pinned,
-                          s.metadata
-                 ORDER BY s.created_at ASC`,
-                [parentSessionId, workspacePath]
-            );
+            const rows = (await readSessionSubtree(database, parentSessionId, workspacePath))
+                .filter(row => row.id !== parentSessionId && (includeArchived || !row.is_archived));
 
             // Calculate uncommitted file counts per session
             // Uses cached git status and a query bounded to currently-uncommitted paths
@@ -619,8 +597,12 @@ export async function registerSessionHandlers() {
                     workspaceId: row.workspace_id,
                     worktreeId: row.worktree_id || null,
                     parentSessionId: row.parent_session_id,
-                    isArchived: row.is_archived || false,
-                    isPinned: row.is_pinned || false,
+                    depth: Number(row.depth),
+                    descendantCount: Number(row.descendant_count) || 0,
+                    isArchived: !!row.is_archived,
+                    isPinned: !!row.is_pinned,
+                    hasUnread: !!metadata.hasUnread,
+                    hasPendingInteractivePrompt: !!metadata.hasPendingPrompt,
                     messageCount: typeof row.message_count === 'string'
                         ? parseInt(row.message_count, 10) || 0
                         : (row.message_count || 0),
@@ -653,6 +635,13 @@ export async function registerSessionHandlers() {
         console.log('[SessionHandlers] sessions:create-child called with:', JSON.stringify(payload));
         try {
             const { parentSessionId, workspacePath, worktreeId, provider: rawProvider = 'claude-code', model: providedModel } = payload;
+            const remoteParent = await remoteSessions.get(parentSessionId, workspacePath);
+            if (remoteParent) {
+                const host = remoteParent.metadata?.remoteHostDeviceId as string;
+                const sessionId = await remoteSessions.create(workspacePath, host, {parentSessionId, model: providedModel, worktree: !!worktreeId});
+                return {success: true, sessionId, remoteHostDeviceId: host};
+            }
+
             // Use crypto.randomUUID() instead of dynamic import to avoid bundling issues
             const sessionId = crypto.randomUUID();
             console.log(`[SessionHandlers] Creating child session ${sessionId} for parent ${parentSessionId}`);
@@ -662,6 +651,11 @@ export async function registerSessionHandlers() {
                 providedModel,
             );
 
+            // A child made under an extension-owned session stays owned by that
+            // extension (never inheriting its directive), written at creation.
+            const parentRow = await AISessionsRepository.get(parentSessionId);
+            if (!parentRow || parentRow.workspacePath !== workspacePath) throw new Error('Parent session not found in this workspace');
+            if (worktreeId && worktreeId !== parentRow.worktreeId) throw new Error('Parent session is in a different worktree');
             const createPayload = {
                 id: sessionId,
                 provider,
@@ -669,13 +663,19 @@ export async function registerSessionHandlers() {
                 title: 'New Session',
                 workspaceId: workspacePath,
                 parentSessionId,  // Link to parent
-                worktreeId: worktreeId || null,  // Inherit from parent if provided
+                createdBySessionId: parentSessionId,
+                worktreeId: parentRow.worktreeId || null,
+                metadata: inheritedOwnership(parentRow?.metadata),
             };
 
             await AISessionsRepository.create(createPayload as any);
+            // Always `workstream_child`: this handler exists only to parent a
+            // session under another one, so the surface is knowable here and
+            // does not need to be passed in.
             trackCreateAISession(provider as AIProviderType, {
                 worktreeId: createPayload.worktreeId,
                 parentSessionId,
+                launchSource: 'workstream_child',
             });
             console.log(`[SessionHandlers] Child session ${sessionId} created successfully with model: ${model}`);
 
@@ -691,6 +691,7 @@ export async function registerSessionHandlers() {
         sessionId: string;
         newParentId: string | null;
         workspacePath: string;
+        restoreManagerId?: string | null;
     }) => {
         try {
             const { sessionId, newParentId, workspacePath } = payload;
@@ -716,16 +717,18 @@ export async function registerSessionHandlers() {
                     return { success: false, error: 'Parent session is in a different workspace' };
                 }
 
-                // Parent must not itself be a child session (no nested workstreams)
-                if (parent.parentSessionId) {
-                    return { success: false, error: 'Cannot nest workstreams: parent is already a child session' };
-                }
             }
-
-            // Update parent_session_id
-            await AISessionsRepository.updateMetadata(sessionId, { parentSessionId: newParentId });
-
-            return { success: true };
+            const managerId = payload.restoreManagerId !== undefined ? payload.restoreManagerId : newParentId;
+            if (managerId) {
+                const manager = await AISessionsRepository.get(managerId);
+                if (managerId === sessionId || !manager || manager.workspacePath !== workspacePath) throw new Error('Invalid session manager');
+            }
+            await AISessionsRepository.updateMetadata(sessionId, { parentSessionId: newParentId, createdBySessionId: managerId,
+                expectedParentSessionId: session.parentSessionId ?? null, expectedCreatedBySessionId: session.createdBySessionId ?? null });
+            for (const window of BrowserWindow.getAllWindows()) {
+                if (!window.isDestroyed()) window.webContents.send('sessions:refresh-list', { workspacePath, sessionId });
+            }
+            return { success: true, previousParentId: session.parentSessionId ?? null, previousManagerId: session.createdBySessionId ?? null };
         } catch (error) {
             console.error('[SessionHandlers] Failed to set session parent:', error);
             return { success: false, error: String(error) };
@@ -782,7 +785,13 @@ export async function registerSessionHandlers() {
             // Destroy any active provider (aborts lead query and kills all teammates)
             ProviderFactory.destroyProvider(sessionId);
 
+            const session = await AISessionsRepository.get(sessionId);
             await AISessionsRepository.delete(sessionId);
+            if (session?.workspacePath) {
+                for (const window of BrowserWindow.getAllWindows()) {
+                    if (!window.isDestroyed()) window.webContents.send('sessions:refresh-list', { workspacePath: session.workspacePath });
+                }
+            }
             return { success: true };
         } catch (error) {
             console.error('[SessionHandlers] Failed to delete session:', error);
@@ -887,85 +896,7 @@ export async function registerSessionHandlers() {
     // Get sessions by file path (cross-worktree aware)
     safeHandle('sessions:get-by-file', async (event, workspaceId: string, filePath: string) => {
         try {
-            const { database } = await import('../database/PGLiteDatabaseWorker');
-            const { resolveProjectPath, isWorktreePath } = await import('../utils/workspaceDetection');
-
-            // Compute relative path for cross-workspace matching
-            const relativePath = filePath.startsWith(workspaceId)
-                ? filePath.slice(workspaceId.length) // includes leading /
-                : null;
-
-            const projectPath = resolveProjectPath(workspaceId);
-
-            let fileLinksResult;
-            if (relativePath) {
-                // Query across all related workspaces using relative path suffix
-                // This handles: worktree -> main project, main project -> worktrees,
-                // and worktree -> other worktrees
-                // Escape SQL LIKE wildcards in the path to prevent unintended pattern matching
-                const escapedRelativePath = relativePath.replace(/[%_\\]/g, '\\$&');
-                const escapedProjectPath = projectPath.replace(/[%_\\]/g, '\\$&');
-                fileLinksResult = await database.query(
-                    `SELECT DISTINCT session_id FROM session_files
-                     WHERE file_path LIKE '%' || $1 ESCAPE '\\'
-                     AND (workspace_id = $2 OR workspace_id = $3 OR workspace_id LIKE $4 ESCAPE '\\')`,
-                    [escapedRelativePath, workspaceId, projectPath, escapedProjectPath + '_worktrees/%']
-                );
-            } else {
-                // Fallback: exact match only
-                fileLinksResult = await database.query(
-                    `SELECT DISTINCT session_id FROM session_files
-                     WHERE workspace_id = $1 AND file_path = $2`,
-                    [workspaceId, filePath]
-                );
-            }
-
-            if (!fileLinksResult.rows || fileLinksResult.rows.length === 0) {
-                return [];
-            }
-
-            const sessionIds = fileLinksResult.rows.map((row: any) => row.session_id);
-
-            // Get list entries with messageCount (only available for current workspace sessions)
-            const listEntries = await AISessionsRepository.list(workspaceId);
-            const entriesMap = new Map(listEntries.map(entry => [entry.id, entry]));
-
-            // Use batch query instead of N individual get() calls
-            const sessionsData = await AISessionsRepository.getMany(sessionIds);
-
-            // Map and enrich with entry data
-            // Sort: current workspace sessions first, then others by updatedAt desc
-            const sessions = sessionsData
-                .map(session => {
-                    const entry = entriesMap.get(session.id);
-                    const sessionWorkspaceId = session.workspacePath || '';
-                    // Worktree-aware matching: when viewing from a worktree, match
-                    // sessions whose worktreePath equals this worktree. When viewing
-                    // from the main project, match sessions with no worktree association.
-                    const isCurrentWs = isWorktreePath(workspaceId)
-                        ? session.worktreePath === workspaceId
-                        : !session.worktreePath && sessionWorkspaceId === workspaceId;
-                    return {
-                        id: session.id,
-                        title: session.title || 'Untitled Session',
-                        provider: session.provider,
-                        model: session.model,
-                        createdAt: session.createdAt,
-                        updatedAt: session.updatedAt,
-                        messageCount: entry?.messageCount || 0,
-                        worktreeId: (session as any).worktreeId || null,
-                        isCurrentWorkspace: isCurrentWs
-                    };
-                })
-                .sort((a, b) => {
-                    // Current workspace sessions first
-                    if (a.isCurrentWorkspace !== b.isCurrentWorkspace) {
-                        return a.isCurrentWorkspace ? -1 : 1;
-                    }
-                    return (b.updatedAt || 0) - (a.updatedAt || 0);
-                });
-
-            return sessions;
+            return await getSessionsForFile(database, AISessionsRepository, workspaceId, filePath);
         } catch (error) {
             console.error('[SessionHandlers] Error getting sessions by file:', error);
             return [];
@@ -1146,6 +1077,35 @@ export async function registerSessionHandlers() {
         }
     });
 
+    // Batch lookup of the session that produced each commit, for the Git Log
+    // panel's Session column. One call per page of the log, never per row.
+    //
+    // Keyed on sha alone -- do NOT add a workspacePath filter here. A session
+    // running in a worktree commits under the worktree path while the user
+    // browses the log from the main checkout; scoping by workspace would drop
+    // exactly the parallel-agent commits this column exists to show.
+    safeHandle('sessions:get-by-commits', async (event, shas: string[]) => {
+        try {
+            const service = SessionCommitService.getInstance();
+
+            // First read kicks off the historical backfill. Fire-and-forget so
+            // the log renders immediately with whatever is already recorded;
+            // the panel fills in on its next fetch.
+            void service.backfillFromRawMessages().catch((error) => {
+                console.error('[SessionHandlers] Session commit backfill failed:', error);
+            });
+
+            const links = await service.getSessionsForCommits(shas || []);
+            // The caller polls on this: on a first-ever open the scan is still
+            // running and `links` is empty, so the panel needs to ask again.
+            const backfillPending = !(await service.isBackfillComplete());
+            return { success: true, links, backfillPending };
+        } catch (error) {
+            console.error('[SessionHandlers] Failed to get sessions by commits:', error);
+            return { success: false, error: String(error), links: {}, backfillPending: false };
+        }
+    });
+
     // ============================================================
     // Interactive Prompts - Durable AI-to-User Interactions
     // These handlers support the durable interactive prompts architecture
@@ -1153,277 +1113,7 @@ export async function registerSessionHandlers() {
     // ============================================================
 
 
-    /**
-     * Respond to an interactive prompt.
-     * Creates a response message and optionally updates the request status.
-     */
-    safeHandle('messages:respond-to-prompt', async (event, params: {
-        sessionId: string;
-        promptId: string;
-        promptType: 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request' | 'git_commit_proposal_request' | 'request_user_input_request';
-        response: any;
-        respondedBy: 'desktop' | 'mobile';
-    }) => {
-        try {
-            const { sessionId, promptId, promptType, response, respondedBy } = params;
-            const { database } = await import('../database/PGLiteDatabaseWorker');
-            const timestamp = Date.now();
-            const requestUserInputTargets = promptType === 'request_user_input_request'
-                ? resolveRequestUserInputPromptTargets(promptId)
-                : null;
-            const canonicalPromptId = promptType === 'git_commit_proposal_request'
-                ? await resolveGitCommitProposalPromptId(sessionId, promptId)
-                : promptId;
-
-            // Determine response type and content
-            let responseContent: any;
-            if (promptType === 'permission_request') {
-                responseContent = {
-                    type: 'permission_response',
-                    requestId: canonicalPromptId,
-                    decision: response.decision,
-                    scope: response.scope,
-                    respondedAt: timestamp,
-                    respondedBy,
-                };
-            } else if (promptType === 'ask_user_question_request') {
-                responseContent = {
-                    type: 'ask_user_question_response',
-                    questionId: canonicalPromptId,
-                    answers: response.answers || response,
-                    cancelled: response.cancelled || false,
-                    respondedAt: timestamp,
-                    respondedBy,
-                };
-            } else if (promptType === 'exit_plan_mode_request') {
-                responseContent = {
-                    type: 'exit_plan_mode_response',
-                    requestId: canonicalPromptId,
-                    approved: response.approved,
-                    clearContext: response.clearContext,
-                    feedback: response.feedback,
-                    respondedAt: timestamp,
-                    respondedBy,
-                };
-            } else if (promptType === 'git_commit_proposal_request') {
-                responseContent = {
-                    type: 'git_commit_proposal_response',
-                    proposalId: canonicalPromptId,
-                    action: response.action,
-                    commitHash: response.commitHash,
-                    commitDate: response.commitDate,
-                    error: response.error,
-                    filesCommitted: response.filesCommitted,
-                    commitMessage: response.commitMessage,
-                    respondedAt: timestamp,
-                    respondedBy,
-                };
-            } else if (promptType === 'request_user_input_request') {
-                responseContent = {
-                    type: 'request_user_input_response',
-                    promptId: canonicalPromptId,
-                    ...(requestUserInputTargets?.rawPromptId ? { rawPromptId: requestUserInputTargets.rawPromptId } : {}),
-                    answers: response.answers || {},
-                    cancelled: response.cancelled === true,
-                    respondedAt: timestamp,
-                    respondedBy,
-                };
-            }
-
-            // Insert response message
-            await database.query(
-                `INSERT INTO ai_agent_messages (session_id, source, direction, content, created_at, hidden)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [
-                    sessionId,
-                    'nimbalyst',
-                    'output',
-                    JSON.stringify(responseContent),
-                    new Date(timestamp),
-                    false,
-                ]
-            );
-
-            // Drive the canonical transformer forward immediately so the
-            // associated tool_call event (e.g. developer_git_commit_proposal)
-            // flips from running -> completed before the renderer next reads
-            // the transcript. Without this we depend on the next SDK chunk's
-            // scheduleTranscriptProcessing to pick up the row, which has
-            // race-with-write-coalescing failure modes that leave the widget
-            // stuck on "pending" after a successful commit (session
-            // cb82f2eb-941c-4fb5-b552-adbae567df61 / 68a60f57). Best-effort:
-            // if the service isn't ready, the next chunk catches up.
-            if (TranscriptMigrationRepository.hasService()) {
-                try {
-                    const session = await AISessionsRepository.get(sessionId);
-                    const provider = session?.provider ?? 'claude-code';
-                    await TranscriptMigrationRepository.getService().processNewMessages(
-                        sessionId,
-                        provider,
-                    );
-                } catch (err) {
-                    console.warn('[SessionHandlers] processNewMessages after prompt response failed:', err);
-                }
-            }
-
-            // Codex currently may not emit a follow-up item.completed event for
-            // long-blocking MCP tools after interactive approval. Persist a
-            // synthetic completion event so transcript replay shows committed state.
-            if (promptType === 'git_commit_proposal_request') {
-                const codexLookupId = parseCodexToolLookupId(promptId);
-                if (codexLookupId) {
-                    try {
-                        const session = await AISessionsRepository.get(sessionId);
-                        if (session?.provider === 'openai-codex') {
-                            const { rows: existingCompletionRows } = await database.query(
-                                `SELECT id
-                                 FROM ai_agent_messages
-                                 WHERE session_id = $1
-                                   AND metadata ->> 'codexProvider' = 'true'
-                                   AND metadata ->> 'eventType' = 'item.completed'
-                                   AND content LIKE $2
-                                 LIMIT 1`,
-                                [sessionId, `%"id":"${codexLookupId.itemId}"%`]
-                            );
-
-                            if (existingCompletionRows.length === 0) {
-                                const hasError = !!response.error || response.action !== 'committed' || !response.commitHash;
-                                const rawCompletionEvent = {
-                                    type: 'item.completed',
-                                    item: {
-                                        id: codexLookupId.itemId,
-                                        type: 'mcp_tool_call',
-                                        // git_commit_proposal is served by the core `nimbalyst` endpoint.
-                                        server: 'nimbalyst',
-                                        tool: 'developer_git_commit_proposal',
-                                        result: {
-                                            action: response.action,
-                                            commitHash: response.commitHash,
-                                            commitDate: response.commitDate,
-                                            filesCommitted: response.filesCommitted,
-                                            commitMessage: response.commitMessage,
-                                            ...(response.error ? { error: response.error } : {}),
-                                        },
-                                        error: hasError ? (response.error || 'Commit proposal cancelled') : null,
-                                        status: hasError ? 'failed' : 'completed',
-                                    },
-                                };
-
-                                await database.query(
-                                    `INSERT INTO ai_agent_messages (session_id, source, direction, content, metadata, created_at, hidden)
-                                     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                                    [
-                                        sessionId,
-                                        'openai-codex',
-                                        'output',
-                                        JSON.stringify(rawCompletionEvent),
-                                        JSON.stringify({
-                                            eventType: 'item.completed',
-                                            codexProvider: true,
-                                            syntheticCommitCompletion: true,
-                                        }),
-                                        new Date(timestamp + 1),
-                                        false,
-                                    ]
-                                );
-                            }
-                        }
-                    } catch (error) {
-                        console.warn('[SessionHandlers] Failed to persist synthetic Codex commit completion event:', error);
-                    }
-                }
-            }
-
-            // For request_user_input, emit to the session-scoped MCP waiter channel
-            // so the MCP handler resolves immediately. (The DB row above is the
-            // durable fallback for cases where the MCP transport drops.)
-            if (promptType === 'request_user_input_request') {
-                const { ipcMain } = await import('electron');
-                const {
-                    getRequestUserInputResponseChannel,
-                    getRequestUserInputFallbackResponseChannel,
-                } = await import('../mcp/tools/interactiveToolHandlers');
-                const waiterPromptIds = requestUserInputTargets?.waiterPromptIds ?? [canonicalPromptId];
-                let notifiedWaiter = false;
-
-                for (const waiterPromptId of waiterPromptIds) {
-                    const channel = getRequestUserInputResponseChannel(sessionId, waiterPromptId);
-                    if (ipcMain.listenerCount(channel) > 0) {
-                        notifiedWaiter = true;
-                        ipcMain.emit(channel, null, {
-                            answers: response.answers,
-                            cancelled: response.cancelled === true,
-                            respondedBy,
-                        });
-                    }
-                }
-
-                const fallbackChannel = getRequestUserInputFallbackResponseChannel(sessionId);
-                if (!notifiedWaiter && ipcMain.listenerCount(fallbackChannel) > 0) {
-                    notifiedWaiter = true;
-                    ipcMain.emit(fallbackChannel, null, {
-                        promptId: canonicalPromptId,
-                        ...(requestUserInputTargets?.rawPromptId ? { rawPromptId: requestUserInputTargets.rawPromptId } : {}),
-                        answers: response.answers,
-                        cancelled: response.cancelled === true,
-                        respondedBy,
-                    });
-                }
-
-                if (!notifiedWaiter) {
-                    console.warn(
-                        `[SessionHandlers] No MCP waiter for RequestUserInput on channels: ${waiterPromptIds.join(', ')}. ` +
-                        `Response was persisted to DB; the handler may have already resolved or the subprocess exited.`,
-                    );
-                }
-                event.sender.send('ai:requestUserInputResolved', { sessionId, promptId: canonicalPromptId });
-                TrayManager.getInstance().onPromptResolved(sessionId);
-            }
-
-            // For git_commit_proposal, emit to the session-scoped MCP waiter channel
-            // and notify renderer to clear the pending interactive prompt indicator
-            if (promptType === 'git_commit_proposal_request') {
-                const { ipcMain } = await import('electron');
-                const responseChannel = getGitCommitProposalResponseChannel(sessionId, canonicalPromptId);
-                const hasWaiter = ipcMain.listenerCount(responseChannel) > 0;
-                if (hasWaiter) {
-                    ipcMain.emit(responseChannel, null, response);
-                } else {
-                    // The MCP server's ipcMain.once() listener is gone — the Claude Code
-                    // subprocess likely died or the app restarted since the proposal was
-                    // created.  The response was already persisted to DB above, so it's
-                    // durable. Mark the session as idle so it doesn't appear stuck forever.
-                    console.warn(
-                        `[SessionHandlers] No MCP waiter for git commit proposal response on channel: ${responseChannel}. ` +
-                        `The Claude Code subprocess may have exited. Session: ${sessionId}, proposalId: ${canonicalPromptId}. ` +
-                        `Marking session as idle.`
-                    );
-                    try {
-                        const { getSessionStateManager } = await import('@nimbalyst/runtime/ai/server/SessionStateManager');
-                        const stateManager = getSessionStateManager();
-                        await stateManager.endSession(sessionId);
-                    } catch (cleanupErr) {
-                        console.warn('[SessionHandlers] Failed to mark orphaned session as idle:', cleanupErr);
-                    }
-                }
-                event.sender.send('ai:gitCommitProposalResolved', { sessionId, proposalId: canonicalPromptId });
-                TrayManager.getInstance().onPromptResolved(sessionId);
-            }
-
-            // Authoritative clear for the persisted "pending prompt" bit.
-            // Covers all prompt types resolved via this handler so the next
-            // session-list refresh on this or any other device sees the
-            // session as idle. The runtime atom clear paths in
-            // sessionStateListeners are still in place; this is the durable
-            // backstop that survives renderer reloads and reaches mobile.
-            void setSessionPendingPrompt(sessionId, false);
-
-            return { success: true, responseContent };
-        } catch (error) {
-            console.error('[SessionHandlers] Failed to respond to prompt:', error);
-            return { success: false, error: String(error) };
-        }
-    });
+    registerSessionPromptResponseHandler();
     // Link a tracker item or file to a session
     // trackerId can be a DB tracker item ID or "file:path/to/file.md" for file-based items
     safeHandle('tracker:link-session', async (_event, payload: { trackerId: string; sessionId: string }) => {
@@ -1475,7 +1165,7 @@ export async function registerSessionHandlers() {
         // populated by the searchable-text extractor.
         const { database } = await import('../database/PGLiteDatabaseWorker');
         const { rows } = await database.query(`
-            SELECT t.id, t.session_id, t.searchable_text, t.created_at,
+            SELECT t.id, t.session_id, t.searchable_text, t.metadata, t.created_at,
                    s.title, s.provider, s.parent_session_id
             FROM ai_agent_messages t
             JOIN ai_sessions s ON t.session_id = s.id
@@ -1487,15 +1177,24 @@ export async function registerSessionHandlers() {
         `, [workspacePath, limit]);
         return {
             success: true,
-            prompts: rows.map((row: any) => ({
-                id: String(row.id),
-                sessionId: row.session_id,
-                content: row.searchable_text || '',
-                createdAt: row.created_at instanceof Date ? row.created_at.getTime() : new Date(row.created_at).getTime(),
-                sessionTitle: row.title || 'Untitled Session',
-                provider: row.provider,
-                parentSessionId: row.parent_session_id,
-            })),
+            prompts: rows.map((row: any) => {
+                const metadata = parseJsonObjectColumn(row.metadata);
+                const promptProvenance = metadata.promptProvenance;
+                const promptActor =
+                    promptProvenance?.actor === 'human' || promptProvenance?.actor === 'agent'
+                        ? promptProvenance.actor
+                        : undefined;
+                return {
+                    id: String(row.id),
+                    sessionId: row.session_id,
+                    content: row.searchable_text || '',
+                    createdAt: row.created_at instanceof Date ? row.created_at.getTime() : new Date(row.created_at).getTime(),
+                    sessionTitle: row.title || 'Untitled Session',
+                    provider: row.provider,
+                    parentSessionId: row.parent_session_id,
+                    promptActor,
+                };
+            }),
         };
     });
 
@@ -1515,7 +1214,7 @@ export async function registerSessionHandlers() {
         );
 
         const viewModel = TranscriptProjector.project(tailEvents);
-        return await enrichTranscriptMessagesWithToolCallDiffs(sessionId, viewModel.messages);
+        return viewModel.messages;
     });
 
     // DEV/TESTING ONLY: Force a single session's canonical events to be

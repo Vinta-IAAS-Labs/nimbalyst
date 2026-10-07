@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { requestConfirmation } from '../dialogs/requestConfirmation';
 import { errorNotificationService } from '../services/ErrorNotificationService';
-import { getTeamSyncProvider } from '../store/atoms/collabDocuments';
+import { DocumentModelRegistry } from '../services/document-model/DocumentModelRegistry';
+import { getTeamSyncProviderForScopeKey } from '../store/atoms/collabDocuments';
+import { teamMemberDisplayName } from '../utils/teamMemberDisplayName';
 
 export type CollabLocalOriginBinding = NonNullable<
   Awaited<ReturnType<typeof window.electronAPI.documentSync.getLocalOrigin>>['binding']
@@ -8,6 +11,10 @@ export type CollabLocalOriginBinding = NonNullable<
 
 type ReuploadResult = Awaited<
   ReturnType<typeof window.electronAPI.documentSync.reuploadLocalOrigin>
+>;
+
+type PullResult = Awaited<
+  ReturnType<typeof window.electronAPI.documentSync.pullLocalOrigin>
 >;
 
 type RendererReuploadResult =
@@ -37,16 +44,16 @@ function formatRelativeTime(ms: number): string {
 }
 
 /**
- * Resolve a room-authed userId to a human label. The team member list carries
- * email (no separate display name), so email is the best "who" we have; falls
- * back to null when the editor isn't in the roster (e.g. it was the local user
- * on another device, or a since-removed member).
+ * Resolve a room-authed userId to a human label. Falls back to null when the
+ * editor isn't in the roster (e.g. it was the local user on another device,
+ * or a since-removed member).
  */
 function resolveEditorLabel(workspacePath: string, userId: string | null | undefined): string | null {
   if (!userId) return null;
   try {
-    const members = getTeamSyncProvider(workspacePath)?.getTeamState()?.members ?? [];
-    return members.find((m) => m.userId === userId)?.email || null;
+    const members = getTeamSyncProviderForScopeKey(workspacePath)?.getTeamState()?.members ?? [];
+    const member = members.find((candidate) => candidate.userId === userId);
+    return member ? teamMemberDisplayName(member) : null;
   } catch {
     return null;
   }
@@ -58,7 +65,10 @@ function resolveEditorLabel(workspacePath: string, userId: string | null | undef
  * DocumentRoom's last *content* update (NIM-953 / NIM-955), delivered on the
  * conflict result. Returns null when neither who nor when is known.
  */
-function describeSharedChange(result: ReuploadResult, workspacePath: string): string | null {
+function describeSharedChange(
+  result: { lastEditedAt?: number | null; lastEditorId?: string | null },
+  workspacePath: string,
+): string | null {
   const at = result.lastEditedAt ?? null;
   const who = resolveEditorLabel(workspacePath, result.lastEditorId);
   const when = at ? `${formatRelativeTime(at)} (${new Date(at).toLocaleString()})` : null;
@@ -86,6 +96,36 @@ function buildConflictPrompt(result: ReuploadResult, workspacePath: string): str
   }
   const context = describeSharedChange(result, workspacePath);
   const action = 'Your push will overwrite the shared document with the current local file. Continue?';
+  return [context, kind, action].filter(Boolean).join(' ');
+}
+
+function confirmOverwriteShared(message: string): Promise<boolean> {
+  return requestConfirmation({
+    title: 'Overwrite shared document?',
+    message,
+    confirmLabel: 'Overwrite',
+    destructive: true,
+  });
+}
+
+function buildPullConflictPrompt(result: PullResult, workspacePath: string): string {
+  let kind: string;
+  switch (result.conflictKind) {
+    case 'missing-baseline':
+      kind = 'No sync baseline exists for this local file yet.';
+      break;
+    case 'local-ahead':
+      kind = 'The local file changed since it was last synced.';
+      break;
+    case 'diverged':
+      kind = 'Both the local file and the shared document changed.';
+      break;
+    default:
+      kind = '';
+      break;
+  }
+  const context = describeSharedChange(result, workspacePath);
+  const action = 'Pulling will replace the whole local file with the shared document. Continue?';
   return [context, kind, action].filter(Boolean).join(' ');
 }
 
@@ -285,7 +325,13 @@ export function useCollabLocalOrigin(
     if (!workspacePath || !documentId || !window.electronAPI?.documentSync?.clearLocalOrigin) {
       return false;
     }
-    if (!window.confirm('Clear the local source link for this shared document?')) {
+    const confirmed = await requestConfirmation({
+      title: 'Clear local source?',
+      message: 'Clear the local source link for this shared document?',
+      confirmLabel: 'Clear',
+      destructive: true,
+    });
+    if (!confirmed) {
       return false;
     }
 
@@ -324,7 +370,7 @@ export function useCollabLocalOrigin(
       });
 
       if (result.status === 'conflict') {
-        const confirmed = window.confirm(buildConflictPrompt(result, workspacePath));
+        const confirmed = await confirmOverwriteShared(buildConflictPrompt(result, workspacePath));
         if (!confirmed) return false;
         result = await window.electronAPI.documentSync.reuploadLocalOrigin({
           workspacePath,
@@ -340,7 +386,7 @@ export function useCollabLocalOrigin(
       if (result.status === 'unsupported' && documentId) {
         let rendererResult = await tryRendererHeadlessReupload(workspacePath, documentId, result);
         if (rendererResult.status === 'conflict') {
-          const confirmed = window.confirm(buildConflictPrompt(rendererResult.result, workspacePath));
+          const confirmed = await confirmOverwriteShared(buildConflictPrompt(rendererResult.result, workspacePath));
           if (!confirmed) return false;
           rendererResult = await tryRendererHeadlessReupload(workspacePath, documentId, result, true);
         }
@@ -459,6 +505,98 @@ export function useLocalFileSharedDocLink(
     void refresh();
   }, [refresh]);
 
+  const pullFromSharedDoc = useCallback(async () => {
+    if (
+      !workspacePath
+      || !sourceFilePath
+      || !binding?.documentId
+      || !window.electronAPI?.documentSync?.pullLocalOrigin
+    ) {
+      return false;
+    }
+
+    setBusyAction('pull');
+    try {
+      const documentModel = DocumentModelRegistry.get(sourceFilePath);
+      if (documentModel?.isDirty()) {
+        await documentModel.flushDirtyEditors();
+        if (documentModel.isDirty()) {
+          errorNotificationService.showError(
+            'Pull failed',
+            'Save the local file before pulling from the shared document.',
+          );
+          return false;
+        }
+      }
+
+      let result = await window.electronAPI.documentSync.pullLocalOrigin({
+        workspacePath,
+        documentId: binding.documentId,
+      });
+
+      while (result.status === 'conflict') {
+        const confirmed = await requestConfirmation({
+          title: 'Overwrite local file?',
+          message: buildPullConflictPrompt(result, workspacePath),
+          confirmLabel: 'Overwrite',
+          destructive: true,
+        });
+        if (!confirmed) return false;
+        if (!result.conflictToken) {
+          errorNotificationService.showError(
+            'Pull failed',
+            'The shared document changed before the overwrite could be confirmed. Try again.',
+          );
+          return false;
+        }
+        result = await window.electronAPI.documentSync.pullLocalOrigin({
+          workspacePath,
+          documentId: binding.documentId,
+          forceOverwriteLocal: true,
+          conflictToken: result.conflictToken,
+        });
+      }
+
+      if (result.success && result.binding !== undefined) {
+        setBinding(result.binding ?? null);
+      }
+
+      switch (result.status) {
+        case 'pulled':
+          errorNotificationService.showInfo(
+            'Local file updated',
+            `Pulled the latest shared document into ${binding.sourceBasename}.`,
+            { duration: 5000 },
+          );
+          return true;
+        case 'noop':
+          errorNotificationService.showInfo(
+            'Already up to date',
+            result.message || 'The local file already matches the shared document.',
+            { duration: 3500 },
+          );
+          return true;
+        case 'missing-source':
+        case 'unsupported':
+        case 'error':
+        default:
+          errorNotificationService.showError(
+            'Pull failed',
+            result.message || 'Could not pull the shared document into the local file.',
+          );
+          return false;
+      }
+    } catch (error) {
+      errorNotificationService.showError(
+        'Pull failed',
+        error instanceof Error ? error.message : String(error),
+      );
+      return false;
+    } finally {
+      setBusyAction(null);
+    }
+  }, [binding?.documentId, binding?.sourceBasename, sourceFilePath, workspacePath]);
+
   const reuploadToSharedDoc = useCallback(async () => {
     if (!workspacePath || !binding?.documentId || !window.electronAPI?.documentSync?.reuploadLocalOrigin) {
       return false;
@@ -472,7 +610,7 @@ export function useLocalFileSharedDocLink(
       });
 
       if (result.status === 'conflict') {
-        const confirmed = window.confirm(buildConflictPrompt(result, workspacePath));
+        const confirmed = await confirmOverwriteShared(buildConflictPrompt(result, workspacePath));
         if (!confirmed) return false;
         result = await window.electronAPI.documentSync.reuploadLocalOrigin({
           workspacePath,
@@ -488,7 +626,7 @@ export function useLocalFileSharedDocLink(
       if (result.status === 'unsupported') {
         let rendererResult = await tryRendererHeadlessReupload(workspacePath, binding.documentId, result);
         if (rendererResult.status === 'conflict') {
-          const confirmed = window.confirm(buildConflictPrompt(rendererResult.result, workspacePath));
+          const confirmed = await confirmOverwriteShared(buildConflictPrompt(rendererResult.result, workspacePath));
           if (!confirmed) return false;
           rendererResult = await tryRendererHeadlessReupload(workspacePath, binding.documentId, result, true);
         }
@@ -558,12 +696,14 @@ export function useLocalFileSharedDocLink(
     busyAction,
     loading,
     refresh,
+    pullFromSharedDoc,
     reuploadToSharedDoc,
   }), [
     binding,
     busyAction,
     loading,
     refresh,
+    pullFromSharedDoc,
     reuploadToSharedDoc,
   ]);
 }

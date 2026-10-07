@@ -1,0 +1,15 @@
+{
+  "name": "knowledge",
+  "version": "1.0.0",
+  "description": "Knowledge pages setup, writing guide, and authoring guidance for Nimbalyst Pages",
+  "author": {
+    "name": "Nimbalyst",
+    "url": "https://nimbalyst.com"
+  },
+  "keywords": [
+    "knowledge",
+    "pages",
+    "wiki",
+    "tracker"
+  ]
+}

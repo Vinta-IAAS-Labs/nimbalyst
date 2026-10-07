@@ -1,5 +1,7 @@
+// @vitest-environment node
 import { readFile } from 'fs/promises';
 import { resolve } from 'path';
+import { createHash } from 'crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -11,9 +13,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * fails loudly here instead of at runtime.
  */
 
-const { fetchMock, safeHandleMock, handlers } = vi.hoisted(() => {
+const { accountsMock, fetchMock, safeHandleMock, handlers } = vi.hoisted(() => {
   const handlers = new Map<string, (...args: any[]) => any>();
   return {
+    accountsMock: vi.fn(() => [{
+      personalOrgId: 'personal-1',
+      email: 'user@test.com',
+      sessionStatus: 'active',
+    }]),
     fetchMock: vi.fn(),
     handlers,
     safeHandleMock: vi.fn((channel: string, handler: (...args: any[]) => any) => {
@@ -27,15 +34,42 @@ vi.mock('electron', () => ({
   net: { fetch: fetchMock },
 }));
 
-vi.mock('../../utils/ipcRegistry', () => ({ safeHandle: safeHandleMock }));
+vi.mock('../../utils/ipcRegistry', () => ({ safeHandle: safeHandleMock, safeOn: vi.fn() }));
 
 vi.mock('../../utils/logger', () => ({
   logger: { main: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
 }));
 
-vi.mock('../../utils/gitUtils', () => ({ getNormalizedGitRemote: vi.fn() }));
+const gitRemoteFnMock = vi.hoisted(() => vi.fn());
+vi.mock('../../utils/gitUtils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/gitUtils')>();
+  return {
+    ...actual,
+    getNormalizedGitRemote: gitRemoteFnMock,
+    getRawGitRemote: gitRemoteFnMock,
+    // The real one closes over the unmocked getRawGitRemote, so it would spawn
+    // git against the test's cwd. Both normalizers stay real -- their exact
+    // output is what several tests below assert on.
+    getGitRemoteIdentities: async (workspacePath: string) => {
+      const raw = await gitRemoteFnMock(workspacePath);
+      const canonical = actual.normalizeGitRemote(raw);
+      const legacy = actual.legacyNormalizeGitRemote(raw);
+      return canonical && legacy ? { canonical, legacy } : null;
+    },
+  };
+});
 
 vi.mock('../teamProjectResolver', () => ({ resolveTeamForRemoteHash: vi.fn() }));
+
+vi.mock('../../window/WindowManager', () => ({
+  createWindow: vi.fn(),
+  windows: new Map(),
+  windowStates: new Map(),
+}));
+
+vi.mock('../../window/windowState', () => ({
+  windowReferencesWorkspace: vi.fn(() => false),
+}));
 
 vi.mock('../../utils/collabSyncUrl', () => ({ getCollabSyncHttpUrl: () => 'https://sync.test' }));
 
@@ -46,7 +80,7 @@ vi.mock('../jwtOrg', () => ({
 }));
 
 vi.mock('../StytchAuthService', () => ({
-  getAccounts: vi.fn(() => [{ personalOrgId: 'personal-1', email: 'user@test.com' }]),
+  getAccounts: accountsMock,
   getPersonalSessionJwt: vi.fn(() => 'personal-jwt'),
   getPersonalSessionJwtForAccount: vi.fn(() => 'personal-jwt'),
   getSessionToken: vi.fn(() => 'session-token'),
@@ -57,16 +91,22 @@ vi.mock('../StytchAuthService', () => ({
   refreshPersonalSessionForAccount: vi.fn(async () => null),
   onAuthStateChange: vi.fn(() => () => {}),
   updateSessionToken: vi.fn(),
+  updateSessionTokenForAccount: vi.fn(),
   getStytchUserId: vi.fn(() => 'user-1'),
   getUserEmail: vi.fn(() => 'user@test.com'),
+  getSyncAccount: vi.fn(() => null),
   getPersonalOrgId: vi.fn(() => 'personal-1'),
   getPersonalUserId: vi.fn(() => 'user-1'),
 }));
 
 vi.mock('@nimbalyst/runtime', () => ({
   asPersonalJwt: (jwt: string) => jwt,
+  asPersonalMemberId: (id: string) => id,
   asTeamJwt: (jwt: string) => jwt,
+  asTeamMemberId: (id: string) => id,
 }));
+
+vi.mock('../../menu/organizationMenuState', () => ({ setHasOrganizationsForMenu: vi.fn() }));
 
 vi.mock('../../database/initialize', () => ({}));
 vi.mock('../OrgProjectionService', () => ({}));
@@ -77,8 +117,19 @@ vi.mock('../CollabBackupService', () => ({}));
 // runAuthenticatedTeamBootstrap), so the mock must return a callable factory.
 vi.mock('../TeamAuthBootstrap', () => ({ createTeamAuthBootstrap: (fn: unknown) => fn }));
 
-import { registerTeamHandlers } from '../TeamService';
+import {
+  canListProjectAccess,
+  invalidateListTeamsCache,
+  pendingInviteForEmail,
+  registerTeamHandlers,
+} from '../TeamService';
+import { getPersonalSessionJwtForAccount } from '../StytchAuthService';
+import type { TeamDetails } from '../TeamService';
 import { registerTeamCustodyHandlers } from '../TeamCustodyService';
+import { registerOrgProjectWalkHandlers } from '../OrgProjectWalkService';
+import { registerSignInAttributionHandlers } from '../SignInAttribution';
+import { registerProjectWalkClaimHandlers } from '../ProjectWalkClaim';
+import { normalizeGitRemote } from '../../utils/gitUtils';
 
 const EXPECTED_TEAM_CHANNELS = [
   'team:accept-invite',
@@ -87,6 +138,7 @@ const EXPECTED_TEAM_CHANNELS = [
   'team:create',
   'team:delete',
   'team:find-for-workspace',
+  'team:find-pending-invite-for-email',
   'team:get',
   'team:get-git-remote',
   'team:invite',
@@ -97,8 +149,17 @@ const EXPECTED_TEAM_CHANNELS = [
   'team:move-project',
   'team:move-project-preview',
   'team:remove-member',
+  'team:rename',
+  'team:resolve-org-projects-local-state',
   'team:set-project-identity',
   'team:update-role',
+];
+
+// Both live in WorkspaceManagerWindow: opening a project is window work, and
+// TeamService only owns the membership check and the binding behind it.
+const TEAM_CHANNELS_REGISTERED_OUTSIDE_TEAM_SERVICE = [
+  'team:open-project-workspace',
+  'team:open-shared-project',
 ];
 
 const EXPECTED_ORG_CHANNELS = [
@@ -127,6 +188,9 @@ describe('registerTeamHandlers channel registration', () => {
 
   it('covers every team:* channel the preload invokes', async () => {
     registerTeamCustodyHandlers(); // owns team:get-key-custody-status
+    registerOrgProjectWalkHandlers(); // owns the post-sign-in project walk channels
+    registerSignInAttributionHandlers(); // owns team:claim-sign-in-attribution
+    registerProjectWalkClaimHandlers(); // owns team:claim-project-walk
 
     const preloadSource = await readFile(
       resolve(__dirname, '../../../preload/index.ts'),
@@ -137,7 +201,272 @@ describe('registerTeamHandlers channel registration', () => {
     );
     expect(invoked.size).toBeGreaterThan(0);
 
-    const unregistered = [...invoked].filter((channel) => !handlers.has(channel)).sort();
+    const externallyRegistered = new Set(TEAM_CHANNELS_REGISTERED_OUTSIDE_TEAM_SERVICE);
+    const unregistered = [...invoked]
+      .filter((channel) => !handlers.has(channel) && !externallyRegistered.has(channel))
+      .sort();
     expect(unregistered).toEqual([]);
+  });
+
+  it('matches only a pending invitation owned by the signed-in email', () => {
+    const teams = [
+      {
+        orgId: 'org-active',
+        name: 'Already joined',
+        membershipType: 'active_member',
+        sourceEmail: 'member@example.com',
+      },
+      {
+        orgId: 'org-other',
+        name: 'Other account',
+        membershipType: 'pending_member',
+        sourceEmail: 'other@example.com',
+      },
+      {
+        orgId: 'org-invite',
+        name: 'Acme Robotics',
+        membershipType: 'pending_member',
+        sourceEmail: 'MEMBER@example.com',
+      },
+    ] as TeamDetails[];
+
+    expect(pendingInviteForEmail(teams, 'member@example.com')?.orgId).toBe('org-invite');
+    expect(pendingInviteForEmail(teams, 'missing@example.com')).toBeNull();
+  });
+});
+
+/**
+ * Org creation was blocked in every non-development build while Teams was being
+ * finished (NIM-2306). That gate is gone; a packaged build must reach the API
+ * instead of short-circuiting with "not available yet".
+ */
+describe('team:create handler', () => {
+  beforeEach(() => {
+    handlers.clear();
+    safeHandleMock.mockClear();
+    fetchMock.mockReset();
+    gitRemoteFnMock.mockReset();
+    gitRemoteFnMock.mockResolvedValue(null);
+    registerTeamHandlers();
+  });
+
+  async function captureCreateRequest(rawRemote: string): Promise<Record<string, unknown>> {
+    gitRemoteFnMock.mockResolvedValue(rawRemote);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ orgId: 'org-new', name: 'Acme', creatorMemberId: 'member-1' }),
+    });
+
+    await handlers.get('team:create')!({}, 'Acme', '/workspace');
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/teams'));
+    return JSON.parse(String((call?.[1] as { body?: string } | undefined)?.body));
+  }
+
+  it('calls the teams API from a packaged build', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ orgId: 'org-new', name: 'Acme', creatorMemberId: 'member-1' }),
+    });
+
+    const handler = handlers.get('team:create');
+    if (!handler) throw new Error('team:create is not registered');
+    const result = await handler({}, 'Acme');
+
+    expect(fetchMock).toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0]?.[0]).toContain('/api/teams');
+    expect(result.error ?? '').not.toContain('not available yet');
+
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ['https://user:token@github.com/acme/widgets.git', 'https://github.com/acme/widgets.git'],
+    ['git@github.com:acme/widgets.git', 'git@github.com:acme/widgets.git'],
+    ['ssh://git:password@github.com/acme/widgets.git', 'ssh://git@github.com/acme/widgets.git'],
+    // A git remote never needs a query string, so the whole thing goes rather
+    // than a denylist of names a secret could hide behind.
+    ['https://github.com/acme/widgets.git?ref=main&api_key=SECRET&access-token=SECRET', 'https://github.com/acme/widgets.git'],
+  ])('sanitizes the clone remote before transmit: %s', async (rawRemote, expectedRemote) => {
+    const body = await captureCreateRequest(rawRemote);
+
+    expect(body.remoteUrl).toBe(expectedRemote);
+  });
+
+  it('hashes the canonical remote, so a credentialed origin matches a clean clone', async () => {
+    // Asserted against a literal, not against normalizeGitRemote's own output:
+    // deriving the expectation from the function under test is what let the
+    // credentialed/clean mismatch survive here unnoticed.
+    const expectedHash = createHash('sha256').update('github.com/acme/widgets').digest('hex');
+
+    const credentialed = await captureCreateRequest('https://user:token@github.com/acme/widgets.git');
+    const cleanClone = await captureCreateRequest('https://github.com/acme/widgets.git');
+
+    expect(credentialed.gitRemoteHash).toBe(expectedHash);
+    expect(cleanClone.gitRemoteHash).toBe(expectedHash);
+    expect(credentialed.remoteUrl).toBe('https://github.com/acme/widgets.git');
+  });
+
+  it('writes one identity for every spelling of the same repository', async () => {
+    const expectedHash = createHash('sha256').update('github.com/acme/widgets').digest('hex');
+
+    for (const raw of [
+      'ssh://git@github.com/acme/widgets.git',
+      'git@github.com:acme/widgets.git',
+      'https://user@github.com/acme/widgets.git',
+    ]) {
+      expect((await captureCreateRequest(raw)).gitRemoteHash).toBe(expectedHash);
+    }
+  });
+
+  it('omits malformed hierarchical userinfo rather than transmitting it', async () => {
+    const body = await captureCreateRequest('https://user:token@github.com:bad/widgets.git');
+
+    expect(body).not.toHaveProperty('remoteUrl');
+  });
+});
+
+/**
+ * The wizard's invitation branch is only as good as the channel behind it, and
+ * the matcher above is one of four things the handler does: it also validates
+ * the argument, refuses an email the signed-in accounts do not own, and turns a
+ * directory failure into a result rather than an unhandled rejection.
+ */
+describe('team:find-pending-invite-for-email handler', () => {
+  const invite = (email: string) => ({
+    orgId: 'org-invite',
+    name: 'Acme Robotics',
+    membershipType: 'pending_member',
+    sourceEmail: email,
+  });
+
+  function respondWithTeams(teams: unknown[]) {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ teams }),
+    });
+  }
+
+  async function invokeHandler(email: unknown) {
+    const handler = handlers.get('team:find-pending-invite-for-email');
+    if (!handler) throw new Error('team:find-pending-invite-for-email is not registered');
+    return handler({}, email);
+  }
+
+  beforeEach(() => {
+    handlers.clear();
+    safeHandleMock.mockClear();
+    fetchMock.mockReset();
+    accountsMock.mockReturnValue([{
+      personalOrgId: 'personal-1',
+      email: 'member@example.com',
+      sessionStatus: 'active',
+    }]);
+    invalidateListTeamsCache();
+    registerTeamHandlers();
+  });
+
+  it('rejects an email that is not a usable string', async () => {
+    respondWithTeams([invite('member@example.com')]);
+
+    await expect(invokeHandler(undefined)).resolves.toMatchObject({ success: false });
+    await expect(invokeHandler('   ')).resolves.toMatchObject({ success: false });
+    await expect(invokeHandler(42)).resolves.toMatchObject({ success: false });
+    // Nothing was looked up, so nothing could have leaked.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The email comes from the renderer. Answering for an address the signed-in
+   * accounts do not own would report another person's pending invitation to
+   * whoever typed their address.
+   */
+  it('reports no invitation for an email no signed-in account owns', async () => {
+    respondWithTeams([invite('someone-else@example.com')]);
+
+    await expect(invokeHandler('someone-else@example.com'))
+      .resolves.toEqual({ success: true, invitation: null });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('returns the pending invitation for an owned email', async () => {
+    respondWithTeams([
+      { orgId: 'org-joined', name: 'Already joined', membershipType: 'active_member', sourceEmail: 'member@example.com' },
+      invite('MEMBER@example.com'),
+    ]);
+
+    const result = await invokeHandler('member@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.invitation).toMatchObject({ orgId: 'org-invite', name: 'Acme Robotics' });
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('reports no invitation when the owned email has none pending', async () => {
+    respondWithTeams([
+      { orgId: 'org-joined', name: 'Already joined', membershipType: 'active_member', sourceEmail: 'member@example.com' },
+    ]);
+
+    await expect(invokeHandler('member@example.com'))
+      .resolves.toEqual({ success: true, invitation: null });
+  });
+
+  // Invitation discovery is optional to the wizard; a directory outage must not
+  // reach the renderer as a rejected invoke.
+  it('answers with no invitation when the directory lookup fails', async () => {
+    fetchMock.mockRejectedValue(new Error('network down'));
+
+    await expect(invokeHandler('member@example.com'))
+      .resolves.toEqual({ success: true, invitation: null });
+  });
+});
+
+
+describe('team:list completeness', () => {
+  beforeEach(() => {
+    accountsMock.mockReturnValue([{ personalOrgId: 'personal-1', email: 'a@example.com', sessionStatus: 'active' }]);
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValue('personal-jwt' as never);
+    fetchMock.mockReset().mockResolvedValue({ ok: true, status: 200, json: async () => ({ teams: [] }) });
+    invalidateListTeamsCache();
+    registerTeamHandlers();
+  });
+
+  it('does not report an empty success before the personal JWT is restored, and recovers on the next read', async () => {
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValueOnce(null);
+    const list = handlers.get('team:list')!;
+    await expect(list({})).resolves.toMatchObject({ success: false, complete: false, teams: [], retryable: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(list({})).resolves.toMatchObject({ success: true, complete: true, teams: [] });
+  });
+
+  it('does not turn an authenticated zero-account snapshot into a conclusive empty list', async () => {
+    accountsMock.mockReturnValue([]);
+    await expect(handlers.get('team:list')!({})).resolves.toMatchObject({ success: false, complete: false });
+  });
+
+  it('returns healthy-account rows but never declares a partial multi-account directory complete', async () => {
+    accountsMock.mockReturnValue([
+      { personalOrgId: 'personal-1', email: 'a@example.com', sessionStatus: 'active' },
+      { personalOrgId: 'personal-2', email: 'b@example.com', sessionStatus: 'active' },
+    ]);
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValueOnce(null);
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ teams: [{ orgId: 'org-b', name: 'Beta', role: 'owner' }] }) });
+    const result = await handlers.get('team:list')!({});
+    expect(result).toMatchObject({ success: false, complete: false, teams: [{ orgId: 'org-b' }] });
+  });
+
+});
+
+describe('projection sync project-access listing', () => {
+  it('only asks the admin-only endpoint for teams where the caller is an owner or admin', () => {
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'admin' })).toBe(true);
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'owner' })).toBe(true);
+    // A member gets a 403 on every sync; the role-derived projection stands instead.
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'member' })).toBe(false);
+    expect(canListProjectAccess({ teamProjectId: null, role: 'admin' })).toBe(false);
   });
 });

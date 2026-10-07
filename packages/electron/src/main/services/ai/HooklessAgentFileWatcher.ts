@@ -36,6 +36,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { extractFilePathsFromCommand as extractCommandPathCandidates } from './extractFilePathsFromCommand';
 import { type SessionData } from '@nimbalyst/runtime/ai/server/types';
 import { SessionFilesRepository } from '@nimbalyst/runtime';
 import { logger } from '../../utils/logger';
@@ -400,6 +401,7 @@ export class HooklessAgentFileWatcher {
           resolvedBeforeContent,
           session.id,
           existingTag.toolUseId,
+          { speculative: true },
         );
         logger.main.info('[HooklessAgentFileWatcher] Upgraded empty bash tag with baseline:', {
           sessionId: session.id, filePath, tagId: existingTag.id,
@@ -423,6 +425,9 @@ export class HooklessAgentFileWatcher {
         resolvedBeforeContent,
         session.id,
         toolUseId,
+        // Speculative: the baseline is inferred from paths scraped out of a
+        // bash command, so an authoritative writer may replace its content.
+        { speculative: true },
       );
 
       await SessionFilesRepository.addFileLink({
@@ -492,7 +497,6 @@ export async function extractFilePathsFromCommand(
   cwd: string,
 ): Promise<string[]> {
   const results = new Set<string>();
-  const normalizedCommand = command.replace(/\\/g, path.sep);
 
   const resolveAndCheck = async (candidate: string): Promise<void> => {
     try {
@@ -511,27 +515,7 @@ export async function extractFilePathsFromCommand(
     }
   };
 
-  const candidates: string[] = [];
-
-  const absoluteMatches = [
-    ...(normalizedCommand.match(/\/[^\s'"]+/g) || []),
-    ...(normalizedCommand.match(/[A-Za-z]:[\\\/][^\s'"]+/g) || []),
-  ];
-  for (const raw of absoluteMatches) {
-    const cleaned = raw.replace(/[);:,]+$/, '');
-    if (!cleaned) continue;
-    candidates.push(path.normalize(cleaned));
-  }
-
-  const tokens = normalizedCommand.split(/\s+/);
-  for (const token of tokens) {
-    if (!token) continue;
-    const cleaned = token.replace(/^['"]|['"]$/g, '').replace(/[);:,]+$/, '');
-    if (!cleaned || path.isAbsolute(cleaned)) continue;
-    if (!cleaned.includes(path.sep) && !cleaned.includes('/')) continue;
-    candidates.push(path.normalize(path.resolve(cwd, cleaned)));
-  }
-
+  const candidates = extractCommandPathCandidates(command, cwd);
   await Promise.all(candidates.map(c => resolveAndCheck(c)));
   return [...results];
 }

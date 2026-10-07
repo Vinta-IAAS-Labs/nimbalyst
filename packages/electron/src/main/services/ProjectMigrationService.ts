@@ -1,3 +1,5 @@
+import PrivateSettingsStore from '../utils/privateSettingsStore';
+import { getProviderCredentials } from './credentials/providerCredentials';
 /**
  * ProjectMigrationService.ts
  *
@@ -22,6 +24,7 @@ import { encodeWorkspaceDir } from './ClaudeCodeSessionScanner';
 // Import store utilities - we'll need to access the underlying stores directly
 import {
   getRecentItems,
+  invalidateWorkspaceStoreCache,
   store as appStore,
 } from '../utils/store';
 import { resolveClaudeConfigDir } from '@nimbalyst/runtime/ai/server/providers/claudeCode/claudeConfigDir';
@@ -417,8 +420,8 @@ export class ProjectMigrationService {
   private async migrateWorkspaceSettings(oldPath: string, newPath: string): Promise<void> {
     // Get the electron-store for workspace settings
     // We need to access it directly since the exported functions don't expose key migration
-    const ElectronStore = require('electron-store');
-    const workspaceStore = new ElectronStore({
+    getProviderCredentials().moveWorkspace(oldPath, newPath);
+    const workspaceStore = new PrivateSettingsStore<Record<string, any>>({
       name: 'workspace-settings',
       cwd: app.getPath('userData'),
     });
@@ -474,6 +477,9 @@ export class ProjectMigrationService {
       // Write to new key and delete old key
       workspaceStore.set(newKey, oldState);
       workspaceStore.delete(oldKey);
+      // This writes the workspace-settings file through its own store instance,
+      // so store.ts's read-through cache is now stale for both keys.
+      invalidateWorkspaceStoreCache();
       logger.main.info('[ProjectMigration] Workspace settings migrated from', oldKey, 'to', newKey);
     }
   }

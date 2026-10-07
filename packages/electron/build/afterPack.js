@@ -4,12 +4,15 @@
 // resolves from inside the packaged tree. The validator catches the failure
 // class where the build is green but the feature is broken in production
 // because the SDK's package.json/exports map is missing or unresolvable --
-// something `validate-extra-resources.js` (input-only validation) cannot
-// detect.
+// something the pre-pack input validation cannot detect.
 
 const path = require('path');
 const fs = require('fs');
 const { spawnSync } = require('child_process');
+const { relocateClaudeRuntime } = require('./claude-runtime.js');
+const { validatePackagedTutorialProject } = require('./validate-extra-resources.js');
+const { findUnresolvedDependencies } = require('./packaged-dependency-check.js');
+const asar = require('@electron/asar');
 
 exports.default = async function(context) {
   const { appOutDir, packager } = context;
@@ -84,7 +87,11 @@ exports.default = async function(context) {
     }
   }
 
+  relocateClaudeRuntime(resourcesDir, platformName, arch);
+
   pruneSqlitePrebuilds(resourcesDir, platformName, arch);
+  pruneNodePtyPrebuilds(resourcesDir, platformName, arch);
+  pruneOnnxRuntimeBinaries(resourcesDir, platformName, arch);
 
   // Ensure node-pty's `spawn-helper` is executable in the packaged tree.
   // node-pty ships via extraResources to resources/node-pty; the macOS/Linux
@@ -135,6 +142,22 @@ exports.default = async function(context) {
     );
   }
 
+  // Every module in app.asar must find the dependencies it declares. The SDK
+  // and native-binary checks above do not load the electron-store chain, so a
+  // collector packaging the wrong version of a transitive dep passed them.
+  const appAsar = path.join(resourcesDir, 'app.asar');
+  const unresolved = findUnresolvedDependencies(asar.listPackage(appAsar), (file) => {
+    try {
+      return JSON.parse(asar.extractFile(appAsar, file.replace(/^[\\/]/, '')).toString('utf8'));
+    } catch {
+      return null;
+    }
+  });
+  if (unresolved.length > 0) {
+    throw new Error(`AfterPack: packaged modules cannot resolve their dependencies:\n  ${unresolved.join('\n  ')}`);
+  }
+  console.log('AfterPack: every packaged module resolves its declared dependencies');
+
   // Validate that the built-in extensions actually landed in the packaged
   // tree. electron-builder's extraResources copy of packages/extensions is
   // filter-driven and can silently produce NOTHING (e.g. the minimatch 10.2.3
@@ -143,6 +166,7 @@ exports.default = async function(context) {
   // releases with zero bundled extensions. Assert the output here so it fails
   // the build instead of silently shipping.
   validateBundledExtensions(resourcesDir);
+  validatePackagedTutorialProject(resourcesDir);
 
   console.log('AfterPack: Complete');
 };
@@ -211,6 +235,103 @@ function pruneSqlitePrebuilds(resourcesDir, platformName, arch) {
   console.log(
     `AfterPack: Pruned ${removedCount} non-target better-sqlite3 prebuilds ` +
     `(kept ${[...keep].join(', ')}, saved ${Math.round(removedSize / 1024 / 1024)}MB)`,
+  );
+  return { removedCount, keptCount, removedSize, skipped: false };
+}
+
+// Prune non-target node-pty prebuilds from the packaged tree.
+// node-pty ships prebuilds for darwin-{arm64,x64} and win32-{arm64,x64}, and
+// the extraResources copy takes the whole package -- so a Windows build also
+// carried the Mach-O pty.node files and a mac build carried the PE ones.
+// Beyond the dead weight, the foreign binaries broke the release workflow's
+// recursive Authenticode sweep (a Mach-O file can never carry a Windows
+// signature), which killed the v0.72.0 build after its tag was already
+// pushed. Linux has no prebuild dir -- CI source-builds it into build/Release
+// -- so a zero-kept prune is only fatal when that fallback is missing too.
+exports.pruneNodePtyPrebuilds = pruneNodePtyPrebuilds;
+function pruneNodePtyPrebuilds(resourcesDir, platformName, arch) {
+  const prebuildsDir = path.join(resourcesDir, 'node-pty/prebuilds');
+  const keep = new Set(
+    arch === 'universal'
+      ? [`${platformName}-x64`, `${platformName}-arm64`]
+      : [`${platformName}-${arch}`],
+  );
+  if (!fs.existsSync(prebuildsDir)) {
+    return { removedCount: 0, keptCount: 0, removedSize: 0, skipped: true };
+  }
+
+  let removedCount = 0;
+  let removedSize = 0;
+  let keptCount = 0;
+  for (const entry of fs.readdirSync(prebuildsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    if (keep.has(entry.name)) {
+      keptCount++;
+      continue;
+    }
+    const dirPath = path.join(prebuildsDir, entry.name);
+    removedSize += getDirSize(dirPath);
+    fs.rmSync(dirPath, { recursive: true });
+    removedCount++;
+  }
+
+  const sourceBuilt = path.join(resourcesDir, 'node-pty/build/Release/pty.node');
+  if (keptCount === 0 && !fs.existsSync(sourceBuilt)) {
+    throw new Error(
+      `AfterPack: pruned every node-pty prebuild in ${prebuildsDir} -- none matched the build ` +
+      `target (${[...keep].join(', ')}) and there is no source-built fallback at ${sourceBuilt}. ` +
+      `The packaged app could not start a terminal. Check that node-pty's prebuild dir naming ` +
+      `still matches <process.platform>-<process.arch>.`,
+    );
+  }
+
+  console.log(
+    `AfterPack: Pruned ${removedCount} non-target node-pty prebuilds ` +
+    `(kept ${[...keep].join(', ')}, saved ${Math.round(removedSize / 1024 / 1024)}MB)`,
+  );
+  return { removedCount, keptCount, removedSize, skipped: false };
+}
+
+// @huggingface/transformers loads onnxruntime-node from Resources/node_modules.
+// The npm package carries native runtimes for every supported target (~200 MB),
+// so retain only the build target while failing closed if its binary is absent.
+exports.pruneOnnxRuntimeBinaries = pruneOnnxRuntimeBinaries;
+function pruneOnnxRuntimeBinaries(resourcesDir, platformName, arch) {
+  const napiDir = path.join(resourcesDir, 'node_modules/onnxruntime-node/bin/napi-v3');
+  if (!fs.existsSync(napiDir)) {
+    return { removedCount: 0, keptCount: 0, removedSize: 0, skipped: true };
+  }
+
+  const keepArchitectures = arch === 'universal' ? new Set(['x64', 'arm64']) : new Set([arch]);
+  let removedCount = 0;
+  let removedSize = 0;
+  let keptCount = 0;
+  for (const platformEntry of fs.readdirSync(napiDir, { withFileTypes: true })) {
+    if (!platformEntry.isDirectory()) continue;
+    const platformDir = path.join(napiDir, platformEntry.name);
+    for (const archEntry of fs.readdirSync(platformDir, { withFileTypes: true })) {
+      if (!archEntry.isDirectory()) continue;
+      const archDir = path.join(platformDir, archEntry.name);
+      if (platformEntry.name === platformName && keepArchitectures.has(archEntry.name)) {
+        if (fs.existsSync(path.join(archDir, 'onnxruntime_binding.node'))) keptCount++;
+        continue;
+      }
+      removedSize += getDirSize(archDir);
+      fs.rmSync(archDir, { recursive: true });
+      removedCount++;
+    }
+    if (fs.readdirSync(platformDir).length === 0) fs.rmSync(platformDir, { recursive: true });
+  }
+
+  if (keptCount !== keepArchitectures.size) {
+    throw new Error(
+      `AfterPack: onnxruntime-node is missing a native binding for ${platformName}-${arch}. ` +
+      'The packaged memory extension would silently fall back to keyword-only retrieval.',
+    );
+  }
+  console.log(
+    `AfterPack: Pruned ${removedCount} non-target onnxruntime directories ` +
+    `(kept ${platformName}-${[...keepArchitectures].join(',')}, saved ${Math.round(removedSize / 1024 / 1024)}MB)`,
   );
   return { removedCount, keptCount, removedSize, skipped: false };
 }

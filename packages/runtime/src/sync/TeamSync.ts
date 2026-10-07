@@ -1,3 +1,4 @@
+import { DocumentFeedbackIndexClient } from './DocumentFeedbackIndexClient';
 /**
  * TeamSyncProvider
  *
@@ -35,9 +36,20 @@ import type {
   FolderNode,
   ServerTeamState,
   SharedDocumentTypeMetadataV2,
+  TypePlacementNode,
+  ItemPlacementNode,
+  DocumentPlacementOptions,
 } from './teamSyncTypes';
+import type { PageParentKind } from '@nimbalyst/collab-protocol';
+import { decodeDocEntry, lockedDocEntry, mergeQueuedMessage } from './teamDocEntries';
+import { asTeamMemberId } from '../auth/jwtScopes';
 import type { BoundedPreview } from '@nimbalyst/collab-protocol';
 import { appendSyncClientParams } from './syncClientInfo';
+import { TeamTypePlacementCache, typePlacementQueueKey } from './teamTypePlacements';
+import { TeamItemPlacementCache, itemPlacementQueueKey } from './teamItemPlacements';
+import { TeamPageMarksRequests, type TeamPageMarksFilters, type TeamPageMarksResult } from './teamPageMarks';
+import { TeamPageLinksRequests, type TeamPageLinksFilters, type TeamPageLinksResult } from './teamPageLinks';
+import { PageSearchRequests, type PageSearchRequest, type PageSearchResponse } from '@nimbalyst/collab-protocol';
 
 // ============================================================================
 // TeamSyncProvider
@@ -49,6 +61,7 @@ const RECONNECT_MAX_MS = 30_000;
 
 export class TeamSyncProvider {
   private config: TeamSyncConfig;
+  private readonly documentFeedbackIndex: DocumentFeedbackIndexClient;
   private ws: WebSocket | null = null;
   private status: TeamSyncStatus = 'disconnected';
   private destroyed = false;
@@ -74,6 +87,42 @@ export class TeamSyncProvider {
   /** Resolvers waiting for the next decrypted folder-index snapshot. */
   private folderResyncWaiters: Array<(folders: FolderNode[] | null) => void> = [];
 
+  /** Tracker types placed in the page tree, this project only. */
+  private readonly typePlacementEntries = new TeamTypePlacementCache(
+    () => this.config.teamProjectId ?? this.teamState?.metadata?.teamProjectId ?? null,
+    () => this.config,
+  );
+
+  /** Tracker items placed in the page tree, this project only. */
+  private readonly itemPlacementEntries = new TeamItemPlacementCache(
+    () => this.config.teamProjectId ?? this.teamState?.metadata?.teamProjectId ?? null,
+    () => this.config,
+  );
+
+  /** Open `pageMarksQuery` requests. */
+  private readonly pageMarkRequests = new TeamPageMarksRequests();
+  /** Open `pageLinksQuery` requests. */
+  private readonly pageLinkRequests = new TeamPageLinksRequests();
+  private readonly pageSearchRequests = new PageSearchRequests();
+
+  /** Set by a snapshot from a TeamRoom whose folders were converted into documents. */
+  private pageTree = false;
+  /** Set by a snapshot from a TeamRoom that echoes the author's page writes back to it. */
+  private authorWriteEcho = false;
+  private authorTitleEcho = false;
+  /** Set by a snapshot from a TeamRoom that stores plain-page fields. */
+  private pageFields = false;
+
+  /**
+   * Resolvers waiting for a `docIndexRegistered` ack, keyed by document id.
+   *
+   * A document's room 404s until its index row exists, so anything that writes
+   * into a freshly created document has to know when registration landed
+   * (NIM-2472). The index broadcast excludes the registering socket, so this
+   * ack is the only signal available to its author.
+   */
+  private registerAckWaiters = new Map<string, Array<(acked: boolean) => void>>();
+
   /**
    * Messages queued while disconnected. Unlike DocumentSync (which queues CRDT
    * updates), TeamSync was silently dropping doc index mutations when offline;
@@ -84,6 +133,7 @@ export class TeamSyncProvider {
 
   constructor(config: TeamSyncConfig) {
     this.config = config;
+    this.documentFeedbackIndex = new DocumentFeedbackIndexClient(state => this.config.onDocumentFeedbackIndex?.(state));
   }
 
   // --------------------------------------------------------------------------
@@ -118,6 +168,9 @@ export class TeamSyncProvider {
       this.reconnectAttempt = 0;
       this.setStatus('syncing');
       this.send({ type: 'teamSync' });
+      // Marks lists and Links sections that went unanswered while offline ask again.
+      this.pageMarkRequests.changed();
+      this.pageLinkRequests.changed();
     });
 
     ws.addEventListener('message', (event) => {
@@ -159,6 +212,16 @@ export class TeamSyncProvider {
     const folderWaiters = this.folderResyncWaiters;
     this.folderResyncWaiters = [];
     for (const waiter of folderWaiters) waiter(null);
+    this.typePlacementEntries.destroy();
+    this.itemPlacementEntries.destroy();
+    this.pageMarkRequests.cancelAll();
+    this.pageLinkRequests.cancelAll();
+    this.pageSearchRequests.cancelAll();
+    const registerWaiters = [...this.registerAckWaiters.values()].flat();
+    this.registerAckWaiters.clear();
+    // Unconfirmed, not confirmed-failed: a destroyed provider says nothing
+    // about whether the row landed.
+    for (const waiter of registerWaiters) waiter(false);
   }
 
   getStatus(): TeamSyncStatus {
@@ -187,14 +250,36 @@ export class TeamSyncProvider {
     return { encryptedTitle: title, titleIv: '' };
   }
 
+  /**
+   * Register a document in the org's index.
+   *
+   * Resolves `true` once the server confirms the row is committed. Callers that
+   * are about to write into the document's room MUST await this: `DocumentRoom`
+   * binds the id through `document_index` and 404s until the row exists
+   * (NIM-2472).
+   *
+   * Resolves `false` — without throwing — when no ack arrives before
+   * `ackTimeoutMs`. That happens against a server predating the ack, and when
+   * the message was queued offline. The registration itself is unaffected
+   * (the mutation is idempotent and the offline queue still carries it); the
+   * caller decides whether to proceed optimistically.
+   *
+   * `placement.parentKind` says whether `parentFolderId` is a page or a tracker
+   * item; `placement.sortOrder` positions the document among its siblings.
+   */
   async registerDocument(
     documentId: string,
     title: string,
     documentType: string,
     parentFolderId: string | null = null,
     metadata?: SharedDocumentTypeMetadataV2,
-  ): Promise<void> {
+    ackTimeoutMs = 6000,
+    placement: DocumentPlacementOptions = {},
+  ): Promise<boolean> {
     const { encryptedTitle, titleIv } = await this.encodeTitleForWire(title);
+    // Register the waiter BEFORE sending: the ack can land in the same tick the
+    // socket flushes, and a waiter added afterwards would miss it.
+    const acked = this.waitForRegisterAck(documentId, ackTimeoutMs);
     this.send({
       type: 'docIndexRegister', documentId, encryptedTitle, titleIv, documentType,
       ...metadata,
@@ -202,20 +287,61 @@ export class TeamSyncProvider {
       // project-partitioned doc index (and a future move) can scope it.
       projectId: this.config.teamProjectId ?? null,
       parentFolderId,
+      ...placementFields(placement),
+    });
+    return acked;
+  }
+
+  private waitForRegisterAck(documentId: string, timeoutMs: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (acked: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const waiters = this.registerAckWaiters.get(documentId);
+        if (waiters) {
+          const remaining = waiters.filter((waiting) => waiting !== waiter);
+          if (remaining.length > 0) this.registerAckWaiters.set(documentId, remaining);
+          else this.registerAckWaiters.delete(documentId);
+        }
+        resolve(acked);
+      };
+      const waiter = (acked: boolean) => done(acked);
+      const timer = setTimeout(() => done(false), timeoutMs);
+      const existing = this.registerAckWaiters.get(documentId);
+      if (existing) existing.push(waiter);
+      else this.registerAckWaiters.set(documentId, [waiter]);
     });
   }
 
-  async updateDocumentTitle(documentId: string, newTitle: string): Promise<void> {
+  private resolveRegisterAck(documentId: string, acked: boolean): void {
+    const waiters = this.registerAckWaiters.get(documentId);
+    if (!waiters) return;
+    this.registerAckWaiters.delete(documentId);
+    for (const waiter of waiters) waiter(acked);
+  }
+
+  async updateDocumentTitle(documentId: string, newTitle: string, options: { requestId?: string } = {}): Promise<void> {
     const { encryptedTitle, titleIv } = await this.encodeTitleForWire(newTitle);
     this.send({
-      type: 'docIndexUpdate', documentId, encryptedTitle, titleIv,
+      type: 'docIndexUpdate', documentId, encryptedTitle, titleIv, ...requestIdField(options.requestId),
     });
   }
 
-  removeDocument(documentId: string): void {
+  /**
+   * Set some of a plain page's own fields: a patch, null clears a key. Only a
+   * server whose snapshot set `pageFields` takes it (`storesPageFields`).
+   */
+  setDocumentFields(documentId: string, fields: Record<string, unknown>, options: { requestId?: string } = {}): void {
+    this.send({ type: 'docIndexSetFields', documentId, fields, ...requestIdField(options.requestId) });
+  }
+
+  /** `purge` permanently deletes a page in Trash; only Trash's permanent delete sends it. */
+  removeDocument(documentId: string, options: { requestId?: string; purge?: true } = {}): void {
     this.localEntries.delete(documentId);
     this.send({
-      type: 'docIndexRemove', documentId,
+      type: 'docIndexRemove', documentId, ...requestIdField(options.requestId), ...(options.purge ? { purge: true } : {}),
     });
   }
 
@@ -241,14 +367,27 @@ export class TeamSyncProvider {
     });
   }
 
-  /** Reparent a document into a folder (null = root). Content untouched. */
-  moveDocument(documentId: string, newParentFolderId: string | null): void {
+  /**
+   * Reparent a document (null = root) under a page or, with `parentKind:
+   * 'item'`, a tracker item. The same parent with a new `sortOrder` is a
+   * reorder. Content untouched.
+   */
+  moveDocument(
+    documentId: string,
+    newParentFolderId: string | null,
+    placement: DocumentPlacementOptions & { requestId?: string } = {},
+  ): void {
     const existing = this.localEntries.get(documentId);
     if (existing) {
-      this.localEntries.set(documentId, { ...existing, parentFolderId: newParentFolderId });
+      const parentKind = newParentFolderId ? placement.parentKind ?? 'page' : 'page';
+      const sameParent = (existing.parentFolderId ?? null) === newParentFolderId
+        && (existing.parentKind ?? 'page') === parentKind;
+      const sortOrder = placement.sortOrder !== undefined ? placement.sortOrder
+        : sameParent ? existing.sortOrder ?? null : null;
+      this.localEntries.set(documentId, { ...existing, parentFolderId: newParentFolderId, parentKind, sortOrder });
     }
     this.send({
-      type: 'docMove', documentId, newParentFolderId,
+      type: 'docMove', documentId, newParentFolderId, ...placementFields(placement), ...requestIdField(placement.requestId),
     });
   }
 
@@ -317,10 +456,10 @@ export class TeamSyncProvider {
   }
 
   /** Delete a folder recursively (folder + descendants + their documents). */
-  removeFolder(folderId: string): void {
+  removeFolder(folderId: string, options: { requestId?: string } = {}): void {
     this.folderEntries.delete(folderId);
     this.send({
-      type: 'folderRemove', folderId,
+      type: 'folderRemove', folderId, ...requestIdField(options.requestId),
     });
   }
 
@@ -353,6 +492,136 @@ export class TeamSyncProvider {
   }
 
   // --------------------------------------------------------------------------
+  // Public API: Tracker-type placements in the page tree
+  // --------------------------------------------------------------------------
+
+  /** Place a type (or move its placement) under a page or an item. `parentFolderId` null = root level. */
+  setTypePlacement(typeId: string, parentFolderId: string | null, sortOrder = 0, parentKind?: PageParentKind): void {
+    this.send({
+      type: 'typePlacementSet', typeId, parentFolderId, sortOrder,
+      ...(parentKind ? { parentKind } : {}),
+      projectId: this.config.teamProjectId ?? null,
+    });
+  }
+
+  removeTypePlacement(typeId: string): void {
+    this.send({ type: 'typePlacementRemove', typeId, projectId: this.config.teamProjectId ?? null });
+  }
+
+  /** Null until the server has sent a placement list (older servers never do). */
+  getTypePlacements(): TypePlacementNode[] | null {
+    return this.typePlacementEntries.authoritativeList();
+  }
+
+  /** Resolves after the server's placement list is applied; null on timeout. */
+  refreshTypePlacements(timeoutMs = 6000): Promise<TypePlacementNode[] | null> {
+    return this.typePlacementEntries.waitForSnapshot(
+      () => this.send({ type: 'typePlacementIndexSync' }),
+      timeoutMs,
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Public API: Tracker-item placements and the one page tree
+  // --------------------------------------------------------------------------
+
+  /**
+   * True once the TeamRoom converted folders into documents: the tree is built
+   * from documents (`parentFolderId` = parent page id) and `folders` is only a
+   * projection for older clients. A document moves under a document via `docMove`.
+   */
+  isPageTree(): boolean {
+    return this.pageTree;
+  }
+
+  /**
+   * True once a snapshot said the server sends the author its own `docMove`,
+   * `docIndexRemove` and `folderRemove` broadcasts and echoes `requestId` on a
+   * refusal, so a write sent with a `requestId` can wait to be confirmed.
+   */
+  echoesAuthorWrites(): boolean {
+    return this.authorWriteEcho;
+  }
+
+  echoesTitleWrites(): boolean {
+    return this.authorTitleEcho;
+  }
+
+  /** True once a snapshot said the room stores plain-page fields and echoes their writes. */
+  storesPageFields(): boolean {
+    return this.pageFields;
+  }
+
+  /**
+   * Place an item (or move its placement). `parentId` is a page id, or an item
+   * id with `parentKind: 'item'`; null = root level. The server refuses a
+   * parent inside the item's own subtree.
+   */
+  setItemPlacement(itemId: string, parentId: string | null, sortOrder = 0, parentKind?: PageParentKind): void {
+    this.send({
+      type: 'itemPlacementSet', itemId, parentId, sortOrder,
+      ...(parentKind ? { parentKind } : {}),
+      projectId: this.config.teamProjectId ?? null,
+    });
+  }
+
+  /** Put an item back under its type. */
+  removeItemPlacement(itemId: string): void {
+    this.send({ type: 'itemPlacementRemove', itemId, projectId: this.config.teamProjectId ?? null });
+  }
+
+  /** Null until the server has sent a placement list (older servers never do). */
+  getItemPlacements(): ItemPlacementNode[] | null {
+    return this.itemPlacementEntries.authoritativeList();
+  }
+
+  /** Resolves after the server's placement list is applied; null on timeout. */
+  refreshItemPlacements(timeoutMs = 6000): Promise<ItemPlacementNode[] | null> {
+    return this.itemPlacementEntries.waitForSnapshot(() => this.send({ type: 'itemPlacementIndexSync' }), timeoutMs);
+  }
+
+  /**
+   * Decision and open-question marks from the team's pages, read from the
+   * server's marks index (pages this member can read, never trashed ones).
+   * Null while offline or when the server does not answer in time.
+   */
+  queryPageMarks(filters: TeamPageMarksFilters, timeoutMs = 8000): Promise<TeamPageMarksResult | null> {
+    return this.pageMarkRequests.request((message) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return false;
+      this.send(message);
+      return true;
+    }, filters, timeoutMs);
+  }
+
+  /**
+   * Links out of and into one page of a team project, read from the server's
+   * page links index (pages this member can read, typed pages that still
+   * exist). Null while offline or when the server does not answer in time.
+   */
+  queryPageLinks(filters: TeamPageLinksFilters, timeoutMs = 8000): Promise<TeamPageLinksResult | null> {
+    return this.pageLinkRequests.request((message) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return false;
+      this.send(message);
+      return true;
+    }, filters, timeoutMs);
+  }
+
+  /**
+   * This connection's project's pages whose bodies match `request`, from the
+   * server's search index (pages this member can read, never trashed ones).
+   * Null while offline, before the project is known, or when unanswered.
+   */
+  searchPages(request: PageSearchRequest, timeoutMs = 8000): Promise<PageSearchResponse | null> {
+    const projectId = this.config.teamProjectId ?? this.teamState?.metadata?.teamProjectId ?? null;
+    if (!projectId) return Promise.resolve(null);
+    return this.pageSearchRequests.request((message) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return false;
+      this.send(message);
+      return true;
+    }, projectId, request, timeoutMs);
+  }
+
+  // --------------------------------------------------------------------------
   // Message Handling
   // --------------------------------------------------------------------------
 
@@ -363,6 +632,21 @@ export class TeamSyncProvider {
       switch (message.type) {
         case 'teamSyncResponse':
           await this.handleTeamSyncResponse(message);
+          break;
+        case 'orgSettingsUpdated':
+          this.config.onOrgSettingsUpdated?.(message.settings);
+          break;
+        case 'conversationDescriptorUpdated':
+          this.config.onConversationDescriptorUpdated?.(message.descriptor);
+          break;
+        case 'documentFeedbackIndexSnapshot':
+          this.documentFeedbackIndex.receive(message);
+          break;
+        case 'feedbackIndexSyncResponse':
+          this.config.onFeedbackIndexLoaded?.(message.entries);
+          break;
+        case 'feedbackIndexBroadcast':
+          this.config.onFeedbackIndexChanged?.(message.entry);
           break;
         case 'memberAdded':
           this.handleMemberAdded(message);
@@ -375,6 +659,9 @@ export class TeamSyncProvider {
           break;
         case 'docIndexSyncResponse':
           await this.handleDocIndexSyncResponse(message);
+          break;
+        case 'docIndexRegistered':
+          this.resolveRegisterAck(message.documentId, true);
           break;
         case 'docIndexBroadcast':
           await this.handleDocIndexBroadcast(message);
@@ -391,8 +678,41 @@ export class TeamSyncProvider {
         case 'folderRemoveBroadcast':
           this.handleFolderRemoveBroadcast(message);
           break;
+        case 'typePlacementIndexSyncResponse':
+          this.typePlacementEntries.applySnapshot(message.placements);
+          break;
+        case 'typePlacementBroadcast':
+          this.typePlacementEntries.applyUpsert(message.placement);
+          break;
+        case 'typePlacementRemoveBroadcast':
+          this.typePlacementEntries.applyRemove(message.projectId, message.typeIds);
+          break;
+        case 'itemPlacementIndexSyncResponse':
+          this.itemPlacementEntries.applySnapshot(message.placements);
+          break;
+        case 'itemPlacementBroadcast':
+          this.itemPlacementEntries.applyUpsert(message.placement);
+          break;
+        case 'itemPlacementRemoveBroadcast':
+          this.itemPlacementEntries.applyRemove(message.projectId, message.itemIds);
+          break;
         case 'projectAccessChanged':
           this.handleProjectAccessChanged(message);
+          break;
+        case 'pageMarksResponse':
+          this.pageMarkRequests.receive(message);
+          break;
+        case 'pageMarksChanged':
+          this.pageMarkRequests.changed();
+          break;
+        case 'pageLinksResponse':
+          this.pageLinkRequests.receive(message);
+          break;
+        case 'pageLinksChanged':
+          this.pageLinkRequests.changed();
+          break;
+        case 'pageSearchResponse':
+          this.pageSearchRequests.receive(message);
           break;
         case 'documentCommentNotifyAck':
           // Fire-and-forget: nothing in the client waits on this. Surfacing a
@@ -408,6 +728,17 @@ export class TeamSyncProvider {
           break;
         case 'error':
           console.error('[TeamSync] Server error:', message.code, message.message);
+          if (message.requestId) {
+            this.config.onWriteRefused?.(message.requestId, { code: message.code, message: message.message });
+            // The refused docMove/docIndexRemove/folderRemove already changed the
+            // local index; re-read server truth so a later snapshot cannot replay it.
+            this.send({ type: 'docIndexSync' });
+            this.send({ type: 'folderIndexSync' });
+          }
+          // A refused placement mutation would otherwise leave the author's
+          // optimistic row in place; the re-read replaces it with server truth.
+          if (this.typePlacementEntries.takeUnconfirmed()) this.send({ type: 'typePlacementIndexSync' });
+          if (this.itemPlacementEntries.takeUnconfirmed()) this.send({ type: 'itemPlacementIndexSync' });
           break;
       }
     } catch (err) {
@@ -417,6 +748,10 @@ export class TeamSyncProvider {
 
   private async handleTeamSyncResponse(msg: TeamSyncResponseMessage): Promise<void> {
     const server: ServerTeamState = msg.team;
+    this.pageTree = server.pageTree === true;
+    this.authorWriteEcho = server.authorWriteEcho === true;
+    this.authorTitleEcho = server.authorTitleEcho === true;
+    this.pageFields = server.pageFields === true;
 
     // Decrypt document titles. NIM-910: in server-managed mode this teamSync
     // path returns titles RAW (DEK-ciphertext the client cannot read); the
@@ -451,12 +786,20 @@ export class TeamSyncProvider {
     // console.log('[TeamSync] Team state loaded:', server.members.length, 'members,', documents.length, 'documents');
 
     this.config.onTeamStateLoaded?.(this.teamState);
+    // Omitted by pre-settings servers; a snapshot that carries them is as
+    // authoritative as a broadcast, so a client that connects after a change
+    // still sees it.
+    if (server.settings) {
+      this.config.onOrgSettingsUpdated?.(server.settings);
+    }
     if (documents.length > 0) {
       this.config.onDocumentsLoaded?.(documents);
     }
     if (folders.length > 0) {
       this.config.onFoldersLoaded?.(folders);
     }
+    this.typePlacementEntries.applySnapshot(server.typePlacements);
+    this.itemPlacementEntries.applySnapshot(server.itemPlacements);
 
     // Replay index mutations / comment notifications queued while disconnected
     this.replayPendingOfflineMessages();
@@ -470,6 +813,8 @@ export class TeamSyncProvider {
     // `folderIndexSync` path too.
     this.send({ type: 'docIndexSync' });
     this.send({ type: 'folderIndexSync' });
+    this.send({ type: 'feedbackIndexSync' });
+    if (this.config.onDocumentFeedbackIndex) this.documentFeedbackIndex.start(() => this.send({ type: 'documentFeedbackIndexSync' }));
 
   }
 
@@ -495,7 +840,7 @@ export class TeamSyncProvider {
     if (this.teamState) {
       this.teamState.members = this.teamState.members.filter(m => m.userId !== msg.userId);
     }
-    this.config.onMemberRemoved?.(msg.userId);
+    this.config.onMemberRemoved?.(asTeamMemberId(msg.userId));
   }
 
   private handleMemberRoleChanged(msg: TeamMemberRoleChangedMessage): void {
@@ -503,7 +848,7 @@ export class TeamSyncProvider {
       const member = this.teamState.members.find(m => m.userId === msg.userId);
       if (member) member.role = msg.role;
     }
-    this.config.onMemberRoleChanged?.(msg.userId, msg.role);
+    this.config.onMemberRoleChanged?.(asTeamMemberId(msg.userId), msg.role);
   }
 
   private async handleDocIndexSyncResponse(msg: TeamDocIndexSyncResponseMessage): Promise<void> {
@@ -523,28 +868,14 @@ export class TeamSyncProvider {
   private async handleDocIndexBroadcast(msg: TeamDocIndexBroadcastMessage): Promise<void> {
     let entry: DocIndexEntry;
     try {
-      entry = await this.decryptEntry(msg.document);
+      entry = decodeDocEntry(msg.document, this.localEntries.get(msg.document.documentId));
     } catch (err) {
       console.warn(
-        '[TeamSync] Title decrypt failed on broadcast; surfacing as locked entry:',
+        '[TeamSync] Title decrypt failed on broadcast; keeping a known title or surfacing as locked:',
         msg.document.documentId,
         err,
       );
-      entry = {
-        documentId: msg.document.documentId,
-        title: '',
-        documentType: msg.document.documentType,
-        metadataVersion: msg.document.metadataVersion,
-        fileExtension: msg.document.fileExtension,
-        editorId: msg.document.editorId,
-        createdBy: msg.document.createdBy,
-        createdAt: msg.document.createdAt,
-        updatedAt: msg.document.updatedAt,
-        lastWriterUserId: msg.document.lastWriterUserId ?? null,
-        parentFolderId: msg.document.parentFolderId ?? null,
-        trashedAt: msg.document.trashedAt ?? null,
-        decryptFailed: true,
-      };
+      entry = lockedDocEntry(msg.document, this.localEntries.get(msg.document.documentId));
     }
     this.localEntries.set(entry.documentId, entry);
     if (this.teamState) {
@@ -559,7 +890,11 @@ export class TeamSyncProvider {
   }
 
   private handleProjectAccessChanged(msg: TeamProjectAccessChangedMessage): void {
-    this.config.onProjectAccessChanged?.(msg.projectId, msg.userId, msg.projectRole);
+    this.config.onProjectAccessChanged?.(
+      msg.projectId,
+      asTeamMemberId(msg.userId),
+      msg.projectRole,
+    );
   }
 
   private handleDocIndexRemoveBroadcast(msg: TeamDocIndexRemoveBroadcastMessage): void {
@@ -672,7 +1007,7 @@ export class TeamSyncProvider {
     let quietLockedCount = 0;
     for (const e of encrypted) {
       try {
-        results.push(await this.decryptEntry(e));
+        results.push(decodeDocEntry(e, this.localEntries.get(e.documentId)));
       } catch (err) {
         // Preserve the entry as a locked placeholder so the user can see
         // that a doc exists and take action (refresh keys, ask admin to
@@ -686,21 +1021,7 @@ export class TeamSyncProvider {
             err,
           );
         }
-        results.push({
-          documentId: e.documentId,
-          title: '',
-          documentType: e.documentType,
-          metadataVersion: e.metadataVersion,
-          fileExtension: e.fileExtension,
-          editorId: e.editorId,
-          createdBy: e.createdBy,
-          createdAt: e.createdAt,
-          updatedAt: e.updatedAt,
-          lastWriterUserId: e.lastWriterUserId ?? null,
-          parentFolderId: e.parentFolderId ?? null,
-          trashedAt: e.trashedAt ?? null,
-          decryptFailed: true,
-        });
+        results.push(lockedDocEntry(e));
       }
     }
     if (quietLockedCount > 0) {
@@ -709,46 +1030,6 @@ export class TeamSyncProvider {
       );
     }
     return results;
-  }
-
-  private async decryptEntry(encrypted: EncryptedDocIndexEntry): Promise<DocIndexEntry> {
-    const title = await this.decryptTitleFromWire(
-      encrypted.documentId,
-      encrypted.encryptedTitle,
-      encrypted.titleIv,
-    );
-    return {
-      documentId: encrypted.documentId,
-      title,
-      documentType: encrypted.documentType,
-      metadataVersion: encrypted.metadataVersion,
-      fileExtension: encrypted.fileExtension,
-      editorId: encrypted.editorId,
-      createdBy: encrypted.createdBy,
-      createdAt: encrypted.createdAt,
-      updatedAt: encrypted.updatedAt,
-      lastWriterUserId: encrypted.lastWriterUserId ?? null,
-      parentFolderId: encrypted.parentFolderId ?? null,
-      trashedAt: encrypted.trashedAt ?? null,
-    };
-  }
-
-  /**
-   * Resolve a wire doc-index title to plaintext. The server decrypts titles it
-   * owns and sends them with the empty-iv sentinel (''). A NON-EMPTY iv is a
-   * pre-cutover row from the retired client-managed lane: no supported client
-   * holds that key, so THROW and let the caller mark the entry `decryptFailed`
-   * (locked) rather than rendering raw base64 as a title.
-   */
-  private async decryptTitleFromWire(
-    _documentId: string,
-    encryptedTitle: string,
-    titleIv: string,
-  ): Promise<string> {
-    if (titleIv) {
-      throw new Error('doc-index title is pre-cutover client-encrypted content and can no longer be read');
-    }
-    return encryptedTitle;
   }
 
   /**
@@ -778,6 +1059,8 @@ export class TeamSyncProvider {
   private send(message: TeamClientMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
+      this.typePlacementEntries.noteSent(message);
+      this.itemPlacementEntries.noteSent(message);
       return;
     }
     const key = this.offlineQueueKey(message);
@@ -787,11 +1070,12 @@ export class TeamSyncProvider {
       return;
     }
     // Collapse a duplicate of the same logical mutation; both queued kinds are
-    // idempotent server-side, so the last one wins.
+    // idempotent server-side, so the last one wins (field patches merge).
+    const previous = this.pendingOfflineMessages.find(pending => this.offlineQueueKey(pending) === key);
     this.pendingOfflineMessages = this.pendingOfflineMessages.filter(
       pending => this.offlineQueueKey(pending) !== key,
     );
-    this.pendingOfflineMessages.push(message);
+    this.pendingOfflineMessages.push(mergeQueuedMessage(previous, message));
     console.warn(`[TeamSync] Queued offline ${message.type} (${this.pendingOfflineMessages.length} pending)`);
   }
 
@@ -805,6 +1089,8 @@ export class TeamSyncProvider {
       // a queued notification for the same comment cannot lose a delivery.
       return `${msg.type}:${msg.commentId}:${msg.reason}`;
     }
+    const placementKey = typePlacementQueueKey(msg) ?? itemPlacementQueueKey(msg);
+    if (placementKey) return placementKey;
     if (!this.isDocIndexMessage(msg)) return undefined;
     const entityId = 'documentId' in msg ? msg.documentId
       : 'folderId' in msg ? msg.folderId
@@ -813,7 +1099,8 @@ export class TeamSyncProvider {
   }
 
   private isDocIndexMessage(msg: TeamClientMessage): boolean {
-    return msg.type === 'docIndexRegister' || msg.type === 'docIndexUpdate' || msg.type === 'docIndexRemove'
+    return msg.type === 'docIndexRegister' || msg.type === 'docIndexUpdate' || msg.type === 'docIndexSetFields'
+      || msg.type === 'docIndexRemove'
       || msg.type === 'docTrash' || msg.type === 'docRestore' || msg.type === 'docMove'
       || msg.type === 'folderRegister' || msg.type === 'folderRename'
       || msg.type === 'folderMove' || msg.type === 'folderRemove';
@@ -829,6 +1116,7 @@ export class TeamSyncProvider {
   }
 
   private setStatus(status: TeamSyncStatus): void {
+    if (status === 'disconnected') this.documentFeedbackIndex.disconnect();
     if (this.status === status) return;
     this.status = status;
     this.config.onStatusChange?.(status);
@@ -906,4 +1194,17 @@ export class TeamSyncProvider {
       this.scheduleReconnect();
     });
   }
+}
+
+/** A write's `requestId`, off the wire when there is none. */
+function requestIdField(requestId: string | undefined): { requestId?: string } {
+  return requestId ? { requestId } : {};
+}
+
+/** Wire fields for a document placement; absent options stay off the wire for older servers. */
+function placementFields(placement: DocumentPlacementOptions): DocumentPlacementOptions {
+  return {
+    ...(placement.parentKind ? { parentKind: placement.parentKind } : {}),
+    ...(placement.sortOrder !== undefined ? { sortOrder: placement.sortOrder } : {}),
+  };
 }

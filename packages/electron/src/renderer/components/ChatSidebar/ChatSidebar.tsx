@@ -8,10 +8,11 @@
 
 import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle, useMemo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import { SessionTranscript, SessionTranscriptRef } from '../UnifiedAI/SessionTranscript';
 import { SessionDropdown } from '../AIChat/SessionDropdown';
+import type { EditorRevealPosition } from '../TabEditor/editorRevealCommand';
 import {
   sessionListChatAtom,
   refreshSessionListAtom,
@@ -38,6 +39,8 @@ export interface ChatSidebarProps {
   onSessionIdChange?: (sessionId: string | null) => void;
   /** Whether to select/create a session automatically on mount. */
   autoInitializeSession?: boolean;
+  /** Content for an intentionally empty sidebar, instead of the load-error message. */
+  emptyState?: React.ReactNode;
   /** Title used when this sidebar creates a new standard chat session. */
   newSessionTitle?: string;
   /** Optional initial draft for newly-created standard chat sessions. */
@@ -47,7 +50,8 @@ export interface ChatSidebarProps {
   documentContext?: SerializableDocumentContext;
   /** Getter function for document context - async, reads from disk */
   getDocumentContext?: () => Promise<SerializableDocumentContext>;
-  onFileOpen?: (filePath: string) => Promise<void> | void;
+  /** `location` scrolls the opened file to a line. */
+  onFileOpen?: (filePath: string, location?: EditorRevealPosition) => Promise<void> | void;
   /** Whether the sidebar is collapsed */
   isCollapsed?: boolean;
   /** Callback when collapse state should toggle */
@@ -66,6 +70,7 @@ export const ChatSidebar = forwardRef<ChatSidebarRef, ChatSidebarProps>(({
   sessionId: controlledSessionId,
   onSessionIdChange,
   autoInitializeSession = true,
+  emptyState,
   newSessionTitle = 'Chat',
   newSessionDraft,
   linkedSession,
@@ -302,9 +307,9 @@ export const ChatSidebar = forwardRef<ChatSidebarRef, ChatSidebarProps>(({
     workspacePath,
   ]);
 
-  const handleFileClick = useCallback(async (filePath: string) => {
+  const handleFileClick = useCallback(async (filePath: string, location?: EditorRevealPosition) => {
     if (onFileOpen) {
-      await onFileOpen(filePath);
+      await onFileOpen(filePath, location);
     }
   }, [onFileOpen]);
 
@@ -363,11 +368,11 @@ export const ChatSidebar = forwardRef<ChatSidebarRef, ChatSidebarProps>(({
   if (!sessionId) {
     return (
       <div
-        className="chat-sidebar chat-sidebar-error flex flex-col h-full overflow-hidden bg-nim border-l border-nim relative items-center justify-center text-nim-muted"
+        className={`chat-sidebar ${emptyState ? 'chat-sidebar-empty' : 'chat-sidebar-error'} flex flex-col h-full overflow-hidden bg-nim border-l border-nim relative items-center justify-center text-nim-muted`}
         style={{ width: onWidthChange ? width : undefined }}
         data-session-id={sessionId}
       >
-        <p>Failed to load chat session</p>
+        {emptyState ?? <p>Failed to load chat session</p>}
       </div>
     );
   }

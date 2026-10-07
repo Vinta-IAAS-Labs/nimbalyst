@@ -5,14 +5,37 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
 const mocks = vi.hoisted(() => ({
   resolveShareability: vi.fn(),
+  resolveMetadata: vi.fn(),
   openDialog: vi.fn(),
   activeTeamOrgIdAtom: Symbol('activeTeamOrgId'),
+  resolveDesktopCollabScope: vi.fn(async () => ({
+    scope: {
+      scopeKey: '/workspace',
+      orgId: 'team-1',
+      indexConfig: { serverUrl: 'ws://sync', teamMemberId: 'user-1' },
+    },
+    retryable: false,
+  })),
   trashSharedDocument: vi.fn(),
+  createCollaborativeDocument: vi.fn(),
+  buildSharedDocumentDeepLink: vi.fn((documentId: string, orgId: string) =>
+    `nimbalyst://doc/${encodeURIComponent(documentId)}?orgId=${encodeURIComponent(orgId)}`),
+  copyToClipboard: vi.fn(),
+  showError: vi.fn(),
+  showInfo: vi.fn(),
+  showWarning: vi.fn(),
+  shareFolderToTeamFromContextMenu: vi.fn(async () => {}),
+}));
+
+vi.mock('../../services/shareFolderToTeamFlow', () => ({
+  shareFolderToTeamFromContextMenu: mocks.shareFolderToTeamFromContextMenu,
 }));
 
 vi.mock('@nimbalyst/runtime', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span data-icon={icon} />,
+  copyToClipboard: mocks.copyToClipboard,
   getEmbeddableExtensions: () => ['.mockup.html'],
+  getShowInFileBrowserLabel: () => 'Show in Explorer',
   parseEmbedAttrs: () => ({}),
   serializeEmbedAttrs: (attrs: Record<string, string>) =>
     Object.entries(attrs).map(([key, value]) => `${key}=${value}`).join(' '),
@@ -22,7 +45,10 @@ vi.mock('@nimbalyst/runtime/store', () => ({
     get: vi.fn((atom: unknown) => (atom === mocks.activeTeamOrgIdAtom ? 'team-1' : '/workspace')),
   },
 }));
-vi.mock('jotai', () => ({ useAtomValue: vi.fn(() => true) }));
+vi.mock('jotai', async (importOriginal) => ({
+  ...await importOriginal<typeof import('jotai')>(),
+  useAtomValue: vi.fn(() => true),
+}));
 vi.mock('../../hooks/useFileActions', () => ({
   useFileActions: () => ({
     openInDefaultApp: vi.fn(),
@@ -35,6 +61,8 @@ vi.mock('../../hooks/useFileActions', () => ({
 vi.mock('../../store/atoms/collabDocuments', () => ({
   workspaceHasTeamAtom: Symbol('workspaceHasTeam'),
   activeTeamOrgIdAtom: mocks.activeTeamOrgIdAtom,
+  resolveDesktopCollabScope: mocks.resolveDesktopCollabScope,
+  buildSharedDocumentDeepLink: mocks.buildSharedDocumentDeepLink,
   trashSharedDocument: mocks.trashSharedDocument,
 }));
 vi.mock('../../store/atoms/openProjects', () => ({ activeWorkspacePathAtom: Symbol('activeWorkspace') }));
@@ -47,16 +75,24 @@ vi.mock('../../services/CollaborativeDocumentTypeCatalog', () => ({
     subscribe: () => () => {},
     getSnapshot: () => 0,
     resolveShareability: mocks.resolveShareability,
-    resolveMetadata: vi.fn(),
+    resolveMetadata: mocks.resolveMetadata,
     editorIdForDescriptor: vi.fn(),
   }),
 }));
 vi.mock('../../services/collaborativeDocumentCreationOrchestrator', () => ({
   CollaborativeDocumentCreationError: class extends Error {},
-  createCollaborativeDocument: vi.fn(),
+  createCollaborativeDocument: mocks.createCollaborativeDocument,
+}));
+vi.mock('../../services/ErrorNotificationService', () => ({
+  errorNotificationService: {
+    showError: mocks.showError,
+    showInfo: mocks.showInfo,
+    showWarning: mocks.showWarning,
+  },
 }));
 
-import { CommonFileActions, readShareToTeamSourceContent } from '../CommonFileActions';
+import { CommonFileActions } from '../CommonFileActions';
+import { readShareToTeamSourceContent } from '../../services/shareToTeamSourceContent';
 
 const spreadsheetDescriptor = {
   documentType: 'csv',
@@ -72,7 +108,6 @@ const spreadsheetDescriptor = {
     sharedCreate: true,
     history: true,
     export: true,
-    embed: false,
   },
 };
 
@@ -94,7 +129,15 @@ function renderActions(fileName: string) {
   );
 }
 
-describe('CommonFileActions Share to Team catalog eligibility', () => {
+describe('CommonFileActions Copy to Pages catalog eligibility', () => {
+  it('uses the platform-aware system file browser label', () => {
+    mocks.resolveShareability.mockReturnValue({ state: 'unsupported', reason: 'Unsupported' });
+    renderActions('index.ts');
+
+    screen.getByRole('button', { name: 'Show in Explorer' });
+    expect(screen.queryByRole('button', { name: 'Show in Finder' })).toBeNull();
+  });
+
   it('inspects markdown embeds before opening the share dialog', async () => {
     const markdownDescriptor = {
       ...spreadsheetDescriptor,
@@ -146,7 +189,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     });
 
     renderActions('notes.md');
-    fireEvent.click(screen.getByRole('button', { name: 'Share to Team' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Pages...' }));
 
     await vi.waitFor(() => expect(mocks.openDialog).toHaveBeenCalledWith(
       'share-to-team',
@@ -164,15 +207,82 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     ));
   });
 
-  it('shows Share to Team for a ready first-wave non-markdown type', () => {
+  it('shows Copy to Pages for a ready first-wave non-markdown type', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
     renderActions('people.tsv');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Share to Team' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Pages...' }));
     expect(mocks.openDialog).toHaveBeenCalledWith('share-to-team', expect.objectContaining({
       fileName: 'people.tsv',
       descriptor: spreadsheetDescriptor,
     }));
+  });
+
+  it('adds a Copy Link action to the successful share toast', async () => {
+    mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
+    mocks.resolveMetadata.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
+    mocks.createCollaborativeDocument.mockResolvedValue({
+      documentId: 'document/one',
+      title: 'people.csv',
+      documentType: 'csv',
+      parentFolderId: null,
+    });
+    mocks.copyToClipboard.mockResolvedValue(undefined);
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: {
+        readFileContent: vi.fn(async () => ({
+          success: true,
+          content: 'name\nAda',
+          isBinary: false,
+        })),
+        invoke: vi.fn(async () => undefined),
+      },
+    });
+
+    renderActions('people.csv');
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Pages...' }));
+    const dialogData = mocks.openDialog.mock.calls[0]?.[1];
+    await dialogData.onConfirm({
+      folderId: null,
+      folderPath: '',
+      sharedName: 'people.csv',
+      selectedEmbeddedDocumentPaths: [],
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.showInfo).toHaveBeenCalledWith(
+        'Shared to team',
+        '"people.csv" is now a collaborative document.',
+        expect.objectContaining({
+          action: expect.objectContaining({ label: 'Copy Link' }),
+        }),
+      );
+    });
+
+    const action = mocks.showInfo.mock.calls[0]?.[2]?.action;
+    await action.onClick();
+
+    expect(mocks.buildSharedDocumentDeepLink).toHaveBeenCalledWith('document/one', 'team-1');
+    expect(mocks.copyToClipboard).toHaveBeenCalledWith(
+      'nimbalyst://doc/document%2Fone?orgId=team-1',
+    );
+  });
+
+  it('offers Copy to Pages with no team (for Personal) for any type but code', async () => {
+    const { useAtomValue } = await import('jotai');
+    vi.mocked(useAtomValue).mockReturnValue(false);
+    try {
+      mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
+      const { unmount } = renderActions('people.csv');
+      screen.getByRole('button', { name: 'Copy to Pages...' });
+      unmount();
+      mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: { ...spreadsheetDescriptor, documentType: 'code' } });
+      renderActions('index.ts');
+      expect(screen.queryByRole('button', { name: 'Copy to Pages...' })).toBeNull();
+    } finally {
+      vi.mocked(useAtomValue).mockReturnValue(true);
+    }
   });
 
   it('keeps Monaco files visible but disabled with the catalog reason', () => {
@@ -180,14 +290,49 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'unsupported', reason });
     renderActions('index.ts');
 
-    const action = screen.getByRole('button', { name: /Share to Team/ });
+    const action = screen.getByRole('button', { name: /Copy to Pages/ });
     expect(action.getAttribute('aria-disabled')).toBe('true');
     expect(action.textContent).toContain(reason);
     fireEvent.click(action);
     expect(mocks.openDialog).not.toHaveBeenCalled();
   });
 
-  it('does not offer Share to Team for an already-shared collaborative document', () => {
+  it('offers a folder the folder promote instead of a file-extension verdict', async () => {
+    // A folder has no document type, so the catalog's "no collaborative
+    // document type is registered for X" is a file message about a non-file.
+    // It used to be the reason the action was greyed out on every folder.
+    mocks.resolveShareability.mockReturnValue({
+      state: 'unsupported',
+      reason: 'No collaborative document type is registered for "design".',
+    });
+    render(
+      <CommonFileActions
+        filePath="/workspace/design"
+        fileName="design"
+        onClose={() => {}}
+        menuItemClass="menu-item"
+        separatorClass="separator"
+        useButtons
+        isDirectory
+      />,
+    );
+
+    const action = screen.getByRole('button', { name: /Share Folder to Team/ });
+    expect(action.getAttribute('aria-disabled')).toBe('false');
+    expect(action.textContent).not.toContain('No collaborative document type');
+
+    fireEvent.click(action);
+    await vi.waitFor(() => {
+      expect(mocks.shareFolderToTeamFromContextMenu).toHaveBeenCalledWith({
+        folderPath: '/workspace/design',
+        folderName: 'design',
+      });
+    });
+    // The single-file dialog is not the folder path.
+    expect(mocks.openDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not offer Copy to Pages for an already-shared collaborative document', () => {
     mocks.resolveShareability.mockReturnValue({ state: 'ready', descriptor: spreadsheetDescriptor });
     render(
       <CommonFileActions
@@ -200,7 +345,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: 'Share to Team' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy to Pages...' })).toBeNull();
   });
 
   it('omits Copy Path for collaborative documents while keeping it for local files', () => {
@@ -229,7 +374,7 @@ describe('CommonFileActions Share to Team catalog eligibility', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Copy Path' })).toBeTruthy();
+    screen.getByRole('button', { name: 'Copy Path' });
   });
 
   it('reads text descriptors as UTF-8 strings and opaque descriptors as bytes', async () => {

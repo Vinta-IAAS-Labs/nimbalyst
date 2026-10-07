@@ -16,17 +16,32 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
 import {
+  sessionStoreAtom,
+  setSessionWorkspaceOpenAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionProcessingAtom,
   sessionPendingPromptsAtom,
   sessionRegistryAtom,
   sessionChildrenAtom,
   sessionLastActivityAtom,
+  sessionListWorkspaceAtom,
+  selectedWorkstreamAtom,
   type SessionMeta,
 } from '../atoms/sessions';
 import {
   globalSessionTurnActivityAtom,
 } from '../atoms/sessionActivity';
+import { activeWorkspacePathAtom, openProjectsAtom } from '../atoms/openProjects';
+import { activeExtensionPanelAtom, activeExtensionBottomPanelAtom } from '../atoms/extensionPanels';
+import { resetWindowMode, windowModeAtom } from '../atoms/windowMode';
+import {
+  initWorkstreamState,
+  setWorkstreamActiveChildAtom,
+  workstreamActiveChildAtom,
+  workstreamStatesLoadedAtom,
+} from '../atoms/workstreamState';
+import { TranscriptStreamAccumulator } from '../transcriptStreamAccumulator';
+import { errorNotificationService } from '../../services/ErrorNotificationService';
 
 function seedRegistry(entries: Array<Partial<SessionMeta> & { id: string }>): void {
   const map = new Map(store.get(sessionRegistryAtom));
@@ -63,7 +78,12 @@ function makeApi() {
       handlers.set(channel, handler);
       return () => handlers.delete(channel);
     }),
-    invoke: vi.fn().mockResolvedValue({ success: true, sessions: [] }),
+    invoke: vi.fn(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') {
+        return null;
+      }
+      return { success: true, sessions: [] };
+    }),
     send: vi.fn(),
     sessionState: {
       subscribe: vi.fn().mockResolvedValue({ success: true }),
@@ -102,7 +122,422 @@ beforeEach(async () => {
 afterEach(() => {
   cleanup?.();
   cleanup = null;
+  errorNotificationService.clearAll();
+  resetWindowMode();
+  store.set(activeWorkspacePathAtom, null);
+  store.set(sessionListWorkspaceAtom, null);
+  store.set(openProjectsAtom, []);
+  store.set(workstreamStatesLoadedAtom, false);
   vi.unstubAllGlobals();
+});
+
+describe('notification click navigation', () => {
+  it('switches to the immutable workspace carried by the notification', async () => {
+    const sid = uniqueSessionId('notification-workspace');
+    const targetWorkspace = `/ws/notification-target-${sid}`;
+    initWorkstreamState(targetWorkspace);
+    store.set(activeWorkspacePathAtom, '/ws/current-project');
+    store.set(sessionListWorkspaceAtom, '/ws/current-project');
+    seedRegistry([{ id: sid, workspaceId: targetWorkspace }]);
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [{
+            id: sid,
+            title: 'Notification target',
+            provider: 'claude',
+            sessionType: 'session',
+            isArchived: false,
+          }],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    const handler = handlers.get('notification-clicked');
+    expect(handler).toBeTypeOf('function');
+    await handler!({
+      sessionId: sid,
+      workspacePath: targetWorkspace,
+      sourceLabel: 'Notification target',
+    });
+
+    expect(store.get(activeWorkspacePathAtom)).toBe(targetWorkspace);
+    expect(store.get(selectedWorkstreamAtom(targetWorkspace))).toEqual({
+      type: 'session',
+      id: sid,
+    });
+    expect(store.get(selectedWorkstreamAtom('/ws/current-project'))).toBeNull();
+  });
+
+  it('activates the exact originating child inside its workstream', async () => {
+    const sid = uniqueSessionId('notification-child');
+    const parentId = uniqueSessionId('notification-parent');
+    const workspacePath = `/ws/notification-child-${sid}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    store.set(sessionListWorkspaceAtom, workspacePath);
+    store.set(windowModeAtom, 'agent');
+    store.set(activeExtensionPanelAtom, 'com.nimbalyst.project-graph.graph');
+    store.set(activeExtensionBottomPanelAtom, 'extension.bottom');
+    seedRegistry([
+      { id: parentId, workspaceId: workspacePath, sessionType: 'workstream' },
+      { id: sid, workspaceId: workspacePath, parentSessionId: parentId },
+    ]);
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [
+            {
+              id: parentId,
+              title: 'Parent workstream',
+              provider: 'claude',
+              sessionType: 'workstream',
+              isArchived: false,
+            },
+            {
+              id: sid,
+              title: 'Child notification',
+              provider: 'claude',
+              sessionType: 'session',
+              parentSessionId: parentId,
+              isArchived: false,
+            },
+          ],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    const handler = handlers.get('notification-clicked');
+    expect(handler).toBeTypeOf('function');
+    await handler!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Child notification',
+    });
+
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+      type: 'workstream',
+      id: parentId,
+    });
+    expect(store.get(workstreamActiveChildAtom(parentId))).toBe(sid);
+    expect(store.get(activeExtensionPanelAtom)).toBeNull();
+    expect(store.get(activeExtensionBottomPanelAtom)).toBeNull();
+  });
+
+  it('fails visibly without selecting a different session when the target is missing', async () => {
+    const sid = uniqueSessionId('notification-missing');
+    const workspacePath = `/ws/notification-missing-${sid}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    store.set(sessionListWorkspaceAtom, workspacePath);
+    store.set(selectedWorkstreamAtom(workspacePath), {
+      type: 'session',
+      id: 'existing-session',
+    });
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') {
+        return { success: true, sessions: [] };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    const handler = handlers.get('notification-clicked');
+    expect(handler).toBeTypeOf('function');
+    await handler!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Missing notification',
+    });
+
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+      type: 'session',
+      id: 'existing-session',
+    });
+    expect(errorNotificationService.getAll()).toEqual([
+      expect.objectContaining({
+        title: 'Missing notification unavailable',
+        severity: 'warning',
+        action: expect.objectContaining({ label: 'Retry' }),
+      }),
+    ]);
+  });
+
+  it('drains queued navigation after an unloaded project becomes active', async () => {
+    const sid = uniqueSessionId('notification-queued');
+    const workspacePath = `/ws/notification-queued-${sid}`;
+    let pending: {
+      sessionId: string;
+      workspacePath: string;
+      sourceLabel: string;
+    } | null = {
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Queued notification',
+    };
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') {
+        const result = pending;
+        pending = null;
+        return result;
+      }
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [{
+            id: sid,
+            title: 'Queued notification',
+            provider: 'claude',
+            sessionType: 'session',
+            isArchived: false,
+          }],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    store.set(activeWorkspacePathAtom, workspacePath);
+
+    await vi.waitFor(() => {
+      expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+        type: 'session',
+        id: sid,
+      });
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      'notifications:consume-pending-navigation',
+      workspacePath,
+    );
+  });
+
+  it('fails visibly without changing selection when the target is archived', async () => {
+    const sid = uniqueSessionId('notification-archived');
+    const workspacePath = `/ws/notification-archived-${sid}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    store.set(sessionListWorkspaceAtom, workspacePath);
+    store.set(selectedWorkstreamAtom(workspacePath), {
+      type: 'session',
+      id: 'existing-session',
+    });
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [{
+            id: sid,
+            title: 'Archived notification',
+            provider: 'claude',
+            sessionType: 'session',
+            isArchived: true,
+          }],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    const handler = handlers.get('notification-clicked');
+    expect(handler).toBeTypeOf('function');
+    await handler!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Archived notification',
+    });
+
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+      type: 'session',
+      id: 'existing-session',
+    });
+    expect(errorNotificationService.getAll()).toEqual([
+      expect.objectContaining({
+        title: 'Archived notification unavailable',
+        severity: 'warning',
+        action: expect.objectContaining({ label: 'Retry' }),
+      }),
+    ]);
+  });
+
+  it('fails visibly when the originating project cannot be registered', async () => {
+    const sid = uniqueSessionId('notification-unregistered');
+    const workspacePath = `/ws/notification-unregistered-${sid}`;
+    initWorkstreamState('/ws/current-project');
+    store.set(activeWorkspacePathAtom, '/ws/current-project');
+    store.set(selectedWorkstreamAtom('/ws/current-project'), {
+      type: 'session',
+      id: 'existing-session',
+    });
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'workspace:register-additional') {
+        return { success: false, error: 'workspace is not trusted' };
+      }
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [{ id: sid, title: 'Unregistered', provider: 'claude', isArchived: false }],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    await handlers.get('notification-clicked')!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Unregistered notification',
+    });
+
+    // The visible project must not change, and nothing may be selected in the
+    // workspace we failed to activate.
+    expect(store.get(activeWorkspacePathAtom)).toBe('/ws/current-project');
+    expect(store.get(selectedWorkstreamAtom('/ws/current-project'))).toEqual({
+      type: 'session',
+      id: 'existing-session',
+    });
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toBeNull();
+    expect(errorNotificationService.getAll()).toEqual([
+      expect.objectContaining({
+        title: 'Unregistered notification unavailable',
+        severity: 'warning',
+        action: expect.objectContaining({ label: 'Retry' }),
+      }),
+    ]);
+  });
+
+  it('does not reload workstream states into an already-loaded window', async () => {
+    const sid = uniqueSessionId('notification-loaded');
+    const otherParentId = uniqueSessionId('notification-other-parent');
+    const workspacePath = `/ws/notification-loaded-${sid}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    store.set(sessionListWorkspaceAtom, workspacePath);
+    store.set(workstreamStatesLoadedAtom, true);
+    // Hierarchy state owned by loadSessionChildrenAtom / setWorkstreamActiveChildAtom
+    // and not yet flushed to the debounced persisted snapshot.
+    store.set(setWorkstreamActiveChildAtom, {
+      workstreamId: otherParentId,
+      childId: 'in-flight-child',
+    });
+    seedRegistry([{ id: sid, workspaceId: workspacePath }]);
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') {
+        return {
+          success: true,
+          sessions: [{ id: sid, title: 'Loaded', provider: 'claude', isArchived: false }],
+        };
+      }
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    await handlers.get('notification-clicked')!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Loaded notification',
+    });
+
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+      type: 'session',
+      id: sid,
+    });
+    // An unrelated workstream's in-flight active child must survive the click.
+    expect(store.get(workstreamActiveChildAtom(otherParentId))).toBe('in-flight-child');
+    expect(invoke).not.toHaveBeenCalledWith('workspace:get-state', workspacePath);
+  });
+
+  it('navigates when the session list is behind the database', async () => {
+    const firstId = uniqueSessionId('notification-known');
+    const lateId = uniqueSessionId('notification-late');
+    const workspacePath = `/ws/notification-late-${firstId}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    let sessions = [{ id: firstId, title: 'Known', provider: 'claude', isArchived: false }];
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') return { success: true, sessions };
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    // First click initializes the session list for this workspace.
+    await handlers.get('notification-clicked')!({
+      sessionId: firstId,
+      workspacePath,
+      sourceLabel: 'Known notification',
+    });
+
+    // A session created afterwards exists in the database but not yet in this
+    // window's registry; `initSessionList` is deduped and will not refetch.
+    sessions = [
+      ...sessions,
+      { id: lateId, title: 'Late', provider: 'claude', isArchived: false },
+    ];
+
+    await handlers.get('notification-clicked')!({
+      sessionId: lateId,
+      workspacePath,
+      sourceLabel: 'Late notification',
+    });
+
+    expect(errorNotificationService.getAll()).toEqual([]);
+    expect(store.get(selectedWorkstreamAtom(workspacePath))).toEqual({
+      type: 'session',
+      id: lateId,
+    });
+  });
+
+  it('re-shows the failure when Retry fails the same way inside the dedup window', async () => {
+    const sid = uniqueSessionId('notification-retry');
+    const workspacePath = `/ws/notification-retry-${sid}`;
+    initWorkstreamState(workspacePath);
+    store.set(activeWorkspacePathAtom, workspacePath);
+    const invoke = window.electronAPI.invoke as ReturnType<typeof vi.fn>;
+    invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'notifications:consume-pending-navigation') return null;
+      if (channel === 'sessions:list') return { success: true, sessions: [] };
+      if (channel === 'workspace:get-state') return {};
+      return { success: true };
+    });
+
+    await handlers.get('notification-clicked')!({
+      sessionId: sid,
+      workspacePath,
+      sourceLabel: 'Retry notification',
+    });
+
+    const first = errorNotificationService.getAll();
+    expect(first).toHaveLength(1);
+
+    first[0].action!.onClick();
+    await vi.waitFor(() => {
+      const current = errorNotificationService.getAll();
+      expect(current).toHaveLength(1);
+      // A new warning replaced the dismissed one rather than being deduplicated
+      // away, so the Retry button never looks inert.
+      expect(current[0].id).not.toBe(first[0].id);
+    });
+  });
 });
 
 describe('lifecycle: session:streaming', () => {
@@ -275,6 +710,62 @@ describe('direct prompt events: AskUserQuestion', () => {
     expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
     expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
   });
+
+  // GitHub #1549. A question that is aborted or cancelled never produced an
+  // answer, so nothing cleared this flag: the session kept advertising a widget
+  // the transcript had already terminalized. Cancellation settles the prompt on
+  // the same terms an answer does.
+  it('ai:askUserQuestionCancelled clears pending and removes prompt', () => {
+    const sid = uniqueSessionId('auq-cancel');
+    const qid = 'q-1';
+    const cancelled = handlers.get('ai:askUserQuestionCancelled');
+    expect(cancelled).toBeTypeOf('function');
+
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: qid, questions: [] });
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+
+    cancelled!({ sessionId: sid, questionId: qid });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
+  // Regression: the resolve handler removed only the settled prompt from the
+  // array but hard-cleared the aggregate flag, so cancelling or answering Q1
+  // stopped the sidebar advertising Q2. The flag has to be recomputed from
+  // what is left.
+  it('keeps the aggregate flag set when a sibling question is still pending', () => {
+    const sid = uniqueSessionId('auq-two');
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-1', questions: [] });
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-2', questions: [] });
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(2);
+
+    handlers.get('ai:askUserQuestionCancelled')!({ sessionId: sid, questionId: 'q-1' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+    const remaining = store.get(sessionPendingPromptsAtom(sid));
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].promptId).toBe('q-2');
+
+    handlers.get('ai:askUserQuestionCancelled')!({ sessionId: sid, questionId: 'q-2' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
+  // The array holds every interactive prompt kind, so a question settling must
+  // not clear a tool permission the user has not answered yet.
+  it('keeps the aggregate flag set when a tool permission is still pending', () => {
+    const sid = uniqueSessionId('auq-perm');
+    handlers.get('ai:askUserQuestion')!({ sessionId: sid, questionId: 'q-1', questions: [] });
+    handlers.get('ai:toolPermission')!({ sessionId: sid, requestId: 'perm-1', request: { toolName: 'Bash' } });
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(2);
+
+    handlers.get('ai:askUserQuestionAnswered')!({ sessionId: sid, questionId: 'q-1' });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(true);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(1);
+  });
 });
 
 describe('direct prompt events: ExitPlanMode', () => {
@@ -326,6 +817,14 @@ describe('direct prompt events: ToolPermission', () => {
 });
 
 describe('direct prompt events: GitCommitProposal', () => {
+  it('does not request user input for a proposal already approved automatically', () => {
+    const sid = uniqueSessionId('gcp-auto');
+    handlers.get('ai:gitCommitProposal')!({ sessionId: sid, proposalId: 'auto-1', autoApproved: true });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
   it('ai:gitCommitProposal sets pending true and pushes prompt', () => {
     const sid = uniqueSessionId('gcp-set');
     const pid = 'gcp-1';
@@ -375,9 +874,11 @@ describe('regression: streaming after a pending prompt', () => {
 describe('workstream sort: child activity bubbles to parent', () => {
   it('session:started for a child bumps the parent workstream\'s turn activity', () => {
     const parentId = uniqueSessionId('ws-parent');
+    const rootId = uniqueSessionId('ws-root');
     const childId = uniqueSessionId('ws-child');
     seedRegistry([
-      { id: parentId, sessionType: 'workstream', childCount: 1 },
+      { id: rootId, childCount: 1 },
+      { id: parentId, parentSessionId: rootId, childCount: 1 },
       { id: childId, parentSessionId: parentId },
     ]);
 
@@ -392,6 +893,7 @@ describe('workstream sort: child activity bubbles to parent', () => {
     const turnsForWs = store.get(globalSessionTurnActivityAtom).get(WS);
     expect(turnsForWs?.get(childId)).toBe(5_000);
     expect(turnsForWs?.get(parentId)).toBe(5_000);
+    expect(turnsForWs?.get(rootId)).toBe(5_000);
   });
 
   it('ai:message-logged for a child bumps only the child\'s relative-time label, not turn-activity', () => {
@@ -539,6 +1041,35 @@ describe('processing reconcile on terminal events', () => {
       expect(store.get(sessionProcessingAtom(child))).toBe(false); // healed via children union
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+
+describe('closed project transcript retention', () => {
+  it('unloads streamed histories on close or completion while preserving an open project', () => {
+    const apply = vi.spyOn(TranscriptStreamAccumulator.prototype, 'apply');
+    const workspacePath = '/ws/cache-cleanup';
+    const ids = ['idle', 'running', 'other'].map(uniqueSessionId);
+    try {
+      for (const [index, sessionId] of ids.entries()) {
+        store.set(sessionStoreAtom(sessionId), { id: sessionId, workspacePath: index === 2 ? '/other' : workspacePath, messages: [] } as any);
+        handlers.get('transcript:event')!({ id: index + 1, sessionId, sequence: 1, createdAt: new Date(), eventType: 'assistant_message', searchableText: 'retained response', payload: {}, parentEventId: null, searchable: true, subagentId: null, provider: 'claude-code', providerToolCallId: null });
+      }
+      const accumulator = apply.mock.instances[0] as TranscriptStreamAccumulator;
+      expect(accumulator.hasPendingFlush(ids[0])).toBe(true);
+      store.set(sessionProcessingAtom(ids[1]), true);
+      store.set(setSessionWorkspaceOpenAtom, { workspacePath, isOpen: false });
+      expect(accumulator.hasPendingFlush(ids[0])).toBe(false);
+      expect(accumulator.hasPendingFlush(ids[1])).toBe(true);
+      expect(accumulator.hasPendingFlush(ids[2])).toBe(true);
+      handlers.get('ai-session-state:event')!({ type: 'session:completed', sessionId: ids[1], workspacePath });
+      expect(accumulator.hasPendingFlush(ids[1])).toBe(false);
+      expect(accumulator.hasPendingFlush(ids[2])).toBe(true);
+    } finally {
+      apply.mockRestore();
+      store.set(setSessionWorkspaceOpenAtom, { workspacePath, isOpen: true });
+      for (const id of ids) store.set(sessionStoreAtom(id), null);
     }
   });
 });

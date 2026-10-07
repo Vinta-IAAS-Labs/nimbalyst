@@ -15,8 +15,9 @@
 
 import { BaseAgentProvider } from './BaseAgentProvider';
 import { buildUserMessageAddition } from './documentContextUtils';
+import { describeUnusableWorkspacePath } from './workspacePreconditions';
 import { buildClaudeCodeSystemPrompt } from '../../prompt';
-import { DEFAULT_MODELS, OPENCODE_PRESET_MODELS } from '../../modelConstants';
+import { DEFAULT_MODELS } from '../../modelConstants';
 import {
   ProviderConfig,
   DocumentContext,
@@ -27,48 +28,46 @@ import {
   ChatAttachment,
 } from '../types';
 import { OpenCodeSDKProtocol } from '../protocols/OpenCodeSDKProtocol';
+import {
+  openCodePermissionDisplayName,
+  openCodePermissionPattern,
+  type OpenCodePermissionContext,
+  type OpenCodePermissionRequest,
+} from '../protocols/openCodePermissions';
+import type { ProtocolSession } from '../protocols/ProtocolInterface';
+import { ToolPermissionService } from '../permissions/ToolPermissionService';
+import type {
+  PermissionPatternChecker,
+  PermissionPatternSaver,
+  SecurityLogger,
+  TrustChecker,
+} from './ProviderPermissionMixin';
 import { McpConfigService } from '../services/McpConfigService';
 import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
 import { MCPServerConfig } from '../../../types/MCPServerConfig';
 import { safeJSONSerialize } from '../../../utils/serialization';
 import { AgentProtocolTranscriptAdapter } from './agentProtocol/AgentProtocolTranscriptAdapter';
 import { TranscriptMigrationRepository } from '../../../storage/repositories/TranscriptMigrationRepository';
+import {
+  getOpenCodeColdModelCatalog,
+  getOpenCodeModelCatalog,
+} from './openCode/OpenCodeModelCatalog';
 
 interface OpenCodeProviderDeps {
   protocol?: OpenCodeSDKProtocol;
-}
-
-/**
- * Subset of OpenCode's `opencode.json` schema we care about for surfacing
- * configured providers/models to the picker. OpenCode accepts many more
- * fields -- we only read what we need and pass everything else through
- * untouched on writes.
- */
-export interface OpenCodeFileProviderModel {
-  name?: string;
-}
-
-export interface OpenCodeFileProvider {
-  name?: string;
-  npm?: string;
-  options?: Record<string, unknown>;
-  models?: Record<string, OpenCodeFileProviderModel>;
-}
-
-export interface OpenCodeFileConfig {
-  $schema?: string;
-  model?: string;
-  autoupdate?: boolean;
-  share?: 'manual' | 'auto' | 'disabled';
-  provider?: Record<string, OpenCodeFileProvider>;
-  [key: string]: unknown;
+  permissionService?: ToolPermissionService;
 }
 
 export class OpenCodeProvider extends BaseAgentProvider {
   static readonly DEFAULT_MODEL = DEFAULT_MODELS['opencode'];
+  private static cachedSdkSlashCommands = new Map<string, string[]>();
 
   private readonly protocol: OpenCodeSDKProtocol;
+  private readonly permissionService: ToolPermissionService | null;
   private readonly mcpConfigService: McpConfigService;
+  private readonly liveProtocolSessions = new Map<string, ProtocolSession>();
+  private readonly slashCommandsByWorkspace = new Map<string, string[]>();
+  private activeWorkspacePath: string | null = null;
 
   // Analytics initialization data, captured during first sendMessage call
   private _initData: {
@@ -83,11 +82,6 @@ export class OpenCodeProvider extends BaseAgentProvider {
   // MCP config loader (injected from electron main process)
   private static mcpConfigLoader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null = null;
 
-  // OpenCode config loader (injected from electron main process). Returns the
-  // parsed opencode.json so we can surface user-configured providers/models in
-  // the picker. Optional -- if missing we just return the preset list.
-  private static configLoader: (() => Promise<OpenCodeFileConfig | null>) | null = null;
-
   // Shell environment loader (injected from electron main process)
   private static shellEnvironmentLoader: (() => Record<string, string> | null) | null = null;
 
@@ -97,8 +91,13 @@ export class OpenCodeProvider extends BaseAgentProvider {
   constructor(deps?: OpenCodeProviderDeps) {
     super();
 
+    this.permissionService = deps?.permissionService ?? this.createPermissionService();
+
     // Initialize protocol (or use injected for testing)
     this.protocol = deps?.protocol || new OpenCodeSDKProtocol();
+    this.protocol.setPermissionHost?.({
+      resolvePermission: (request, context) => this.resolveOpenCodePermission(request, context),
+    });
 
     // Initialize MCP config service from the shared registry + provider loaders.
     this.mcpConfigService = getMcpConfigService({
@@ -112,7 +111,7 @@ export class OpenCodeProvider extends BaseAgentProvider {
     this.config = config;
   }
 
-  getProviderName(): string {
+  getProviderName(): AIProviderType {
     return 'opencode';
   }
 
@@ -131,8 +130,20 @@ export class OpenCodeProvider extends BaseAgentProvider {
     OpenCodeProvider.enhancedPathLoader = loader;
   }
 
-  public static setConfigLoader(loader: (() => Promise<OpenCodeFileConfig | null>) | null): void {
-    OpenCodeProvider.configLoader = loader;
+  public static setTrustChecker(checker: TrustChecker | null): void {
+    BaseAgentProvider.setTrustChecker(checker);
+  }
+
+  public static setPermissionPatternSaver(saver: PermissionPatternSaver | null): void {
+    BaseAgentProvider.setPermissionPatternSaver(saver);
+  }
+
+  public static setPermissionPatternChecker(checker: PermissionPatternChecker | null): void {
+    BaseAgentProvider.setPermissionPatternChecker(checker);
+  }
+
+  public static setSecurityLogger(logger: SecurityLogger | null): void {
+    BaseAgentProvider.setSecurityLogger(logger);
   }
 
   getDisplayName(): string {
@@ -169,58 +180,78 @@ export class OpenCodeProvider extends BaseAgentProvider {
     };
   }
 
+  /** Return commands discovered by this instance for its active workspace. */
+  getSlashCommands(): string[] {
+    if (!this.activeWorkspacePath) return [];
+    return [...(this.slashCommandsByWorkspace.get(this.activeWorkspacePath) ?? [])];
+  }
+
+  /** Read a workspace's cached commands without borrowing another project's list. */
+  static getCachedSdkSlashCommands(workspacePath?: string): string[] {
+    if (!workspacePath) return [];
+    return [...(OpenCodeProvider.cachedSdkSlashCommands.get(workspacePath) ?? [])];
+  }
+
+  /** Test-only: clear cross-instance command discovery. */
+  static resetCachedSdkSlashCommandsForTests(): void {
+    OpenCodeProvider.cachedSdkSlashCommands.clear();
+  }
+
   /**
-   * Get available models from OpenCode.
+   * Compact an OpenCode session through its native summarize RPC.
    *
-   * Returns the curated preset list (Claude/GPT/Gemini) plus any models the
-   * user has wired up in their `opencode.json` -- e.g. an LM Studio bridge.
-   * Configured models are deduplicated against the presets by id.
+   * A live protocol session is not a precondition. The host offers Compact for
+   * every OpenCode session -- including one restored after a restart, which has
+   * sent nothing through this instance -- so when there is no live session we
+   * resume the persisted OpenCode session first and compact that. The
+   * conversation being compacted lives on the OpenCode server, not in this
+   * process, so resuming is all that is missing (#574).
    */
-  static async getModels(): Promise<AIModel[]> {
-    const provider = 'opencode' as AIProviderType;
-    const presets: AIModel[] = OPENCODE_PRESET_MODELS.map((m) => ({
-      id: m.id,
-      name: m.name,
-      provider,
-    }));
+  async compactSession(
+    sessionId: string,
+    options?: { workspacePath?: string; providerSessionId?: string },
+  ): Promise<void> {
+    const session = this.liveProtocolSessions.get(sessionId)
+      ?? await this.resumeSessionForCompaction(sessionId, options);
+    await this.protocol.compactSession(session);
+  }
 
-    const config = await OpenCodeProvider.configLoader?.().catch(() => null);
-    if (!config) {
-      // No file found or unreadable. Surface this in the log so the user can
-      // tell the difference between "I have no providers configured" and
-      // "Nimbalyst can't find the file you wrote". See #284.
-      if (OpenCodeProvider.configLoader) {
-        // eslint-disable-next-line no-console -- runtime package logger is renderer-only
-        console.warn(
-          '[OpenCode] configLoader returned null. opencode.json was not found or could not be parsed. Configured providers will not appear in the model picker.'
-        );
-      }
-      return presets;
+  private async resumeSessionForCompaction(
+    sessionId: string,
+    options?: { workspacePath?: string; providerSessionId?: string },
+  ): Promise<ProtocolSession> {
+    const openCodeSessionId = options?.providerSessionId
+      || this.sessions.getSessionId(sessionId);
+    if (!openCodeSessionId) {
+      // Nothing has ever been sent to OpenCode for this session, so there is no
+      // context to compact.
+      throw new Error('Cannot compact: this session has no OpenCode conversation yet.');
     }
-    if (!config.provider) {
-      return presets;
-    }
-
-    const seen = new Set(presets.map((m) => m.id));
-    const configured: AIModel[] = [];
-
-    for (const [providerID, providerEntry] of Object.entries(config.provider)) {
-      const providerLabel = providerEntry.name || providerID;
-      const models = providerEntry.models;
-      if (!models) continue;
-      for (const [modelID, modelEntry] of Object.entries(models)) {
-        const id = `opencode:${providerID}/${modelID}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        configured.push({
-          id,
-          name: modelEntry?.name ? `${modelEntry.name} (${providerLabel})` : `${modelID} (${providerLabel})`,
-          provider,
-        });
-      }
+    if (!options?.workspacePath) {
+      throw new Error('Cannot compact: no project folder is set for this session.');
     }
 
-    return [...presets, ...configured];
+    const session = await this.protocol.resumeSession(openCodeSessionId, {
+      workspacePath: options.workspacePath,
+      model: this.config?.model || 'default',
+      env: OpenCodeProvider.buildOpenCodeEnvironment(),
+    });
+    this.liveProtocolSessions.set(sessionId, session);
+    return session;
+  }
+
+  /**
+   * Read the cached live catalog without starting an OpenCode server.
+   *
+   * `workspacePath` is a required parameter that accepts `undefined` so a
+   * caller with no project context has to say so rather than drift into the
+   * preset list by omission (#1382).
+   */
+  static async getModels(workspacePath: string | undefined): Promise<AIModel[]> {
+    if (!workspacePath) {
+      return (await getOpenCodeColdModelCatalog()).models;
+    }
+    return (await getOpenCodeModelCatalog(workspacePath)).models;
   }
 
   /**
@@ -250,10 +281,16 @@ export class OpenCodeProvider extends BaseAgentProvider {
   /**
    * Build system prompt for the OpenCode session.
    */
-  protected buildSystemPrompt(documentContext?: DocumentContext): string {
+  protected buildSystemPrompt(
+    documentContext?: DocumentContext,
+    sessionDirective?: string,
+    hasOutOfBandNaming: boolean = false,
+  ): string {
     return buildClaudeCodeSystemPrompt({
       hasSessionNaming: isInternalMcpServerEnabled(),
+      hasOutOfBandNaming,
       toolReferenceStyle: 'opencode' as any,
+      sessionDirective,
       trackersEnabled: areTrackerToolsEnabled(resolveTrackersWorkspacePath(documentContext)),
     });
   }
@@ -266,12 +303,15 @@ export class OpenCodeProvider extends BaseAgentProvider {
     workspacePath?: string,
     attachments?: ChatAttachment[]
   ): AsyncIterableIterator<StreamChunk> {
-    if (!workspacePath) {
-      yield { type: 'error', error: '[OpenCodeProvider] workspacePath is required but was not provided' };
+    const unusableWorkspace = describeUnusableWorkspacePath(workspacePath);
+    if (unusableWorkspace || !workspacePath) {
+      yield { type: 'error', error: unusableWorkspace ?? 'No project folder is set for this session.' };
       return;
     }
 
-    const systemPrompt = this.buildSystemPrompt(documentContext);
+    const systemPrompt = this.buildSystemPrompt(
+      documentContext, await this.getSessionDirective(sessionId), this.isNamedOutOfBand(sessionId, documentContext),
+    );
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
 
     // Emit prompt additions for UI
@@ -286,7 +326,9 @@ export class OpenCodeProvider extends BaseAgentProvider {
     }
 
     if (sessionId) {
-      await this.logAgentMessageBestEffort(sessionId, 'input', messageWithContext);
+      await this.logAgentMessageBestEffort(sessionId, 'input', messageWithContext, {
+        metadata: this.withPromptProvenanceMetadata(documentContext),
+      });
     }
 
     const mcpConfigWorkspacePath = documentContext?.mcpConfigWorkspacePath || workspacePath;
@@ -315,6 +357,11 @@ export class OpenCodeProvider extends BaseAgentProvider {
         raw: {
           systemPrompt,
           abortSignal: abortController.signal,
+          permissionsPath: documentContext?.permissionsPath || workspacePath,
+          // Session role (an `app.agents` primary agent). Applied per prompt,
+          // so changing it takes effect on the next turn of an existing
+          // conversation rather than only at session creation.
+          openCodeAgent: this.config?.agentRole,
         },
       };
 
@@ -322,6 +369,22 @@ export class OpenCodeProvider extends BaseAgentProvider {
       const session = isResumedSession
         ? await this.protocol.resumeSession(existingSessionId, sessionOptions)
         : await this.protocol.createSession(sessionOptions);
+
+      if (sessionId) {
+        this.liveProtocolSessions.set(sessionId, session);
+      }
+      this.activeWorkspacePath = workspacePath;
+
+      // Memoized in the protocol for the server process's lifetime, so this is
+      // one round trip per server rather than one per turn (#574).
+      try {
+        const slashCommands = await this.protocol.listSlashCommands(session);
+        this.slashCommandsByWorkspace.set(workspacePath, slashCommands);
+        OpenCodeProvider.cachedSdkSlashCommands.set(workspacePath, slashCommands);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn('[OPENCODE] Failed to load slash commands:', detail);
+      }
 
       // Store initialization data for analytics
       this._initData = {
@@ -339,6 +402,15 @@ export class OpenCodeProvider extends BaseAgentProvider {
       // Create transcript adapter as event parser (returns ParsedItems for the streaming loop).
       // Canonical events are written by the TranscriptTransformer from raw ai_agent_messages.
       const transcriptAdapter = new AgentProtocolTranscriptAdapter(null, sessionId ?? '');
+      // Cache-backed read only: getOpenCodeModelCatalog() may query an already
+      // running server, but never starts one. The assistant usage event names
+      // the actual provider/model selected by OpenCode, including when the
+      // session was configured as `default`.
+      const modelCatalog = await getOpenCodeModelCatalog(workspacePath).catch((error) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn('[OPENCODE] Failed to read model catalog for context usage:', detail);
+        return { models: [] };
+      });
 
       transcriptAdapter.userMessage(
         messageWithContext,
@@ -381,7 +453,17 @@ export class OpenCodeProvider extends BaseAgentProvider {
           }
         }
 
-        for (const item of transcriptAdapter.processEvent(event)) {
+        const actualModelId = typeof event.metadata?.openCodeModelId === 'string'
+          ? event.metadata.openCodeModelId
+          : undefined;
+        const resolvedContextWindow = actualModelId
+          ? modelCatalog.models.find((model) => model.id === actualModelId)?.contextWindow
+          : undefined;
+        const normalizedEvent = event.type === 'complete' && resolvedContextWindow
+          ? { ...event, contextWindow: resolvedContextWindow }
+          : event;
+
+        for (const item of transcriptAdapter.processEvent(normalizedEvent)) {
           switch (item.kind) {
             case 'text':
               // Content rendered from canonical events, but AIService still needs
@@ -461,6 +543,103 @@ export class OpenCodeProvider extends BaseAgentProvider {
         this.abortController = null;
       }
     }
+  }
+
+  /**
+   * Release every protocol session this instance opened.
+   *
+   * `destroy()` is the hook the host actually reaches --
+   * `ProviderFactory.destroyProvider` runs on session delete, archive, worktree
+   * teardown and app shutdown, and provider instances are cached per session,
+   * so there is no earlier point at which these entries stop being needed.
+   * Without this the ProtocolSession (and the OpenCode server reference behind
+   * it) was retained for the life of the process (#574).
+   */
+  destroy(): void {
+    this.permissionService?.rejectAllPending();
+    this.permissionService?.clearSessionCache();
+    for (const session of this.liveProtocolSessions.values()) {
+      try {
+        this.protocol.cleanupSession(session);
+      } catch (error) {
+        console.warn('[OPENCODE] protocol.cleanupSession threw during destroy():', error);
+      }
+    }
+    this.liveProtocolSessions.clear();
+    super.destroy();
+  }
+
+  abort(): void {
+    this.permissionService?.rejectAllPending();
+    for (const session of this.liveProtocolSessions.values()) {
+      this.protocol.abortSession(session);
+    }
+    super.abort();
+  }
+
+  resolveToolPermission(
+    requestId: string,
+    response: { decision: 'allow' | 'deny'; scope: 'once' | 'session' | 'always' | 'always-all' },
+    sessionId?: string,
+    respondedBy: 'desktop' | 'mobile' = 'desktop',
+  ): void {
+    this.permissionService?.resolvePermission(requestId, response);
+    if (sessionId) {
+      void this.logAgentMessageBestEffort(
+        sessionId,
+        'output',
+        this.createPermissionResultMessage(requestId, response, respondedBy),
+      );
+    }
+  }
+
+  private createPermissionService(): ToolPermissionService | null {
+    if (
+      !BaseAgentProvider.trustChecker
+      || !BaseAgentProvider.permissionPatternSaver
+      || !BaseAgentProvider.permissionPatternChecker
+    ) {
+      return null;
+    }
+    return new ToolPermissionService({
+      trustChecker: BaseAgentProvider.trustChecker,
+      patternSaver: BaseAgentProvider.permissionPatternSaver,
+      patternChecker: BaseAgentProvider.permissionPatternChecker,
+      securityLogger: BaseAgentProvider.securityLogger ?? undefined,
+      emit: this.emit.bind(this),
+    });
+  }
+
+  private async resolveOpenCodePermission(
+    request: OpenCodePermissionRequest,
+    context: OpenCodePermissionContext,
+  ) {
+    if (!this.permissionService) {
+      throw new Error('OpenCode permission handling dependencies are not configured.');
+    }
+    const pattern = openCodePermissionPattern(request);
+    const displayName = openCodePermissionDisplayName(request);
+    return this.permissionService.requestToolPermission({
+      requestId: request.id,
+      sessionId: context.sessionId,
+      workspacePath: context.workspacePath,
+      permissionsPath: context.permissionsPath,
+      toolName: request.permission,
+      toolInput: {
+        permission: request.permission,
+        patterns: request.patterns,
+        always: request.always,
+        metadata: request.metadata,
+        ...(request.tool ? { tool: request.tool } : {}),
+      },
+      pattern,
+      patternDisplayName: displayName,
+      toolDescription: displayName,
+      isDestructive: false,
+      warnings: [],
+      signal: context.signal,
+      suppressAlwaysAllowRule: request.always.length === 0,
+    });
   }
 
   // Drive the transcript transformer incrementally so that canonical events

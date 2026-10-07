@@ -118,14 +118,15 @@
 /* eslint-disable @typescript-eslint/no-unused-vars, no-shadow */
 
 import type {Transformer} from '@lexical/markdown';
-import {
-  $convertFromEnhancedMarkdownString,
-  $convertToEnhancedMarkdownString,
-} from '../../../markdown';
+// Deep paths, not the `markdown` barrel: this engine also runs headless in the
+// collab worker (`@nimbalyst/markdown-ydoc`), which must not load React.
+import {$convertFromEnhancedMarkdownString} from '../../../markdown/EnhancedMarkdownImport';
+import {$convertToEnhancedMarkdownString} from '../../../markdown/EnhancedMarkdownExport';
 import type {LexicalEditor, SerializedLexicalNode, TextNode} from 'lexical';
 import {
   type ElementNode,
   type LexicalNode,
+  $createParagraphNode,
   $createTextNode,
   $getNodeByKey,
   $getRoot,
@@ -139,6 +140,8 @@ import {
   SKIP_DOM_SELECTION_TAG,
 } from 'lexical';
 import {$createAutoLinkNode, $isAutoLinkNode, $isLinkNode} from '@lexical/link';
+import {$isEmbeddedFileNode} from '../../EmbedPlugin/EmbeddedFileNodeCore';
+import {$rescanForEmbedUpgrade} from '../../EmbedPlugin/embedUpgrade';
 
 import {createHeadlessEditor} from '@lexical/headless';
 import {createNodeFromSerialized} from './createNodeFromSerialized';
@@ -152,6 +155,8 @@ import {QuoteDiffHandler} from '../handlers/QuoteDiffHandler';
 import {TableDiffHandler} from '../handlers/TableDiffHandler';
 import {CodeBlockDiffHandler} from '../handlers/CodeBlockDiffHandler';
 import {MermaidDiffHandler} from '../handlers/MermaidDiffHandler';
+import {DecisionDiffHandler} from '../handlers/DecisionDiffHandler';
+import {preserveCommentMarks} from './preserveCommentMarks';
 import {NodeStructureValidator} from './NodeStructureValidator';
 import {applyParsedDiffToMarkdown} from './standardDiffFormat';
 import {
@@ -161,8 +166,16 @@ import {
   DiffError,
 } from './DiffError';
 import {createWindowedTreeMatcher, NodeDiff} from './TreeMatcher';
+import {
+  DEFAULT_MAX_PAIR_EVALUATIONS,
+  DiffBudgetExceededError,
+} from './ThresholdedOrderPreservingTree';
 import type {CanonicalTreeNode} from './canonicalTree';
 import { applyFrontmatterUpdateIfNeeded } from './diffFrontmatter';
+// Circular with diffPluginUtils (which imports `initializeHandlers` from here);
+// both sides only call the other at run time, never during module evaluation.
+import {$approveDiffs} from './diffPluginUtils';
+import {isDiffDebug} from './diffDebug';
 
 // Initialize a simple registry (in future this could be external)
 let _handlersInitialized = false;
@@ -176,6 +189,7 @@ export function initializeHandlers() {
   diffHandlerRegistry.register(new TableDiffHandler());
   diffHandlerRegistry.register(new CodeBlockDiffHandler());
   diffHandlerRegistry.register(new MermaidDiffHandler());
+  diffHandlerRegistry.register(new DecisionDiffHandler());
   diffHandlerRegistry.register(new ParagraphDiffHandler());
   diffHandlerRegistry.register(new QuoteDiffHandler());
   diffHandlerRegistry.register(new HeadingDiffHandler());
@@ -337,6 +351,45 @@ function $applyAutoLinksToHeadlessEditor(editor: LexicalEditor): void {
   );
 }
 
+function $editorHasEmbeds(editor: LexicalEditor): boolean {
+  let found = false;
+  editor.getEditorState().read(() => {
+    const visit = (node: LexicalNode) => {
+      if (found) return;
+      if ($isEmbeddedFileNode(node)) {
+        found = true;
+        return;
+      }
+      if ($isElementNode(node)) {
+        for (const child of node.getChildren()) {
+          visit(child);
+          if (found) return;
+        }
+      }
+    };
+    visit($getRoot());
+  });
+  return found;
+}
+
+/**
+ * Upgrade paragraph-isolated links in the headless target editor into
+ * `EmbeddedFileNode`s, mirroring what `EmbedExtension` would have done in the
+ * live editor.
+ *
+ * Same structural-mismatch class as `$applyAutoLinksToHeadlessEditor` above.
+ * `EmbeddedFileNode` has no markdown IMPORT transformer -- it is produced by a
+ * `registerNodeTransform` on `LinkNode` that only `EmbedExtension` installs.
+ * The headless target editor runs no extensions, so an embed exported as
+ * `[label](src)` comes back as a plain `LinkNode`. TreeMatcher then cannot
+ * pair the source embed with the target link and the recursion emits the item
+ * twice, red/green marked, which is what "the embed duplicated" looks like to
+ * a user (#1744).
+ */
+function $applyEmbedUpgradeToHeadlessEditor(editor: LexicalEditor): void {
+  editor.update(() => $rescanForEmbedUpgrade(), {discrete: true});
+}
+
 // Type for text replacement edits (internal use after resolution)
 export type TextReplacement = {
   oldText: string;
@@ -411,6 +464,23 @@ function normalizeWhitespace(text: string): string {
 
   // Preserve original trailing newlines
   return normalized.trimEnd() + trailingNewlines;
+}
+
+/**
+ * Apply text replacements to a string, exact match first and whitespace-
+ * normalized match second, throwing a TEXT_REPLACEMENT_ERROR when neither
+ * lands.
+ *
+ * Also used by headless writes to codec-only shared documents (mockups,
+ * diagrams, sheets), which have no Lexical tree to reconcile into and so edit
+ * their serialized form directly. Sharing this function is the point: an
+ * agent's `oldText` matches by the same rules wherever it is applied.
+ */
+export function applyTextReplacementsToString(
+  originalText: string,
+  replacements: TextReplacement[],
+): string {
+  return _applyMarkdownEdits(originalText, replacements);
 }
 
 function _applyMarkdownEdits(
@@ -525,11 +595,38 @@ function _applyMarkdownEdits(
  * This is an alternative to applyMarkdownDiff that takes direct text replacements
  * instead of unified diff strings
  */
+export interface ApplyMarkdownReplaceOptions {
+  /**
+   * Fail instead of falling back to a structural guess when a replacement's
+   * `oldText` does not match.
+   *
+   * The fallback below reconstructs a target markdown from the replacement --
+   * for a list-shaped one it locates the FIRST list in the document and
+   * replaces that. On screen that is survivable: a human watches the wrong list
+   * get rewritten and hits undo. Applied headlessly to a shared document nobody
+   * has open, the same guess deletes content, is acknowledged by the server for
+   * every collaborator, and returns SUCCESS to the agent that asked for it.
+   *
+   * Callers with no human in the loop set this. See `headlessMarkdownEdit`.
+   */
+  exactTextMatchRequired?: boolean;
+  /**
+   * Land the edit as final text instead of a pending red/green diff.
+   *
+   * The approval runs inside the same Lexical update that applies the change,
+   * so a collaborative binding emits one Y.Doc transaction holding only the
+   * final text. Approving in a later update would broadcast the pending diff
+   * nodes to every collaborator first. See `agentEditsApplyDirectly`.
+   */
+  acceptChanges?: boolean;
+}
+
 export function applyMarkdownReplace(
   editor: LexicalEditor,
   originalMarkdown: string,
   replacements: TextReplacement[],
   transformers: Transformer[],
+  options: ApplyMarkdownReplaceOptions = {},
 ): void {
   // console.log('[applyMarkdownReplace] CALLED with', replacements.length, 'replacements');
   const normalizedReplacements = replacements.map((replacement) => {
@@ -569,6 +666,12 @@ export function applyMarkdownReplace(
     // This is normal for structural changes like tables and lists
     console.log('[applyMarkdownReplace] Text replacement FAILED:', error);
     textReplacementError = error as Error;
+
+    // No human is watching this edit land, so a guess cannot be reviewed or
+    // undone. Fail with the real reason instead.
+    if (options.exactTextMatchRequired) {
+      throw textReplacementError;
+    }
 
     // Build the new markdown by applying replacements in a best-effort manner
     // For now, we'll use the first replacement's newText as a hint
@@ -685,6 +788,7 @@ export function applyMarkdownReplace(
       originalMarkdown,
       normalizedNewMarkdown,
       transformers,
+      {acceptChanges: options.acceptChanges},
     );
     // console.log('✅ applyMarkdownDiffToDocument completed successfully');
 
@@ -864,6 +968,7 @@ export function applyMarkdownDiffToDocument(
   originalMarkdown: string,
   newMarkdown: string,
   transformers: Array<Transformer>,
+  options: {acceptChanges?: boolean} = {},
 ): void {
   // Debug: Starting diff application
   // console.log('\n🔍 STARTING DIFF APPLICATION...');
@@ -875,12 +980,14 @@ export function applyMarkdownDiffToDocument(
   }
 
   try {
-    // Validate editor state before starting
+    // A brand-new collaborative document has a root with zero children until
+    // someone types. Give it the empty paragraph a fresh local editor starts
+    // with so the tree matcher has a node to diff against.
     editor.update(
       () => {
         const liveRoot = $getRoot();
-        if (liveRoot.getChildren().length === 0) {
-          throw new Error('Live editor root has no children');
+        if (liveRoot.getChildrenSize() === 0) {
+          liveRoot.append($createParagraphNode());
         }
       },
       {discrete: true},
@@ -982,6 +1089,14 @@ export function applyMarkdownDiffToDocument(
         $applyAutoLinksToHeadlessEditor(targetEditor);
       }
 
+      // Same reasoning for embeds: the target's re-imported markdown carries
+      // plain LinkNodes where the source clone has EmbeddedFileNodes (#1744).
+      if ($editorHasEmbeds(sourceEditor)) {
+        $applyEmbedUpgradeToHeadlessEditor(targetEditor);
+      }
+
+      preserveCommentMarks(sourceEditor, targetEditor);
+
 
       // DEBUG: Show what target editor contains
       // targetEditor.getEditorState().read(() => {
@@ -1012,18 +1127,31 @@ export function applyMarkdownDiffToDocument(
     }
 
     // NEW: Use TreeMatcher for root-level matching
-    // Use a large window size to handle documents with many nodes
-    // Window size determines how far apart nodes can be and still be considered for matching
     const sourceNodeCount = sourceEditor.getEditorState().read(() => $getRoot().getChildren().length);
     const targetNodeCount = targetEditor.getEditorState().read(() => $getRoot().getChildren().length);
-    const maxNodeCount = Math.max(sourceNodeCount, targetNodeCount);
-    // Use 50% of document size as window, with minimum of 10 and maximum of 100
-    const windowSize = Math.min(100, Math.max(10, Math.floor(maxNodeCount * 0.5)));
+
+    // The tree matcher aligns siblings with an O(m*n) cost matrix, so a
+    // document with thousands of top-level blocks on each side blocks the
+    // renderer main thread for tens of seconds and then dies on V8's Map size
+    // cap (#4821). Refuse it up front, before the guide-post pass, so callers
+    // get a fast typed failure instead of a freeze. Surfaces that can degrade
+    // gracefully should skip the diff before calling us at all.
+    if (sourceNodeCount * targetNodeCount > DEFAULT_MAX_PAIR_EVALUATIONS) {
+      throw new DiffError(
+        `Document too large to diff structurally: ${sourceNodeCount} source x ` +
+          `${targetNodeCount} target root nodes exceeds the ` +
+          `${DEFAULT_MAX_PAIR_EVALUATIONS} pair budget`,
+        'DIFF_TOO_LARGE',
+        {
+          operation: 'applyMarkdownDiffToDocument',
+          additionalInfo: {sourceNodeCount, targetNodeCount},
+        },
+      );
+    }
 
     // console.log('[diffUtils] Document sizes:', {
     //   sourceNodeCount,
     //   targetNodeCount,
-    //   windowSize,
     //   originalMarkdownLength: originalMarkdown.length,
     //   newMarkdownLength: newMarkdown.length,
     // });
@@ -1047,7 +1175,6 @@ export function applyMarkdownDiffToDocument(
 
     const treeMatcher = createWindowedTreeMatcher(sourceEditor, targetEditor, {
       transformers,
-      windowSize,
       similarityThreshold: 0.05, // Very low threshold to catch dramatic changes
     });
 
@@ -1056,36 +1183,37 @@ export function applyMarkdownDiffToDocument(
     // Phase 1: Match root-level nodes
     const rootMatchResult = treeMatcher.matchRootChildren();
 
-    // Calculate text diff statistics
-    const originalLines = originalMarkdown.split('\n');
-    const newLines = newMarkdown.split('\n');
-    const textStats = {
-      originalLines: originalLines.length,
-      newLines: newLines.length,
-      linesAdded: Math.max(0, newLines.length - originalLines.length),
-      linesRemoved: Math.max(0, originalLines.length - newLines.length),
-    };
-
-    // Calculate lexical node diff statistics
-    const removes = rootMatchResult.sequence.filter(d => d.changeType === 'remove').length;
-    const updates = rootMatchResult.sequence.filter(d => d.changeType === 'update').length;
-    const adds = rootMatchResult.sequence.filter(d => d.changeType === 'add').length;
-    const lexicalStats = {
-      sourceNodes: sourceNodeCount,
-      targetNodes: targetNodeCount,
-      nodesRemoved: removes,
-      nodesModified: updates,
-      nodesAdded: adds,
-      totalOperations: removes + updates + adds,
-    };
-
-    // PRODUCTION LOG: Diff statistics comparison
-    console.log('[DIFF STATS]', JSON.stringify({
-      text: textStats,
-      lexical: lexicalStats,
-      // Flag potential duplication: if lexical adds >> text line adds, might be duplication bug
-      suspectDuplication: lexicalStats.nodesAdded > (textStats.linesAdded * 2),
-    }));
+    // Diff statistics -- commented out because both the stat computation (three
+    // full passes over the match sequence) and the log ran unconditionally on
+    // every diff, in the app and in every test that exercises this path.
+    // Uncomment when investigating node duplication: `suspectDuplication` flags
+    // lexical adds far exceeding text line adds.
+    // const originalLines = originalMarkdown.split('\n');
+    // const newLines = newMarkdown.split('\n');
+    // const textStats = {
+    //   originalLines: originalLines.length,
+    //   newLines: newLines.length,
+    //   linesAdded: Math.max(0, newLines.length - originalLines.length),
+    //   linesRemoved: Math.max(0, originalLines.length - newLines.length),
+    // };
+    //
+    // const removes = rootMatchResult.sequence.filter(d => d.changeType === 'remove').length;
+    // const updates = rootMatchResult.sequence.filter(d => d.changeType === 'update').length;
+    // const adds = rootMatchResult.sequence.filter(d => d.changeType === 'add').length;
+    // const lexicalStats = {
+    //   sourceNodes: sourceNodeCount,
+    //   targetNodes: targetNodeCount,
+    //   nodesRemoved: removes,
+    //   nodesModified: updates,
+    //   nodesAdded: adds,
+    //   totalOperations: removes + updates + adds,
+    // };
+    //
+    // console.log('[DIFF STATS]', JSON.stringify({
+    //   text: textStats,
+    //   lexical: lexicalStats,
+    //   suspectDuplication: lexicalStats.nodesAdded > (textStats.linesAdded * 2),
+    // }));
 
     // Phase 2: Apply changes correctly respecting exact match positions
     try {
@@ -1157,10 +1285,14 @@ export function applyMarkdownDiffToDocument(
               $applyNodeDiff(editor, diff, transformers, sourceEditor, targetEditor, treeMatcher);
             }
           }
+
+          if (options.acceptChanges) {
+            $approveDiffs();
+          }
         },
         {discrete: true},
       );
-      if (process?.env?.DIFF_DEBUG === '1') {
+      if (isDiffDebug()) {
         editor.getEditorState().read(() => {
           const root = $getRoot();
           const snapshot = root.getChildren().map((child, idx) => ({
@@ -1197,6 +1329,21 @@ export function applyMarkdownDiffToDocument(
         error.context.targetMarkdown = newMarkdown;
       }
       throw error;
+    }
+
+    // A nested container (a long list, a wide table) blew the pair budget even
+    // though the root-level counts were within it. Same story as the root
+    // guard above -- report it as a size refusal, not a mystery failure.
+    if (error instanceof DiffBudgetExceededError) {
+      const tooLarge = new DiffError(
+        `Document too large to diff structurally: ${error.message}`,
+        'DIFF_TOO_LARGE',
+        {operation: 'applyMarkdownDiffToDocument'},
+        error,
+      );
+      tooLarge.context.originalMarkdown = originalMarkdown;
+      tooLarge.context.targetMarkdown = newMarkdown;
+      throw tooLarge;
     }
 
     // For unexpected errors, wrap in a DiffError
@@ -1383,16 +1530,16 @@ export function $applyNodeDiff(
       // Don't require similarity === 1.0 because normalized content (like table separators) may have different text
       const isExactMatch = diff.matchType === 'exact';
 
-      if (diff.sourceMarkdown?.includes('|---') || diff.targetMarkdown?.includes('|---')) {
-        console.log('[diffUtils] Table separator diff:', {
-          matchType: diff.matchType,
-          similarity: diff.similarity,
-          isExactMatch,
-          willMark: !isExactMatch,
-          source: diff.sourceMarkdown?.substring(0, 50),
-          target: diff.targetMarkdown?.substring(0, 50),
-        });
-      }
+      // if (diff.sourceMarkdown?.includes('|---') || diff.targetMarkdown?.includes('|---')) {
+      //   console.log('[diffUtils] Table separator diff:', {
+      //     matchType: diff.matchType,
+      //     similarity: diff.similarity,
+      //     isExactMatch,
+      //     willMark: !isExactMatch,
+      //     source: diff.sourceMarkdown?.substring(0, 50),
+      //     target: diff.targetMarkdown?.substring(0, 50),
+      //   });
+      // }
 
       if (!isExactMatch) {
         // Mark the node as modified using NodeState for actual content changes
@@ -1477,11 +1624,8 @@ export function $applySubTreeDiff(
   }
 
   // Create a TreeMatcher with pre-cached data for both editors
-  // Use adaptive window size based on child count
-  const childWindowSize = Math.min(50, Math.max(5, Math.floor(sourceChildren.length * 0.5)));
   const treeMatcher = createWindowedTreeMatcher(sourceEditor, targetEditor, {
     transformers,
-    windowSize: childWindowSize,
     similarityThreshold: 0.05,
   });
 

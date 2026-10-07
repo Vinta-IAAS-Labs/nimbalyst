@@ -1,5 +1,6 @@
 import { BrowserWindow } from "electron";
 import { findWindowByWorkspace } from "../window/WindowManager";
+import { notifyWorkspaceWindowAvailable } from "../window/workspaceWindowAvailability";
 import {
   getBackendTools as registryGetBackendTools,
   getVoiceEnabledBackendTools as registryGetVoiceBackendTools,
@@ -238,6 +239,10 @@ export function registerWorkspaceWindow(
   const isNew = !workspaceToWindowMap.has(workspacePath);
   workspaceToWindowMap.set(workspacePath, windowId);
 
+  // Wake anything deferred on "no window for this workspace" — notably queued
+  // prompts that arrived from mobile while the project was closed (#962).
+  notifyWorkspaceWindowAvailable(workspacePath);
+
   // First time we see a window for this workspace? Re-check any wakeups
   // that were waiting for it. Imported lazily to avoid circular imports
   // between the MCP layer and the services layer.
@@ -412,7 +417,7 @@ export async function getAvailableExtensionTools(
           filePath: {
             type: "string",
             description:
-              "Absolute path to the file to operate on.",
+              "Absolute path to the file to operate on, or a Team page's uri (collab://...) from createSharedDoc, importFileToPages or listPages to edit that shared page.",
           },
         },
         required: [...(tool.inputSchema.required || []), "filePath"],

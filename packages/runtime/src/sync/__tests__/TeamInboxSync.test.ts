@@ -1,3 +1,4 @@
+// @vitest-environment node
 import type { InboxDelivery } from '@nimbalyst/collab-protocol';
 import { asTeamJwt, asTeamMemberId } from '../../auth/jwtScopes';
 import { describe, expect, it, vi } from 'vitest';
@@ -5,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   TeamInboxFanIn,
   TeamInboxOrgClient,
+  type TeamPresenceMember,
   type TeamInboxOrgClientLike,
   type TeamInboxOrgDescriptor,
   type TeamInboxOrgEvent,
@@ -78,6 +80,8 @@ function delivery(
 class FakeOrgClient implements TeamInboxOrgClientLike {
   readonly markRead = vi.fn(async (_deliveryIds: string[]) => {});
   readonly dismiss = vi.fn(async (_deliveryIds: string[]) => {});
+  readonly claimAgentDelivery = vi.fn(async () => true);
+  readonly completeAgentDelivery = vi.fn(async () => true);
   readonly connect = vi.fn(async () => {});
   readonly destroy = vi.fn();
   private listener: ((event: TeamInboxOrgEvent) => void) | null = null;
@@ -93,6 +97,156 @@ class FakeOrgClient implements TeamInboxOrgClientLike {
     this.listener?.(event);
   }
 }
+
+describe('TeamInboxOrgClient', () => {
+  it('reconnects when the server rejects a client protocol message', async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeWebSocket[] = [];
+      const client = new TeamInboxOrgClient({
+        serverUrl: 'https://sync.example.test',
+        org: {
+          orgId: 'org-a',
+          orgName: 'Acme',
+          teamMemberId: asTeamMemberId('member-a'),
+        },
+        getTeamJwt: async () => asTeamJwt('team-jwt'),
+        createWebSocket: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket as unknown as WebSocket;
+        },
+      });
+
+      await client.connect();
+      sockets[0].open();
+      sockets[0].receive({
+        type: 'inboxError',
+        code: 'unknownInboxMessage',
+        message: 'Unknown inbox message type',
+      });
+
+      expect(sockets[0].readyState).toBe(FakeWebSocket.CLOSED);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sockets).toHaveLength(2);
+      client.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends presence heartbeats on the team inbox connection and emits roster updates', async () => {
+    const socket = new FakeWebSocket();
+    const client = new TeamInboxOrgClient({
+      serverUrl: 'https://sync.example.test',
+      org: {
+        orgId: 'org-a',
+        orgName: 'Acme',
+        teamMemberId: asTeamMemberId('member-a'),
+      },
+      getTeamJwt: async () => asTeamJwt('team-jwt'),
+      createWebSocket: () => socket as unknown as WebSocket,
+      heartbeatIntervalMs: 1000,
+      getPresenceStatus: () => 'away',
+      now: () => 10,
+    });
+    const events: TeamInboxOrgEvent[] = [];
+    client.subscribe((event) => events.push(event));
+
+    await client.connect();
+    socket.open();
+    socket.receive({
+      type: 'presenceRoster',
+      orgId: 'org-a',
+      members: [{
+        teamMemberId: 'member-a',
+        status: 'away',
+        lastHeartbeatAt: 10,
+        updatedAt: 10,
+      }],
+    });
+
+    expect(socket.sent.map((message) => JSON.parse(message))).toContainEqual({
+      type: 'presenceHeartbeat',
+      status: 'away',
+      sentAt: 10,
+    });
+    expect(events).toContainEqual({
+      type: 'presenceRoster',
+      members: [{
+        teamMemberId: 'member-a',
+        status: 'away',
+        lastHeartbeatAt: 10,
+        updatedAt: 10,
+      }],
+    });
+    client.destroy();
+  });
+});
+
+describe('TeamInboxFanIn presence', () => {
+  const orgA: TeamInboxOrgDescriptor = {
+    orgId: 'org-a',
+    orgName: 'Acme',
+    teamMemberId: asTeamMemberId('member-a'),
+  };
+
+  it('reconciles roster snapshots and deltas into the merged snapshot', async () => {
+    const clients = new Map<string, FakeOrgClient>();
+    const fanIn = new TeamInboxFanIn({
+      createClient(org) {
+        const client = new FakeOrgClient(org);
+        clients.set(org.orgId, client);
+        return client;
+      },
+    });
+    await fanIn.start([orgA]);
+
+    const online: TeamPresenceMember = {
+      teamMemberId: 'member-a',
+      status: 'online',
+      lastHeartbeatAt: 100,
+      updatedAt: 100,
+    };
+    clients.get('org-a')!.emit({
+      type: 'presenceRoster',
+      members: [online],
+    });
+    clients.get('org-a')!.emit({
+      type: 'presenceDelta',
+      member: {
+        teamMemberId: 'member-b',
+        status: 'away',
+        lastHeartbeatAt: 110,
+        updatedAt: 110,
+      },
+    });
+    clients.get('org-a')!.emit({
+      type: 'presenceDelta',
+      member: {
+        teamMemberId: 'member-a',
+        status: 'offline',
+        updatedAt: 200,
+      },
+    });
+
+    expect(fanIn.getSnapshot().presence).toEqual({
+      'org-a': {
+        'member-a': {
+          teamMemberId: 'member-a',
+          status: 'offline',
+          updatedAt: 200,
+        },
+        'member-b': {
+          teamMemberId: 'member-b',
+          status: 'away',
+          lastHeartbeatAt: 110,
+          updatedAt: 110,
+        },
+      },
+    });
+  });
+});
 
 describe('TeamInboxOrgClient', () => {
   it('uses the team-org JWT and team member id for the organization inbox room', async () => {
@@ -120,6 +274,53 @@ describe('TeamInboxOrgClient', () => {
     expect(socket.sent.map((message) => JSON.parse(message))).toContainEqual({
       type: 'inboxSyncRequest',
     });
+    client.destroy();
+  });
+
+  it('correlates agent-delivery claim and completion responses on the org socket', async () => {
+    const socket = new FakeWebSocket();
+    const client = new TeamInboxOrgClient({
+      serverUrl: 'https://sync.example.test',
+      org: {
+        orgId: 'org-a',
+        orgName: 'Acme',
+        teamMemberId: asTeamMemberId('member-a'),
+      },
+      getTeamJwt: async () => asTeamJwt('team-jwt'),
+      createWebSocket: () => socket as unknown as WebSocket,
+      clientId: 'client-a',
+    });
+    await client.connect();
+    socket.open();
+
+    const claim = client.claimAgentDelivery('delivery-a', 'session-a');
+    const claimMessage = socket.sent.map((message) => JSON.parse(message))
+      .find((message) => message.type === 'claimAgentDelivery');
+    expect(claimMessage).toMatchObject({
+      deliveryId: 'delivery-a',
+      sessionId: 'session-a',
+      clientId: 'client-a',
+    });
+    socket.receive({
+      type: 'agentDeliveryClaimResponse',
+      requestId: claimMessage.requestId,
+      deliveryId: 'delivery-a',
+      sessionId: 'session-a',
+      claimed: true,
+    });
+    await expect(claim).resolves.toBe(true);
+
+    const complete = client.completeAgentDelivery('delivery-a', 'session-a');
+    const completeMessage = socket.sent.map((message) => JSON.parse(message))
+      .find((message) => message.type === 'completeAgentDelivery');
+    socket.receive({
+      type: 'agentDeliveryCompleteResponse',
+      requestId: completeMessage.requestId,
+      deliveryId: 'delivery-a',
+      sessionId: 'session-a',
+      dispatched: true,
+    });
+    await expect(complete).resolves.toBe(true);
     client.destroy();
   });
 });
@@ -184,6 +385,42 @@ describe('TeamInboxFanIn', () => {
     expect(clients.get('org-a')!.dismiss).not.toHaveBeenCalled();
   });
 
+  it('emits only newly accepted live deliveries, never hydration or duplicate replay', async () => {
+    const clients = new Map<string, FakeOrgClient>();
+    const onDelivery = vi.fn();
+    const fanIn = new TeamInboxFanIn({
+      createClient(org) {
+        const client = new FakeOrgClient(org);
+        clients.set(org.orgId, client);
+        return client;
+      },
+      onDelivery,
+    });
+    await fanIn.start([orgA]);
+
+    const hydrated = delivery('org-a', 'hydrated', 100);
+    clients.get('org-a')!.emit({
+      type: 'sync',
+      deliveries: [hydrated],
+      watermarks: [],
+      subscriptions: [],
+    });
+    clients.get('org-a')!.emit({
+      type: 'delivery',
+      delivery: hydrated,
+    });
+    const live = delivery('org-a', 'live', 200);
+    clients.get('org-a')!.emit({ type: 'delivery', delivery: live });
+    clients.get('org-a')!.emit({ type: 'delivery', delivery: live });
+
+    expect(onDelivery).toHaveBeenCalledTimes(1);
+    expect(onDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'live',
+      orgId: 'org-a',
+      orgName: 'Acme',
+    }));
+  });
+
   it('isolates a legacy-custody org while healthy organizations stay ready', async () => {
     const { fanIn, clients } = setup();
     await fanIn.start([orgA, orgB]);
@@ -211,6 +448,25 @@ describe('TeamInboxFanIn', () => {
         },
         { orgId: 'org-b', status: 'ready' },
       ],
+    });
+  });
+
+  it('reports reconnecting while cached deliveries survive a retry', async () => {
+    const { fanIn, clients } = setup();
+    await fanIn.start([orgA]);
+    clients.get('org-a')!.emit({
+      type: 'sync',
+      deliveries: [delivery('org-a', 'cached', 100)],
+      watermarks: [],
+      subscriptions: [],
+    });
+    clients.get('org-a')!.emit({ type: 'disconnected' });
+    clients.get('org-a')!.emit({ type: 'connecting' });
+
+    expect(fanIn.getSnapshot()).toMatchObject({
+      status: 'reconnecting',
+      deliveries: [{ id: 'cached' }],
+      organizations: [{ orgId: 'org-a', status: 'connecting' }],
     });
   });
 

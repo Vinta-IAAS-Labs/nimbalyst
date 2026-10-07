@@ -91,6 +91,24 @@ export interface ClaudeCodePromptOptions {
   sessionNamingInstructionStyle?: ToolReferenceStyle;
   toolReferenceStyle?: ToolReferenceStyle;
   worktreePath?: string;
+  /**
+   * A pre-rendered git snapshot (branch, main branch, recent commits) to state
+   * at the top of the session. #1177: only `claude-code` passes this, and only
+   * because it sets CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1 to suppress the
+   * CLI's own equivalent block — which the CLI rebuilds from the live working
+   * tree on every resumed turn and thereby invalidates the prompt cache behind
+   * it. The caller MUST resolve this once per session and freeze it; a value
+   * that changes between turns re-introduces exactly the cache miss this
+   * replaces. Providers that do not have the bug leave it undefined.
+   */
+  gitContext?: string;
+  /**
+   * Standing instructions for this one session, from its
+   * `metadata.sessionDirective` (written by whoever created the session: an
+   * automation, an extension). Appended last, never replacing the normal
+   * prompt. Same freeze requirement as `gitContext`: resolve once per session.
+   */
+  sessionDirective?: string;
   isVoiceMode?: boolean;
   voiceModeCodingAgentPrompt?: {
     prepend?: string;
@@ -130,6 +148,8 @@ export function buildClaudeCodeSystemPrompt(options: ClaudeCodePromptOptions): s
     sessionNamingInstructionStyle,
     toolReferenceStyle = 'claude',
     worktreePath,
+    gitContext,
+    sessionDirective,
     isVoiceMode = false,
     voiceModeCodingAgentPrompt,
     planTrackingEnabled = false,
@@ -159,6 +179,8 @@ Before writing a question, list of options, or draft for the user to react to in
 
 Combine questions into one multi-field prompt instead of asking across turns, and pre-fill defaults so the user can submit without retyping.
 
+${effectiveToolReferenceStyle === 'codex' ? 'When an interactive tool inside `functions.exec` returns “Script running with cell ID”, keep calling `functions.wait` for that cell until its answer arrives. A running cell is not a timeout. Do not issue a final response while the question call is pending.' : ''}
+
 ## Visual Communication
 
 Use visuals proactively when they improve clarity — they render inline in the conversation.
@@ -179,6 +201,8 @@ When you mention a specific file, write it as a markdown link so the user can cl
     prompt += `
 
 ## Tracker References
+
+Before starting work on a tracker item, call \`work_radar(issueKey)\` when that tool is available so you can see recent teammate activity and avoid duplicating or overwriting concurrent work.
 
 When you mention a tracker item (bug, task, plan, decision, etc.), link it as \`[NIM-123](nimbalyst://NIM-123)\` — issue key as both label and URN — so it renders as a live, clickable status chip. Only link real items you actually created or looked up via the tracker tools; never invent an issue key.`;
   }
@@ -247,6 +271,19 @@ IMPORTANT: You are working in a git worktree at ${worktreePath} — an isolated 
 
 When asked to commit your work, use the ${gitCommitProposalTool} tool instead of command-line git commit — it stages and commits atomically, preventing conflicts between parallel sessions in the same repository. Other git operations from the command line are fine. When the commit is intended to resolve an issue or tracker item, include the canonical closing reference (e.g. \`Fixes #123\`, \`Closes ABC-123\`) on its own line in the proposed message, or a neutral reference line if the closing syntax is unclear.`;
 
+  // Frozen for the life of the session — see the gitContext doc comment. The
+  // "will not update" wording is literally true here, unlike the CLI's block
+  // which silently refreshes on every process spawn.
+  if (gitContext) {
+    prompt += `
+
+## Repository
+
+Resolved when this session started. It is a snapshot and will not update during the conversation — run \`git status\` yourself for the current working tree.
+
+${gitContext}`;
+  }
+
   // Add session naming if available. Fall back to the runtime config when
   // the caller didn't pass an explicit language so we don't have to thread it
   // through every provider's buildSystemPrompt path.
@@ -278,6 +315,11 @@ The user is interacting via voice mode. A voice assistant (GPT-4 Realtime) handl
     }
   }
 
+  prompt += `\nWhen coordinating sibling sessions, use consume_session_inbox when available at integration boundaries, after long validation, and before final synthesis. It consumes informational reports within the current turn; list_queued_prompts only inspects them and leaves them queued. Read the full batch before issuing follow-ups; yield at instruction boundaries. Never poll an empty inbox. Send informational handoffs with send_prompt messageKind=report, and keep instructions/questions/errors distinct. Use the final response for automatic completion notifications instead of sending it twice.\n`;
+  const directive = sessionDirective?.trim();
+  if (directive) {
+    prompt += `\n${directive}\n`;
+  }
   return prompt + `
 </addendum>
 `;
@@ -288,7 +330,13 @@ export type MetaAgentWorkflowPreset = 'default' | 'implement-review-test' | 'res
 export function buildMetaAgentSystemPrompt(
   style: ToolReferenceStyle = 'claude',
   workflowPreset: MetaAgentWorkflowPreset = 'default',
-  options?: { provider?: string; model?: string; modelDisplayName?: string }
+  options?: {
+    provider?: string;
+    model?: string;
+    modelDisplayName?: string;
+    /** See `ClaudeCodePromptOptions.sessionDirective`; an orchestrator can carry standing instructions too. */
+    sessionDirective?: string;
+  }
 ): string {
   // Meta-agent tools fold onto the deferred `nimbalyst-host` server, and
   // update_session_meta onto the eager core `nimbalyst` (MCP consolidation Phase 5).
@@ -308,6 +356,7 @@ export function buildMetaAgentSystemPrompt(
     ? `You are ${options.modelDisplayName}. When the user asks which model or version you are, answer truthfully with that name; do not present internal identifiers as your version. When spawning child sessions with ${createSessionTool}, pass provider \`${options?.provider ?? 'unknown'}\` and model \`${options?.model ?? 'default'}\` so children inherit your configuration. Do NOT set a child's provider to claude-code or openai-codex unless the user explicitly asks for a different provider; if you ever set a provider you MUST also pass a model that matches it (mixing claude-code with your Gemini model creates a child that cannot run).`
     : `You are running as provider \`${options?.provider ?? 'unknown'}\` with model \`${options?.model ?? 'default'}\`. When spawning child sessions with ${createSessionTool}, always pass the same provider and model so children use the same configuration unless the user instructs otherwise.`;
 
+  const consumeInboxTool = formatMcpToolReference('nimbalyst-host', 'consume_session_inbox', style);
   // Base orchestration prompt — always included
   let prompt = `You are a Meta Agent — an orchestrator that manages parallel AI coding sessions to implement complex tasks. You never touch code directly. You plan, delegate, monitor, and coordinate.
 
@@ -318,7 +367,8 @@ export function buildMetaAgentSystemPrompt(
 - ${listSpawnedSessionsTool}: List all sessions you created with status summaries
 - ${getSessionStatusTool}: Check if a child session is running, idle, waiting, or errored
 - ${getSessionResultTool}: Read a session's prompts, its full final response, recent messages, edited files, and pending prompts
-- ${sendPromptTool}: Send follow-up instructions to a child session
+- ${consumeInboxTool} (when available): Receive reports during your active turn without replaying them later. Check before delegation/integration decisions, after long validation, and before final synthesis. Read all reports before acting. Yield at an instruction boundary. Never poll an empty inbox.
+- ${sendPromptTool}: Send follow-up instructions to a child session. Pass \`interrupt: true\` to stop the child's current turn and deliver immediately — only when the new instruction makes the running work obsolete (a wrong approach, a changed requirement, a stop order), never as a routine way to be heard sooner
 - ${respondToPromptTool}: Answer a child session's interactive prompt (permissions, questions, plan approval)
 - ${updateSessionMetaTool}: Name and tag your own session
 
@@ -413,11 +463,22 @@ If any step surfaces issues, repeat the loop until resolved.
 5. After all work is done, write the final answer yourself by drawing on each child's full result. Preserve the concrete detail the children produced (findings, file:line references, recommendations) instead of compressing it into a thin summary. Report only what the children actually did: if a child says it fixed, edited, or built something, relay it as the child's claim rather than confirmed fact unless its result shows the tool call that performed it. End with remaining risks and next steps.`;
   }
 
-  return prompt;
+  return appendSessionDirective(prompt, options?.sessionDirective);
 }
 
 /**
- * System prompt for a STANDARD extension-agent session (e.g. gemini-antigravity)
+ * Append a session directive to a whole system prompt (the meta-agent persona,
+ * or whatever prompt a tool-loop provider was handed). A blank directive
+ * returns the prompt unchanged.
+ */
+export function appendSessionDirective(prompt: string, sessionDirective?: string): string {
+  const directive = sessionDirective?.trim();
+  if (!directive) return prompt;
+  return prompt ? `${prompt}\n\n${directive}` : directive;
+}
+
+/**
+ * System prompt for a STANDARD tool-loop agent session (e.g. Gemini)
  * that holds the read-only dev toolset (read_file / list_files / search_files).
  *
  * Role/persona text ONLY. The simulated tool-call envelope mechanics (the

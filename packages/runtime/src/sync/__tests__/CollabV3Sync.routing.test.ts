@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { isIndexClientMetadataOnlyUpdateForTest } from '../CollabV3Sync';
 import type { SyncedSessionMetadata } from '../types';
@@ -48,6 +49,12 @@ describe('isIndexClientMetadataOnlyUpdate routing predicate', () => {
     it('routes { lastReadAt } through indexUpdate (cross-device unread badges)', () => {
       expect(
         isIndexClientMetadataOnlyUpdateForTest(m({ lastReadAt: 123 } as Partial<SyncedSessionMetadata>)),
+      ).toBe(false);
+    });
+
+    it('routes { hostDeviceId } through indexUpdate (execution ownership)', () => {
+      expect(
+        isIndexClientMetadataOnlyUpdateForTest(m({ hostDeviceId: 'desktop-1' })),
       ).toBe(false);
     });
   });

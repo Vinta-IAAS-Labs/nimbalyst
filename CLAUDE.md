@@ -6,6 +6,8 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ### Keep Commit Messages and CHANGELOG Entries Short
 
+**Write the CHANGELOG entry only when a commit is requested — never while implementing.** `CHANGELOG.md` is touched by nearly every task, so an entry written early both describes code that is not in the tree yet and collides with every other session running against this checkout. See [parallel-sessions.md](./.claude/rules/parallel-sessions.md).
+
 **One-sentence commit subject. One-sentence CHANGELOG bullet.** Commit bodies may include short bullets for distinct key changes — one line each, no prose paragraphs, no root-cause explanations unless the diff truly can't explain itself. Match the existing voice in `[Unreleased]` and recent `git log --oneline`. If your draft is longer than the surrounding entries, cut it before submitting.
 
 **One feature = one CHANGELOG bullet, no matter how many commits built it.** A multi-commit feature (e.g. a whole panel landed over a dozen PRs) gets a single user-facing line, not one bullet per commit. Do NOT append a new bullet for every follow-up commit to the same feature — edit the existing bullet instead. The `[Unreleased]` section must read like a short release summary, not a commit log.
@@ -14,9 +16,36 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 **At release time, condense — don't ship the dev-time bullets verbatim.** `[Unreleased]` accumulates verbose per-commit bullets during development. Before tagging, collapse them: merge a feature's scattered bullets into one line, drop scaffolding, squash near-duplicates. If the release notes are longer than the equivalent section in a recent shipped version, cut harder.
 
+### Keep the Feature Inventory Current
+
+**When adding, significantly expanding, or removing a notable product capability, update [FEATURE_INVENTORY.md](./docs/FEATURE_INVENTORY.md) during implementation.** Examples include a new editor, provider integration, collaboration workflow, automation, or CLI capability. It applies to every agent provider and to ordinary prompts as well as skills. The CHANGELOG's commit-time rule does not defer inventory maintenance.
+
+**Inclusion test: would someone exploring what Nimbalyst can do look for this capability by itself?** Remote agent execution and structured teammate feedback qualify. Elapsed-time counters, status badges, button placement, resizing, and automatic scrolling do not. User-visible does not automatically mean inventory-worthy. The inventory is a curated capability reference, not an exhaustive UI checklist or a second changelog.
+
+Read the relevant section first; group related functionality under an existing capability. Keep only details needed to understand its scope, platform, opt-in requirements, or material limitations. Correct obsolete claims even when the correction is small. Routine fixes, performance improvements, refactors, tests, dependency/model-version bumps, and interaction polish need no entry. Do not record plans or internal scaffolding as working features.
+
+In a parallel batch, the integrating session owns the inventory; slices report the capability change and evidence instead of editing this shared file. Before the final handoff or commit proposal, report **"Feature inventory updated"** with the section, or **"No inventory impact"** with a short reason. A slice handing the update to its integrator must say it is pending; the integrator must apply it before the batch is handed off. At release preparation, reconcile the release's Added/Changed/Removed capabilities against the inventory, checking current code when scope is unclear.
+
+### Parallel Sessions Must Not Share Files
+
+Before launching parallel work, list the files each slice will touch and confirm the sets are disjoint — including shared files like `CHANGELOG.md`, `package.json`, barrels, and central registries, which a source-only check misses. If two slices need the same file, they are one slice. Slices never run the full gate; the orchestrator runs it once. See [parallel-sessions.md](./.claude/rules/parallel-sessions.md).
+
 ### Write and Run Tests for Behavioral Changes
 
-**Any change to runtime behavior ships with a unit test** — a new test, or an extension of an existing one. Pure refactors already covered by tests, formatting, docs, and config-only changes are exempt. Before pushing, run the gate locally: `npm run typecheck && npm run test:prepush`. The repo's pre-push hook runs this automatically; it installs on `npm install` (or `npm run hooks:install`). Never push to `main` with a red suite — CI on `main` is a backstop, not the gate. For high-risk areas (sync/collab, main-process init, IPC, restart-to-verify bugs) the test comes **first** and must fail before the fix — see [end-to-end-verification.md](./.claude/rules/end-to-end-verification.md).
+**Any change to runtime behavior ships with a unit test** — a new test, or an extension of an existing one. Pure refactors already covered by tests, formatting, docs, and config-only changes are exempt. Before pushing, run the gate locally: `pnpm typecheck && pnpm test:prepush`.
+
+**Never run the suite twice to find out what failed.** It takes minutes. Every run records its failures — names, files, messages, diffs, and a command to rerun only those files — to `.vitest/last-run.log`. Read it with `pnpm run test:last`, which states up front whether the tree has changed since; on `CURRENT`, re-running cannot tell you anything you do not already have. Never pipe a test run through `tail -n`: it truncates exactly the failure block you need and costs another full run. Capture to a file, then read the file. When handing failures to another session, paste the failure list into its prompt. The repo's pre-push hook runs this automatically; it installs on `pnpm install` (or `pnpm run hooks:install`). Never push to `main` with a red suite — CI on `main` is a backstop, not the gate. For high-risk areas (sync/collab, main-process init, IPC, restart-to-verify bugs) the test comes **first** and must fail before the fix — see [end-to-end-verification.md](./.claude/rules/end-to-end-verification.md).
+
+**A test's job is to catch a regression a reader cannot see.** The test corpus is ~2M tokens, and every future session pays to read the tests next to the code it touches. A test that only re-states what is obvious on screen is pure cost. Write fewer, denser tests:
+
+- **No presentation-only tests** — icon names, exact title strings, tab ordering, hardcoded element counts. If a human would notice the breakage in one second of looking at the screen, it does not need a unit test. Purely visual changes (label, spacing, color) need no test at all.
+- **Never assert on component source text** via `readFileSync` + `toContain`/`toMatch`. Render it or don't test it. Genuine architectural invariants belong in a `scripts/` gate, not the vitest suite.
+- **Never assert CSS through jsdom by injecting the CSS you are about to assert on** — that is circular. Assert the `className`, or cover it in E2E where real styles load.
+- **Mock the narrowest module, never the `@nimbalyst/runtime` barrel.** Importing that barrel costs ~2.6s of module-import CPU per test file because it drags in the whole Lexical editor tree. `vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', …)` is cheap; `vi.mock('@nimbalyst/runtime', async (importOriginal) => ({ ...await importOriginal(), … }))` is the expensive shape — the spread forces the real barrel to load. Import from the deep path in source too, so the barrel never enters the graph. See NIM-2374.
+- **A `vi.mock()` whose specifier the module under test no longer imports is a silent no-op.** Moving a source import (barrel → deep path, or any rename) without repointing every mock of it lets the *real* module load, and the failure surfaces far from the edit — six `MetaAgentService` test files kept `vi.mock('@nimbalyst/runtime', …)` after the service moved to deep repository paths, and 22 tests died on `Session store adapter has not been provided`. When you change an import specifier in source, grep the test tree for the old specifier in the same commit.
+- **Prefer extending an existing test file** over creating a new one — but do not merge unrelated tests into a mega-file. Small and focused is correct; total volume is the enemy, not file count.
+- **Add `// @vitest-environment node` as the first line of any test that never touches the DOM.** The jsdom environment costs ~270ms per file for nothing.
+- **Don't write `expect(getBy*(...)).toBeTruthy()`** — `getBy*` already throws.
 
 ### Use @floating-ui/react for All Popover/Tooltip/Menu Positioning
 
@@ -62,6 +91,12 @@ The biggest gotcha: **JSONB sub-extraction (`data->'someKey'`) returns a parsed 
 
 **For sync/collab bugs, local PGLite ≠ server collab state.** `tracker_body_cache`, `documents`, and other sync-related tables only reflect the local side. The authoritative state for shared trackers/documents lives in Cloudflare Workers (`packages/collabv3/` DurableObjects) and must be inspected separately via `wrangler tail` against the prod sync worker, or via wrangler-backed E2E tests (`tracker-content-collab.spec.ts` / `tracker-sync-collab.spec.ts` patterns, `RUN_COLLAB_TESTS=1`, `document-sync:open-test` IPC for Stytch bypass). Confirming "the body is in PGLite" is not the same as confirming "the body is on the server." See `feedback_local_state_vs_server_state.md`.
 
+### Never Destroy User Data on a Heuristic
+
+See [destructive-data-paths.md](./.claude/rules/destructive-data-paths.md). Any path that renames, moves, truncates, overwrites, or deletes user data must **retry first, verify the damage is real (not a substring match on an error message), emit its event before acting, and leave a recoverable artifact with a launch heartbeat.** Never print an instruction telling the user to delete their data — restore-from-backup is the primary action.
+
+Past incident (#1347): a feature named "corruption recovery" renamed the live `pglite-db/` aside on any WASM abort, for nine months, silently. Six confirmed installs came up on empty databases; three then migrated the empty database and made it permanent.
+
 ### Always Run Your Own Observation Commands — Don't Push Logs/Curl/Tail to the User
 
 **Never ask the user to run `curl`, `wrangler tail`, `tail -f`, `gh` commands, or paste logs.** The agent has direct tool access to all of these.
@@ -106,28 +141,31 @@ packages/
   extensions/     # Built-in extensions
 ```
 
-- **Install**: `npm install` at repository root
-- **npm workspaces** (not pnpm); packages reference each other via workspace protocol
-- **Preserve `peer: true` flags in package-lock.json** — Some `npm install` configurations strip these flags, breaking CI for optional native dependencies (e.g., esbuild platform binaries). Investigate before committing if you see them disappearing.
+- **Install**: `corepack enable` once (Node 24 ships corepack; `packageManager` pins pnpm), then `pnpm install` at the repository root. CI uses `pnpm install --frozen-lockfile`
+- **pnpm workspaces**; internal deps use `workspace:*`. Lockfile is `pnpm-lock.yaml` (there is no `package-lock.json`). Run a script in one package with `pnpm --filter <pkg> run <script>` or `pnpm --dir <dir> run <script>`; add a dependency with `pnpm --filter <pkg> add <dep>` (root dev dep: `pnpm add -Dw <dep>`)
+- **All pnpm settings live in the root `pnpm-workspace.yaml`** (`nodeLinker: hoisted`, `overrides`, `patchedDependencies`, `allowBuilds`, `minimumReleaseAge`); `.npmrc` is registry/auth only
+- **`allowBuilds` is an allowlist for install scripts.** A new dependency with a build script fails `pnpm install` until you add it as `true` or `false` there
+- **`minimumReleaseAge: 4320` (72h cooldown).** Versions published less than 3 days ago do not resolve; wait, or add a scoped `minimumReleaseAgeExclude` entry with a reason
+- **Patching a dependency**: `pnpm patch <pkg>@<ver>`, edit, then `pnpm patch-commit <dir>`. Patches live in `patches/` and are registered in `pnpm-workspace.yaml` (patch-package is gone)
 
 Package-specific docs: `/packages/electron/CLAUDE.md`, `/packages/runtime/CLAUDE.md`, `/packages/ios/CLAUDE.md`, `/packages/collabv3/CLAUDE.md`.
 
 ## Development Commands
 
 **Electron app:**
-- Start dev: `cd packages/electron && npm run dev` (user runs this — don't do it yourself)
-- Build for Mac: `npm run build:mac:local` or `npm run build:mac:notarized`
+- Start dev: `cd packages/electron && pnpm run dev` (user runs this — don't do it yourself)
+- Build for Mac: `pnpm run build:mac:local` or `pnpm run build:mac:notarized`
 - Main process log: `~/Library/Application Support/@nimbalyst/electron/logs/main.log`
 
 **Testing:**
-- Unit: `npm run test:unit` (vitest), or `npm run test:unit:ui`
+- Unit: `pnpm run test:unit` (vitest), or `pnpm run test:unit:ui`
 - E2E: see [E2E_TESTING.md](./docs/E2E_TESTING.md)
 
-**Marketing screenshots & videos:** See [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md). Quick: `cd packages/electron && npm run marketing:screenshots` (requires dev server on port 5273).
+**Marketing screenshots & videos:** See [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md). Quick: `cd packages/electron && pnpm run marketing:screenshots` (requires dev server on port 5273).
 
-**Multiple dev instances** (for collab/sync testing): `cd packages/electron && npm run dev:user2` uses an isolated `NIMBALYST_USER_DATA_DIR`, `VITE_PORT=5274`, and `--outDir=out2` to prevent file-watcher cross-talk. Worktrees auto-derive a per-worktree userData dir via `crystal-run.sh`.
+**Multiple dev instances** (for collab/sync testing): `cd packages/electron && pnpm run dev:user2` uses an isolated `NIMBALYST_USER_DATA_DIR`, `VITE_PORT=5274`, and `--outDir=out2` to prevent file-watcher cross-talk. Worktrees auto-derive a per-worktree userData dir via `crystal-run.sh`.
 
-**Other packages:** iOS — `npm run ios:test:swift`, `npm run ios:build:transcript`. Collab server — `npm run collabv2:dev`, `npm run collabv2:deploy`.
+**Other packages:** iOS — `pnpm run ios:test:swift`, `pnpm run ios:build:transcript`. Collab server — `pnpm run collabv2:dev`, `pnpm run collabv2:deploy`.
 
 ## Releases
 
@@ -191,9 +229,11 @@ Two-tier architecture — `ai_agent_messages` (raw append-only log, sole source 
 | [FILE_WATCHING_AND_CHANGE_TRACKING.md](./docs/FILE_WATCHING_AND_CHANGE_TRACKING.md) | Working on file watchers, AI change detection, diff display, or the FilesEditedSidebar. |
 | [WEEKLY_DASHBOARD.md](./docs/WEEKLY_DASHBOARD.md) | Adding/modifying insights on the Weeklys PostHog dashboard. |
 | [VOICE_MODE.md](./docs/VOICE_MODE.md) | Working on voice mode, voice-agent prompts, audio pipeline, or session lifecycle. |
-| [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) | Creating decision or bug tracker items as part of a fix or design decision. |
-| [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md) | Making any architectural decision — create an Excalidraw diagram. |
+| [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) | Recording a decision, or creating a bug tracker item as part of a fix. |
+| [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md) | Considering whether a change is complex enough to warrant an Excalidraw diagram. |
 | [DEBUGGING_LOGS.md](./docs/DEBUGGING_LOGS.md) | Investigating bugs — use the log access tools, don't ask the user to paste logs. |
+| [IDENTITY_AUTH_AND_ROOMS.md](./docs/IDENTITY_AUTH_AND_ROOMS.md) | Anything touching encryption, key custody, room taxonomy, or the two JWTs. The `Encrypted*` names in the team lanes are vestigial — check the lane table before concluding anything from a name. |
+| [RENDER_PERFORMANCE.md](./docs/RENDER_PERFORMANCE.md) | Chasing excessive React re-renders, or adding a render-budget test to a hot surface. |
 | [MAIN_PROCESS_INIT.md](./packages/electron/MAIN_PROCESS_INIT.md) | Working on Electron main-process bootstrap, singleton init, or IPC handler registration. |
 | [DATABASE.md](./packages/electron/DATABASE.md) | Working with PGLite tables, shutdown, or timestamp handling. |
 
@@ -206,11 +246,23 @@ Two-tier architecture — `ai_agent_messages` (raw append-only log, sole source 
 
 ## Tracker Workflows
 
-When choosing between alternatives (libraries, patterns, deciding NOT to do something), log a **decision** tracker item. When fixing a bug, ensure a **bug** tracker item exists before writing fix code. See [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) for the exact `tracker_create` calls and lifecycle.
+Tracker sharing model: **a tracker is personal or it is the team's; if it is the team's, the server owns it — schema and items together — and `.nimbalyst/trackers/*.yaml` is the local copy.** Read [TRACKER_SCHEMA_SHARING.md](./docs/TRACKER_SCHEMA_SHARING.md) before changing a tracker schema or sharing and numbering behavior.
+
+Record a decision where it is read. In a project with Pages, follow its "How we write this wiki" page: mark the decision as a sentence in the page it affects, and add a **decision** tracker item as well only when no single page owns it, work or commits hang off it, it is not settled, or its reasons don't fit in the mark. Without Pages, put it in the plan doc or a decision item. Not every choice needs a record. When fixing a bug, ensure a **bug** tracker item exists before writing fix code. See [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) for the exact `tracker_create` calls and lifecycle.
+
+### `NIM-###` Keys Are Tracker-Scoped — Cite GitHub Issues in Source
+
+**`NIM-###` issue keys are scoped to the tracker room for a Nimbalyst workspace or team project. They do not resolve anywhere else** — peer installs in the same room share an identity, but the same key can point at a different item in an unrelated workspace. In a public repo they are worse than no reference: a reader who looks one up can land on an unrelated item and believe it is authoritative.
+
+- **Code comments and runtime log strings** reference the GitHub issue: `// #1146: typed workstream containers are always roots`. If there is no GitHub issue, write the reason in prose instead of citing a key.
+- **Commit messages** keep `Fixes NIM-123` — that trailer is what `CommitTrackerLinker` uses to auto-close the item, and it never ships inside the product. Add `Fixes #123` alongside it when a GitHub issue also exists.
+- **Existing `NIM-###` references in source stay put.** This applies to new code; there is no retro sweep.
+
+A contributed PR carrying a `NIM-###` reference is always wrong — it came from *their* tracker. Strip it or map it to the GitHub issue before merging.
 
 ## Architecture Diagrams for Decisions
 
-Whenever an architectural change is proposed, create an Excalidraw diagram in `nimbalyst-local/architecture/` and share the diagram file/link in the conversation. Use `capture_editor_screenshot` only when visual verification is needed or the user explicitly asks for an inline image. See [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md).
+**Default: no diagram.** Only when a change rearranges how three or more components relate — and the topology is genuinely non-obvious from prose — create an Excalidraw diagram in `nimbalyst-local/architecture/` and share the file link. Never diagram linear sequences, phased rollouts, single components, bug fixes, or a restatement of your own section headings. See [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md) for the full bar.
 
 ## Verifying Development Mode
 
@@ -228,12 +280,12 @@ See the Critical Rules block above ("Always Run Your Own Observation Commands").
 - **Never commit files under `nimbalyst-local/`** — gitignored, local-only working files
 - **Never provide time or effort estimates**
 - **Don't disable tests without asking first**
-- **Don't run `npm run dev` yourself** — user does that
+- **Don't run `pnpm run dev` yourself** — user does that
 - **Never release without being explicitly instructed**
 - **Don't `git reset` or `git add -A` without asking**
 - **Don't add `Co-Authored-By` lines to commit messages**
 - **Never restart Nimbalyst without explicit permission** — always ask before `restart_nimbalyst`
-- **Never mark work as done/completed without user approval** — set tracker items to a review state (e.g., `in-review`), session phase to `validating`, never `done` / `completed` / `complete`. Only the user can promote to those states.
+- **Never mark work done before the user approves it — but a commit IS their approval.** Until the work is committed, set tracker items to `in-review` and session phase to `validating`, never `done` / `complete`. Once the user commits the work, they have reviewed it and agreed it's finished: put a closing reference (`Fixes NIM-123`) in the commit message and the item closes itself; also set session phase to `complete`. Do not leave finished, committed work parked in `in-review`. `approved` on the review lane remains human-only.
 
 **Keyboard Shortcuts**: when adding or modifying shortcuts, update `KeyboardShortcutsDialog.tsx`.
 

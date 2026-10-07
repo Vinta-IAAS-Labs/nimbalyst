@@ -7,9 +7,11 @@ import {
   shift,
   useFloating,
 } from '@floating-ui/react';
-import { MaterialSymbol, getProviderIcon } from '@nimbalyst/runtime';
+import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { getProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import { AlphaBadge, SETTINGS_ALPHA_TOOLTIP } from '../common/AlphaBadge';
-import { TEAM_ALPHA_TOOLTIP } from '../common/TeamAlphaNotice';
+import { TEAM_BETA_TOOLTIP } from '../common/TeamBetaNotice';
 import { developerModeAtom } from '../../store/atoms/appSettings';
 import { teamsConfiguredAtom } from '../../store/atoms/settingsDomains';
 import {
@@ -37,7 +39,7 @@ const GROUP_DESCRIPTIONS: Record<string, string> = {
 };
 
 function routeIcon(route: SettingsRoute): React.ReactNode {
-  if (['claude-code', 'claude', 'openai', 'openai-codex', 'opencode', 'copilot-cli', 'lmstudio'].includes(route.id)) {
+  if (['claude-code', 'claude', 'openai', 'openai-codex', 'opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent', 'lmstudio'].includes(route.id)) {
     const providerId = route.id === 'openai-codex' ? 'openai' : route.id;
     return getProviderIcon(providerId, { size: 16 });
   }
@@ -61,7 +63,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
   const { refs, floatingStyles } = useFloating({
     open: tooltipText !== null,
     placement: 'right',
-    middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 })],
+    middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
   });
 
   useEffect(() => {
@@ -154,9 +156,10 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                   {isSettingsRoute && route.source === 'builtin' && route.isAlpha && (
                     <AlphaBadge
                       size="xs"
-                      // Sharing is the org/Teams entry point, so it gets the
-                      // Teams-specific alpha + pricing disclosure.
-                      tooltip={route.id === 'project-sharing' ? TEAM_ALPHA_TOOLTIP : SETTINGS_ALPHA_TOOLTIP}
+                      // Sharing is the org/Teams entry point, so it is labelled
+                      // beta and gets the Teams-specific pricing disclosure.
+                      stage={route.id === 'project-sharing' ? 'beta' : 'alpha'}
+                      tooltip={route.id === 'project-sharing' ? TEAM_BETA_TOOLTIP : SETTINGS_ALPHA_TOOLTIP}
                     />
                   )}
                   {(status === 'success' || status === 'active' || status === 'error' || status === 'denied') && (

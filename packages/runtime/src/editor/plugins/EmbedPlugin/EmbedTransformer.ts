@@ -18,7 +18,7 @@ import type { ElementTransformer } from '@lexical/markdown';
 import {
   $isEmbeddedFileNode,
   EmbeddedFileNode,
-} from './EmbeddedFileNode';
+} from './EmbeddedFileNodeCore';
 import { serializeEmbedAttrs } from './embedAttrs';
 
 export const EMBED_TRANSFORMER: ElementTransformer = {
@@ -33,6 +33,8 @@ export const EMBED_TRANSFORMER: ElementTransformer = {
   },
   export: (node) => {
     if (!$isEmbeddedFileNode(node)) return null;
+    // Named views use the page-view fence transformer, not an inline view link.
+    if (node.getAttrs().namedPageView) return null;
     const src = node.getSrc();
     const label = node.getLabel();
     const title = serializeEmbedAttrs(node.getAttrs());

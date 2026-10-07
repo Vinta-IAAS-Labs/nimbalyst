@@ -1,0 +1,48 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node", "vite/client"],
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@nimbalyst/tracker-core": ["../tracker-core/src/index.ts"],
+      "@nimbalyst/tracker-core/*": ["../tracker-core/src/*"],
+      // The browser barrel, as in vite.config.ts, so the emitted types match the JS.
+      "@nimbalyst/tracker-schema": ["../tracker-schema/src/browser.ts"],
+      "@nimbalyst/tracker-schema/*": ["../tracker-schema/src/*"],
+      "@nimbalyst/tracker-engine": ["../tracker-engine/src/index.ts"],
+      "@nimbalyst/tracker-engine/*": ["../tracker-engine/src/*"],
+      "@nimbalyst/collab-client": ["../collab-client/src/core/index.ts"],
+      "@nimbalyst/collab-client/*": ["../collab-client/src/*/index.ts"],
+      "@nimbalyst/runtime/*": ["../runtime/src/*"],
+      // A handful of extension-SDK subpaths are published under a name that is
+      // not their source filename, so the wildcard below resolves them to a
+      // file that does not exist. `noCheck` hides that at compile time and the
+      // declaration rewrite in scripts/build-types.mjs is where it surfaces --
+      // keep these two lists in step.
+      "@nimbalyst/extension-sdk/file-tree": ["../extension-sdk/src/fileDirectoryTree.ts"],
+      "@nimbalyst/extension-sdk/file-mask": ["../extension-sdk/src/fileMask.ts"],
+      "@nimbalyst/extension-sdk/*": ["../extension-sdk/src/*"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "types/**/*",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "../runtime/src/editor/types/*.d.ts",
+    "../runtime/src/types/vite.d.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

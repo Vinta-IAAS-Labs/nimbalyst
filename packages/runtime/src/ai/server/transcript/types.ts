@@ -27,6 +27,13 @@ export type TranscriptEventType =
 export interface UserMessagePayload {
   mode: 'agent' | 'planning' | 'auto';
   inputType: 'user' | 'system_message';
+  /**
+   * Who sent this prompt and through what path, copied from the raw row's
+   * `promptProvenance.actor` / `promptOrigin`. Absent on rows written before
+   * provenance existed and on queued prompts that were never classified.
+   */
+  promptActor?: 'human' | 'agent' | 'system';
+  promptOrigin?: string;
   attachments?: Array<{
     id: string;
     filename: string;
@@ -96,6 +103,13 @@ export interface SystemMessagePayload {
   deniedReason?: string;
   deniedReasonType?: PermissionDeniedReasonType | (string & {});
   deniedInput?: Record<string, unknown>;
+  /** Attachment staging was blocked (or is predicted to be blocked) by a file deny rule. */
+  isAttachmentStagingDenied?: boolean;
+  attachmentPath?: string;
+  attachmentFilename?: string;
+  attachmentStagingMode?: 'temp' | 'workspace' | 'custom';
+  attachmentDenyRule?: string;
+  attachmentDetection?: 'reactive' | 'preflight';
 }
 
 export interface ToolCallPayload {
@@ -225,6 +239,8 @@ export interface TranscriptPayloadMap {
 
 export interface TranscriptEvent {
   id: number;
+  /** Ephemeral runtime store identity; never persisted or synced. */
+  transcriptGeneration?: number;
   sessionId: string;
   sequence: number;
   createdAt: Date;

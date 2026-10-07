@@ -25,8 +25,17 @@ import {
   createCommentFixtures,
   createFixtureResolver,
 } from '../commentFixtures';
-import { messageUrn, parseResourceUrn, resourceRefToUrn } from '../resourceUrn';
-import type { CommentRef, ResourceRef } from '../commentTypes';
+import {
+  messageUrn,
+  parsePastedResourceLink,
+  parseResourceUrn,
+  resourceRefToUrn,
+} from '../resourceUrn';
+import {
+  createResourcePreviewResolver,
+  type PreviewableSharedDocument,
+} from '../resourcePreviewResolver';
+import type { Comment, CommentRef, CommentView, ResourceRef } from '../commentTypes';
 
 const NOW = Date.parse('2026-07-26T18:00:00.000Z');
 const ORG = 'org-nimbalyst';
@@ -41,6 +50,7 @@ describe('resource URN round-trip', () => {
       FIXTURE_REFS.commit,
       FIXTURE_REFS.pullRequest,
       FIXTURE_REFS.conversation,
+      { orgId: ORG, kind: 'feedbackRequest', sourceId: 'feedback/request 1' },
     ];
     for (const ref of refs) {
       const urn = resourceRefToUrn(ref);
@@ -59,6 +69,186 @@ describe('resource URN round-trip', () => {
     expect(parseResourceUrn('nimbalyst://tracker', ORG)).toBeNull();
     expect(parseResourceUrn('nimbalyst://unknownkind/1', ORG)).toBeNull();
     expect(parseResourceUrn('nimbalyst://file/foo.ts', ORG)).toBeNull();
+  });
+});
+
+describe('pasted Nimbalyst resource links', () => {
+  it('recognizes copied tracker and plan-document links for this organization', () => {
+    expect(
+      parsePastedResourceLink(
+        'nimbalyst://tracker/tracker%2Fone?orgId=org-nimbalyst',
+        ORG,
+      ),
+    ).toEqual({
+      ref: {
+        orgId: ORG,
+        kind: 'tracker',
+        sourceId: 'tracker/one',
+      },
+      label: 'Tracker',
+    });
+
+    expect(
+      parsePastedResourceLink(
+        'nimbalyst://tracker/plan-42?orgId=org-nimbalyst&view=document',
+        ORG,
+      ),
+    ).toEqual({
+      ref: {
+        orgId: ORG,
+        kind: 'tracker',
+        sourceId: 'plan-42',
+      },
+      label: 'Plan',
+    });
+  });
+
+  it('does not authorize a tracker link copied from another organization', () => {
+    expect(
+      parsePastedResourceLink(
+        'nimbalyst://tracker/tracker-1?orgId=another-org',
+        ORG,
+      ),
+    ).toBeNull();
+  });
+
+  /**
+   * A copied shared-document link spells the host `doc` and carries its org in
+   * the query string; messaging's canonical URN spells it `document` and takes
+   * the org from the conversation. The paste boundary is the only place the two
+   * meet, so it is the only place that translates.
+   */
+  it('normalizes a copied shared-document link to the canonical document ref', () => {
+    expect(
+      parsePastedResourceLink(
+        'nimbalyst://doc/da27a770-9f86-4e04-a847-a51f7befa3d4?orgId=org-nimbalyst',
+        ORG,
+      ),
+    ).toEqual({
+      ref: {
+        orgId: ORG,
+        kind: 'document',
+        sourceId: 'da27a770-9f86-4e04-a847-a51f7befa3d4',
+      },
+      label: 'Document',
+    });
+  });
+
+  it('accepts a shared-document link with no orgId, which is already org-relative', () => {
+    expect(parsePastedResourceLink('nimbalyst://doc/plain-doc', ORG)?.ref).toEqual({
+      orgId: ORG,
+      kind: 'document',
+      sourceId: 'plain-doc',
+    });
+  });
+
+  it('does not authorize a shared-document link copied from another organization', () => {
+    expect(
+      parsePastedResourceLink('nimbalyst://doc/doc-1?orgId=another-org', ORG),
+    ).toBeNull();
+  });
+
+  it('keeps the normalized document ref round-trippable', () => {
+    const parsed = parsePastedResourceLink('nimbalyst://doc/doc-9?orgId=org-nimbalyst', ORG);
+    const urn = resourceRefToUrn(parsed!.ref);
+    expect(urn).toBe('nimbalyst://document/doc-9');
+    expect(parseResourceUrn(urn, ORG)).toEqual(parsed!.ref);
+  });
+
+  it('leaves folder links alone -- there is no folder ResourceKind to mint', () => {
+    expect(
+      parsePastedResourceLink('nimbalyst://folder/f-1?orgId=org-nimbalyst', ORG),
+    ).toBeNull();
+  });
+});
+
+describe('shared-document preview resolution', () => {
+  const DOC: PreviewableSharedDocument = {
+    documentId: 'doc-1',
+    title: 'Launch checklist',
+    documentType: 'markdown',
+  };
+
+  function resolverFor(
+    documents: readonly PreviewableSharedDocument[] | null,
+    describe_?: (doc: PreviewableSharedDocument) => string | undefined,
+  ) {
+    return createResourcePreviewResolver({
+      documents: () => documents,
+      describeDocumentType: describe_ ?? (() => 'Markdown'),
+    });
+  }
+
+  const docRef = (sourceId: string): ResourceRef => ({
+    orgId: ORG,
+    kind: 'document',
+    sourceId,
+  });
+
+  it('resolves a readable document to its title and type', async () => {
+    const previews = await resolverFor([DOC]).resolve([docRef('doc-1')]);
+    expect(previews['nimbalyst://document/doc-1']).toEqual({
+      availability: 'available',
+      title: 'Launch checklist',
+      secondary: 'Markdown',
+    });
+  });
+
+  it('reports a document this reader cannot see as unavailable, not missing', async () => {
+    const previews = await resolverFor([DOC]).resolve([docRef('doc-absent')]);
+    expect(previews['nimbalyst://document/doc-absent']).toEqual({ availability: 'unavailable' });
+  });
+
+  /**
+   * "The index has not arrived" and "you may not see this" are different
+   * answers. Collapsing them shows a permanent "Unavailable" on a document the
+   * reader owns, because nothing re-resolves once the list finally loads.
+   */
+  it('stays loading while the document index has not arrived', async () => {
+    const previews = await resolverFor(null).resolve([docRef('doc-1')]);
+    expect(previews['nimbalyst://document/doc-1']).toEqual({ availability: 'loading' });
+  });
+
+  it('treats a document whose key it cannot use as unavailable', async () => {
+    const previews = await resolverFor([{ ...DOC, decryptFailed: true }]).resolve([docRef('doc-1')]);
+    expect(previews['nimbalyst://document/doc-1']).toEqual({ availability: 'unavailable' });
+  });
+
+  it('names an untitled document rather than rendering an empty pill', async () => {
+    const previews = await resolverFor([{ ...DOC, title: '   ' }]).resolve([docRef('doc-1')]);
+    expect(previews['nimbalyst://document/doc-1']).toMatchObject({
+      availability: 'available',
+      title: 'Untitled document',
+    });
+  });
+
+  it('omits the type line rather than inventing one', async () => {
+    const previews = await resolverFor([DOC], () => undefined).resolve([docRef('doc-1')]);
+    expect(previews['nimbalyst://document/doc-1']).toEqual({
+      availability: 'available',
+      title: 'Launch checklist',
+    });
+  });
+
+  it('does not claim to resolve kinds it has no lookup for', async () => {
+    const previews = await resolverFor([DOC]).resolve([FIXTURE_REFS.session, FIXTURE_REFS.commit]);
+    for (const state of Object.values(previews)) {
+      expect(state).toEqual({ availability: 'unavailable' });
+    }
+  });
+
+  /**
+   * The redaction boundary, asserted end to end: whatever the resolver knew
+   * about a document must not survive into a pill the reader cannot open.
+   */
+  it('leaks nothing through an unavailable pill', async () => {
+    const ref = docRef('doc-absent');
+    const previews = await resolverFor([DOC]).resolve([ref]);
+    const pill = toPillView(ref, previews[resourceRefToUrn(ref)]);
+    expect(pill.label).toBe('Unavailable');
+    expect(pill.secondary).toBeUndefined();
+    expect(pill.state).toBeUndefined();
+    expect(pill.actionable).toBe(false);
   });
 });
 
@@ -384,5 +574,51 @@ describe('draft bound enforcement at the validator limits', () => {
     const result = draft({ resourceRefs: [FIXTURE_REFS.tracker] });
     expect(result.isEmpty).toBe(false);
     expect(result.canSend).toBe(true);
+  });
+});
+
+describe('attachments in the comment view', () => {
+  const ATTACHMENT = {
+    assetId: 'asset-1',
+    fileName: 'screenshot.png',
+    mimeType: 'image/png',
+    byteSize: 2048,
+  };
+
+  function viewOf(overrides: Partial<Comment> = {}): CommentView {
+    const fixtures = createCommentFixtures({ now: NOW });
+    const base = fixtures.comments[0];
+    return buildCommentView(
+      {
+        ...base,
+        body: {
+          version: 1,
+          format: 'nimbalystMarkdown',
+          text: 'see this',
+          attachments: [ATTACHMENT],
+        },
+        ...overrides,
+      },
+      {
+        viewerUserId: fixtures.viewerUserId,
+        directory: fixtures.directory,
+        previews: {},
+        reactionsSupported: true,
+        now: NOW,
+      },
+    );
+  }
+
+  it('addresses an attachment against the message source, not a guess', () => {
+    const view = viewOf();
+    const segment = view.segments.find((entry) => entry.type === 'attachments');
+
+    expect(segment).toBeDefined();
+    expect(segment?.type === 'attachments' && segment.attachments[0].src)
+      .toBe(`collab-asset://doc/${encodeURIComponent(view.ref.sourceId)}/asset/asset-1`);
+  });
+
+  it('shows nothing for a deleted message, attachments included', () => {
+    expect(viewOf({ deletedAt: NOW }).segments).toEqual([]);
   });
 });

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -5,7 +6,8 @@ import * as path from 'path';
 import { createRequire } from 'module';
 
 const require_ = createRequire(import.meta.url);
-const { prebuildsForTarget, pruneSqlitePrebuilds } = require_('../afterPack.js');
+const { prebuildsForTarget, pruneSqlitePrebuilds, pruneNodePtyPrebuilds, pruneOnnxRuntimeBinaries } =
+  require_('../afterPack.js');
 
 const ALL_PREBUILDS = [
   'darwin-arm64.node',
@@ -94,5 +96,117 @@ describe('pruneSqlitePrebuilds', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-afterpack-empty-'));
     created.push(root);
     expect(pruneSqlitePrebuilds(root, 'darwin', 'arm64')).toMatchObject({ skipped: true });
+  });
+});
+
+// node-pty's extraResources copy takes the whole package, so every build
+// carried the other platforms' prebuilds. On Windows those Mach-O pty.node
+// files failed the release workflow's Authenticode sweep and killed the
+// v0.72.0 build after its tag had already been pushed.
+const ALL_PTY_PREBUILDS = ['darwin-arm64', 'darwin-x64', 'win32-arm64', 'win32-x64'];
+
+function makePtyResources(
+  options: { prebuilds?: string[]; sourceBuilt?: boolean } = {},
+): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-afterpack-pty-'));
+  created.push(root);
+  for (const name of options.prebuilds ?? ALL_PTY_PREBUILDS) {
+    const dir = path.join(root, 'node-pty/prebuilds', name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'pty.node'), 'x'.repeat(1024));
+  }
+  if (options.sourceBuilt) {
+    const releaseDir = path.join(root, 'node-pty/build/Release');
+    fs.mkdirSync(releaseDir, { recursive: true });
+    fs.writeFileSync(path.join(releaseDir, 'pty.node'), '');
+  }
+  return root;
+}
+
+function remainingPty(root: string): string[] {
+  return fs.readdirSync(path.join(root, 'node-pty/prebuilds')).sort();
+}
+
+describe('pruneNodePtyPrebuilds', () => {
+  it('strips the Mach-O prebuilds from a Windows payload', () => {
+    const root = makePtyResources();
+    const result = pruneNodePtyPrebuilds(root, 'win32', 'x64');
+    expect(remainingPty(root)).toEqual(['win32-x64']);
+    expect(result).toMatchObject({ removedCount: 3, keptCount: 1 });
+  });
+
+  it('keeps both slices for a universal mac target', () => {
+    const root = makePtyResources();
+    pruneNodePtyPrebuilds(root, 'darwin', 'universal');
+    expect(remainingPty(root)).toEqual(['darwin-arm64', 'darwin-x64']);
+  });
+
+  it('tolerates linux, which is source-built rather than prebuilt', () => {
+    const root = makePtyResources({ sourceBuilt: true });
+    expect(() => pruneNodePtyPrebuilds(root, 'linux', 'x64')).not.toThrow();
+    expect(remainingPty(root)).toEqual([]);
+  });
+
+  it('throws rather than shipping a build with no loadable pty binary', () => {
+    // Simulates a node-pty bump that renames the prebuild dirs: every dir
+    // would be pruned and the app could not start a terminal.
+    const root = makePtyResources({ prebuilds: ['win32-x64-napi-v3'] });
+    expect(() => pruneNodePtyPrebuilds(root, 'win32', 'x64')).toThrow(
+      /pruned every node-pty prebuild/,
+    );
+  });
+
+  it('is a no-op when node-pty was not copied into resources', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-afterpack-pty-empty-'));
+    created.push(root);
+    expect(pruneNodePtyPrebuilds(root, 'darwin', 'arm64')).toMatchObject({ skipped: true });
+  });
+});
+
+const ONNX_TARGETS = [
+  ['darwin', 'arm64'],
+  ['darwin', 'x64'],
+  ['linux', 'arm64'],
+  ['linux', 'x64'],
+  ['win32', 'arm64'],
+  ['win32', 'x64'],
+] as const;
+
+function makeOnnxResources(targets = ONNX_TARGETS): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-afterpack-onnx-'));
+  created.push(root);
+  for (const [platform, arch] of targets) {
+    const dir = path.join(root, 'node_modules/onnxruntime-node/bin/napi-v3', platform, arch);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'onnxruntime_binding.node'), 'x'.repeat(1024));
+  }
+  return root;
+}
+
+describe('pruneOnnxRuntimeBinaries', () => {
+  it('keeps only the target runtime', () => {
+    const root = makeOnnxResources();
+    const result = pruneOnnxRuntimeBinaries(root, 'darwin', 'arm64');
+    const napiDir = path.join(root, 'node_modules/onnxruntime-node/bin/napi-v3');
+
+    expect(fs.existsSync(path.join(napiDir, 'darwin/arm64/onnxruntime_binding.node'))).toBe(true);
+    expect(fs.existsSync(path.join(napiDir, 'darwin/x64'))).toBe(false);
+    expect(fs.existsSync(path.join(napiDir, 'linux'))).toBe(false);
+    expect(result).toMatchObject({ keptCount: 1, removedCount: 5 });
+  });
+
+  it('keeps both slices for a universal mac target', () => {
+    const root = makeOnnxResources();
+    const result = pruneOnnxRuntimeBinaries(root, 'darwin', 'universal');
+
+    expect(result).toMatchObject({ keptCount: 2, removedCount: 4 });
+  });
+
+  it('fails instead of shipping keyword-only when the target binding is absent', () => {
+    const root = makeOnnxResources([['linux', 'x64']]);
+
+    expect(() => pruneOnnxRuntimeBinaries(root, 'darwin', 'arm64')).toThrow(
+      /silently fall back to keyword-only/,
+    );
   });
 });

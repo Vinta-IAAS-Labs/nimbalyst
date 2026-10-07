@@ -10,7 +10,7 @@ Nimbalyst now uses a single GitHub Releases-based flow for both alpha and stable
 - **CHANGELOG.md**: remains the source of truth for release notes
 - **Annotated Git Tags**: still carry the release notes snapshot
 
-During the migration away from Cloudflare R2, `.github/workflows/electron-build.yml` keeps a temporary `LEGACY_ALPHA_TRANSITION_R2_UPLOAD` switch enabled. Leave it on for exactly one transition release so older alpha installs that still point at R2 can update onto the GitHub-backed alpha feed, then turn it off.
+Both channels are served entirely from GitHub Releases. The Cloudflare R2 transition bridge has been removed and its credentials revoked.
 
 ## Standard Release Workflow
 
@@ -20,7 +20,7 @@ The release process is divided into two phases so alpha users can test a publish
 
 #### 1. Prepare Release Notes
 
-As you work, add changes to the `[Unreleased]` section of `CHANGELOG.md`:
+When preparing a commit or release, add changes to the `[Unreleased]` section of `CHANGELOG.md` (not during implementation). Before creating the release, reconcile notable Added/Changed/Removed capabilities and relevant commits against [FEATURE_INVENTORY.md](./docs/FEATURE_INVENTORY.md), update missing or obsolete entries, and report the updated sections or a short "No inventory impact" reason. Follow the root [CLAUDE.md](./CLAUDE.md) rule, including shared-file ownership and checking unclear claims against current code.
 
 ```markdown
 ## [Unreleased]
@@ -57,7 +57,7 @@ This command will:
 
 After approving the release notes, the command will run `./scripts/release.sh` which:
 1. Bumps version in `package.json`
-2. Updates `package-lock.json`
+2. Updates `pnpm-lock.yaml`
 3. Moves [Unreleased] notes to new version section in CHANGELOG.md
 4. Creates a commit with release notes
 5. Creates an annotated git tag with release notes
@@ -81,7 +81,6 @@ Pushing the tag triggers the GitHub Actions workflow which:
 2. Signs and notarizes macOS builds; signs Windows builds via DigiCert KeyLocker
 3. Publishes a visible GitHub **pre-release** for tag `vX.Y.Z`
 4. Uploads build artifacts and update manifests to that release
-5. Optionally uploads the same assets to the legacy R2 bucket when `LEGACY_ALPHA_TRANSITION_R2_UPLOAD` is still enabled
 
 **Windows artifacts:** Two installers ship per release. `Nimbalyst-Windows-x64.exe`
 and `Nimbalyst-Windows-arm64.exe` are the arch-specific installers referenced by
@@ -136,49 +135,13 @@ Check that:
 - Build artifacts are available (if applicable)
 - The release is **not** marked as a pre-release
 
-## Release Branch Workflow (Optional)
+## Release Branches
 
-For more control or when you need to test a release before publishing:
+There is no permanent release branch, and no branch name triggers a release build. The release ref is the annotated `v*` tag, created from a commit already on `main`.
 
-### 1. Create Release Branch
+A branch-name trigger would let anyone with write access start the credentialed release workflow by pushing a branch, so `electron-build.yml` builds only on `v*` tags, manual dispatch, and workflow calls.
 
-```bash
-# Create release branch from main
-git checkout -b release/v0.42.61 main
-
-# Or create from a specific commit
-git checkout -b release/v0.42.61 abc123
-```
-
-### 2. Prepare Release on Branch
-
-Follow the standard workflow steps 1-3 above, but commit to the release branch:
-
-```bash
-# After running release.sh, you'll be on the release branch
-git push origin release/v0.42.61
-```
-
-### 3. Test the Release
-
-The GitHub Actions workflow will build the release branch automatically. You can:
-- Download and test the artifacts
-- Make additional fixes if needed
-- Commit fixes to the release branch
-
-### 4. Merge and Tag
-
-Once satisfied with the release:
-
-```bash
-# Merge to main
-git checkout main
-git merge release/v0.42.61 --no-ff
-
-# Push everything
-git push origin main
-git push origin v0.42.61
-```
+A later change will make releases PR-native: prepare the version bump and changelog on a short-lived `release/vX.Y.Z` topic branch, merge that PR into `main`, then tag the merged `main` commit. Those branches stay ordinary topic branches — the tag remains the only release trigger.
 
 ## Hotfix Workflow
 
@@ -252,19 +215,24 @@ Check the Actions tab in GitHub:
 
 Common issues:
 - Code signing certificates expired
-- PUBLIC_REPO_PAT token needs renewal
 - Dependency installation failed
 
 ### Can't Push to Main Branch
 
-Repository has branch protection rules. You need admin access to bypass, or:
-- Create a release branch
-- Open a PR
-- Merge after CI passes
+`main` requires a reviewed pull request. Release commits are the exception: `scripts/release.sh` pushes the version bump and changelog directly to `main`, which works because the repository admin can bypass the rule.
+
+If that push is rejected:
+- Confirm you are pushing as the repository admin, not as another account or an agent worktree identity.
+- Do not create a `release/**` branch to work around it — no branch name triggers a release build, and the section above explains why.
+- If you are not the release manager, open an ordinary pull request with the change and hand the tag off.
+
+Once the release flow becomes PR-native, the admin bypass narrows to pull requests only and the release version bump goes through a short-lived `release/vX.Y.Z` PR like any other change.
 
 ## iOS Release Workflow
 
 iOS uses a separate release process from Electron, with its own versioning, changelog, and git tags.
+
+Before tagging, reconcile the iOS release's capabilities against the Mobile (iOS) and shared sections of [FEATURE_INVENTORY.md](./docs/FEATURE_INVENTORY.md), following the same inventory check as the desktop release. Preserve platform differences and do not describe unfinished mobile work as shipped.
 
 ### Tag Convention
 

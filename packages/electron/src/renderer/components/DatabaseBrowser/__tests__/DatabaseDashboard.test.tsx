@@ -9,6 +9,17 @@ function mockDashboardStats(backup: { size?: number; sizeBytes?: number } | null
     configurable: true,
     value: {
       invoke: vi.fn().mockImplementation(async (channel: string) => {
+        // The storage-retention card reads its settings on mount.
+        if (channel === 'database:maintenance:get') {
+          return {
+            success: true,
+            settings: {
+              backupCopiesKept: 2,
+              backupIntervalHours: 12,
+              toolOutputRetentionDays: 0,
+            },
+          };
+        }
         if (channel !== 'database:getDashboardStats') {
           throw new Error(`Unexpected invoke channel: ${channel}`);
         }
@@ -50,7 +61,7 @@ describe('DatabaseDashboard backup size rendering', () => {
 
     render(<DatabaseDashboard onTableSelect={vi.fn()} />);
 
-    expect(await screen.findByText('3 KB')).toBeTruthy();
+    await screen.findByText('3 KB');
   });
 
   it('renders legacy backup metadata that uses size', async () => {
@@ -58,6 +69,6 @@ describe('DatabaseDashboard backup size rendering', () => {
 
     render(<DatabaseDashboard onTableSelect={vi.fn()} />);
 
-    expect(await screen.findByText('2 KB')).toBeTruthy();
+    await screen.findByText('2 KB');
   });
 });

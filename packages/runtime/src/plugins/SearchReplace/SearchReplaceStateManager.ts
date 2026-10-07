@@ -7,6 +7,12 @@
 
 export interface SearchReplaceState {
   isOpen: boolean;
+  /**
+   * Bumped every time the Find command is issued. The bar focuses its input on
+   * a change to this, not on `isOpen`, so a second Find on an already-open bar
+   * still pulls focus back out of the document (#1388).
+   */
+  focusNonce: number;
   searchString: string;
   replaceString: string;
   caseInsensitive: boolean;
@@ -17,9 +23,13 @@ export interface SearchReplaceState {
 
 type StateChangeListener = (tabId: string, state: SearchReplaceState) => void;
 
+export type SearchNavigateDirection = 'next' | 'previous';
+type NavigateListener = (tabId: string, direction: SearchNavigateDirection) => void;
+
 class SearchReplaceStateManagerClass {
   private states: Map<string, SearchReplaceState> = new Map();
   private listeners: Set<StateChangeListener> = new Set();
+  private navigateListeners: Set<NavigateListener> = new Set();
 
   /**
    * Get the default state for a new tab
@@ -27,6 +37,7 @@ class SearchReplaceStateManagerClass {
   private getDefaultState(): SearchReplaceState {
     return {
       isOpen: false,
+      focusNonce: 0,
       searchString: '',
       replaceString: '',
       caseInsensitive: true,
@@ -87,15 +98,45 @@ class SearchReplaceStateManagerClass {
   }
 
   /**
-   * Toggle the search/replace bar for a tab
+   * Handle the Find command (Cmd+F) for a tab.
+   *
+   * Find is not a toggle. Every editor the user has ever used opens the bar on
+   * the first Find and refocuses the already-open field on the next one -- it
+   * never closes the bar and never hands focus back to the document, because
+   * doing so turns the following keystrokes into unintended edits (#1388).
+   * Escape is what closes the bar.
    */
-  toggle(tabId: string): void {
+  openAndFocus(tabId: string): void {
     if (!tabId) {
       throw new Error('tabId is required');
     }
 
     const currentState = this.getState(tabId);
-    this.updateState(tabId, { isOpen: !currentState.isOpen });
+    this.updateState(tabId, { isOpen: true, focusNonce: currentState.focusNonce + 1 });
+  }
+
+  /**
+   * Handle Find Next / Find Previous (Cmd+G / Cmd+Shift+G) for a tab.
+   *
+   * These arrive as app-menu commands, so the bar never sees the keystroke.
+   * Returns false when no bar is open for the tab, so the caller can route the
+   * command to another editor's find UI instead.
+   */
+  navigate(tabId: string, direction: SearchNavigateDirection): boolean {
+    if (!tabId || !this.isOpen(tabId)) {
+      return false;
+    }
+
+    this.navigateListeners.forEach((listener) => listener(tabId, direction));
+    return true;
+  }
+
+  addNavigateListener(listener: NavigateListener): void {
+    this.navigateListeners.add(listener);
+  }
+
+  removeNavigateListener(listener: NavigateListener): void {
+    this.navigateListeners.delete(listener);
   }
 
   /**

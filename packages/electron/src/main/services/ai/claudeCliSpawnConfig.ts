@@ -18,7 +18,8 @@
  */
 
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { normalizeClaudeCodeVariant } from '@nimbalyst/runtime/ai/modelConstants';
+import { normalizeClaudeCodeVariant, CLAUDE_CODE_PINNED_SDK_MODELS } from '@nimbalyst/runtime/ai/modelConstants';
+import { claudeCustomModelName } from '@nimbalyst/runtime/ai/claudeCustomModels';
 
 /**
  * Resolve a Nimbalyst model id to the alias the genuine `claude` CLI accepts for
@@ -43,19 +44,24 @@ export function resolveClaudeCliModelArg(model: string | undefined): string | un
 
   // Combined "provider:variant" id → take the variant part; bare value → itself.
   const parsed = ModelIdentifier.tryParse(trimmed);
+  // Custom gateway models (`claude-code-cli:custom/Fast`) go to `--model` verbatim.
+  const customModel = parsed?.customClaudeModel ?? claudeCustomModelName(trimmed);
+  if (customModel) return customModel;
   const isExtended = parsed ? parsed.isExtendedContext : /-1m$/i.test(trimmed);
   const variantInput = parsed ? parsed.baseVariant : trimmed.toLowerCase().replace(/-1m$/, '');
 
   const variant = normalizeClaudeCodeVariant(variantInput);
   if (variant) {
-    // Collapse pinned opus variants (opus-4-7 / opus-4-6) to the CLI's `opus` alias.
-    const alias = variant.startsWith('opus') ? 'opus' : variant;
+    // Share the SDK mapping so explicit versions never collapse to "latest".
+    const alias = CLAUDE_CODE_PINNED_SDK_MODELS[variant] ?? variant;
     return isExtended ? `${alias}[1m]` : alias;
   }
 
   // Unknown format: a bare full model name is fine to pass through; a non-claude
-  // combined id (e.g. `openai:gpt-5`) must never reach `claude --model`.
-  return parsed ? undefined : trimmed;
+  // combined id (e.g. `openai:gpt-5`) or an unparseable Claude id still carrying
+  // its provider prefix must never reach `claude --model`.
+  if (parsed || /^claude-code(?:-cli)?:/.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 export interface ClaudeCliSpawnInput {
@@ -87,6 +93,14 @@ export interface ClaudeCliSpawnInput {
    * to point the CLI at the local SSE-tee proxy. Never used to inject API keys.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * Resolved effort level for this session, forwarded as
+   * `CLAUDE_CODE_EFFORT_LEVEL`. Mirrors the Agent SDK path, which sets the same
+   * variable (`sdkOptionsBuilder`). Every resolved value is forwarded, including
+   * `high`, so the selector matches what the CLI actually runs (#844). Omit to
+   * leave the CLI on its own default.
+   */
+  effortLevel?: string;
   /**
    * Names of trusted MCP servers to pre-allow (NIM-806 BUG 2). Each becomes a
    * server-level `mcp__<server>` entry in `--allowedTools`, so the genuine CLI
@@ -140,6 +154,14 @@ export interface ClaudeCliSpawnInput {
    * skipped; omit for no extension plugins.
    */
   pluginDirs?: string[];
+  /**
+   * Set when an enterprise `managed-mcp.json` forbids passing MCP servers at all
+   * (NIM-2372). The launcher then omits `mcpConfigPath` / `allowedMcpServerNames`,
+   * and this flag makes the prompt honest about it: no nudges toward Nimbalyst MCP
+   * tools, and the built-in `AskUserQuestion` is left enabled since our MCP
+   * replacement is gone.
+   */
+  mcpToolsUnavailable?: boolean;
   /** Extra CLI args appended verbatim (escape hatch for flags we pass through). */
   extraArgs?: string[];
   /** Platform (process.platform); injectable for cross-platform tests. */
@@ -227,6 +249,17 @@ const CLAUDE_CLI_SYSTEM_PROMPT_APPEND = [
   CLAUDE_CLI_SESSION_NAMING_NUDGE,
 ].join('\n\n');
 
+/**
+ * Replacement append for the enterprise MCP lockdown (NIM-2372). Nimbalyst
+ * passes no MCP servers on those machines, so both nudges above would point the
+ * model at tools that cannot exist. It still needs to know where it is running.
+ */
+const CLAUDE_CLI_MCP_LOCKDOWN_APPEND = [
+  'You are running inside Nimbalyst, a desktop GUI that manages your session.',
+  "This machine has an enterprise Claude Code MCP policy, so Nimbalyst's own tools",
+  'are not available in this session. Ask questions in plain text.',
+].join(' ');
+
 export function buildClaudeCliSpawnConfig(input: ClaudeCliSpawnInput): ClaudeCliSpawnConfig {
   const executable = input.claudeExecutable || 'claude';
 
@@ -238,16 +271,13 @@ export function buildClaudeCliSpawnConfig(input: ClaudeCliSpawnInput): ClaudeCli
     args.push('--model', modelArg);
   }
   if (input.mcpConfigPath) {
+    // NIM-2372: additive only. We deliberately do NOT pair this with
+    // `--strict-mcp-config` any more — that made the binary ignore its own
+    // discovery (~/.claude.json, project .mcp.json, enterprise config, claude.ai
+    // connectors), which silently stripped every account connector and made the
+    // launch fail outright on managed machines. Nimbalyst's off-toggle is written
+    // into the CLI's own `disabledMcpServers` instead (claudeCodeDisabledServers.ts).
     args.push('--mcp-config', input.mcpConfigPath);
-    // NIM-843: pair with --strict-mcp-config so the genuine `claude` binary uses
-    // ONLY this snapshot and does NOT merge its own discovery (~/.claude.json,
-    // project .mcp.json, .claude/settings.json, claude.ai connectors). Without it
-    // the binary loads every server it finds in ~/.claude.json — ignoring the
-    // `disabled` flag Nimbalyst writes — so user-disabled third-party servers leak
-    // into CLI sessions and eat context. The snapshot already carries the enabled
-    // set (filtered by isMCPServerEnabledForProvider), so strict mode gives the
-    // Nimbalyst toggle the same authority over CLI sessions as the SDK path.
-    args.push('--strict-mcp-config');
   }
   if (input.resumeSessionId) {
     args.push('--resume', input.resumeSessionId);
@@ -315,9 +345,18 @@ export function buildClaudeCliSpawnConfig(input: ClaudeCliSpawnInput): ClaudeCli
   if (allowedServerEntries.length > 0) {
     args.push('--allowedTools', ...allowedServerEntries);
   }
-  // Force the model off the built-in TUI AskUserQuestion and onto our MCP tool.
-  args.push('--disallowedTools', ...CLAUDE_CLI_DISALLOWED_TOOLS);
-  args.push('--append-system-prompt', CLAUDE_CLI_SYSTEM_PROMPT_APPEND);
+  // Force the model off the built-in TUI AskUserQuestion and onto our MCP tool —
+  // but only while that MCP tool exists. Under an enterprise MCP lockdown
+  // (NIM-2372) we pass no servers at all, so denying the built-in would leave the
+  // model with no way to ask a question. `--append-system-prompt` stays either
+  // way: it's value-bearing and terminates the `--add-dir` variadic above.
+  if (!input.mcpToolsUnavailable) {
+    args.push('--disallowedTools', ...CLAUDE_CLI_DISALLOWED_TOOLS);
+  }
+  args.push(
+    '--append-system-prompt',
+    input.mcpToolsUnavailable ? CLAUDE_CLI_MCP_LOCKDOWN_APPEND : CLAUDE_CLI_SYSTEM_PROMPT_APPEND,
+  );
   if (input.extraArgs?.length) {
     args.push(...input.extraArgs);
   }
@@ -342,6 +381,12 @@ export function buildClaudeCliSpawnConfig(input: ClaudeCliSpawnInput): ClaudeCli
   // Set as a default the user can still override via their own shell/`baseEnv`.
   if (merged.ENABLE_TOOL_SEARCH == null) {
     merged.ENABLE_TOOL_SEARCH = 'true';
+  }
+  // Mirrors the Agent SDK path. Set after baseEnv so an explicit selection wins
+  // over an inherited value; when nothing is selected the inherited value (or
+  // the CLI's own default) stands.
+  if (input.effortLevel) {
+    merged.CLAUDE_CODE_EFFORT_LEVEL = input.effortLevel;
   }
   if (input.extraEnv) {
     Object.assign(merged, input.extraEnv);

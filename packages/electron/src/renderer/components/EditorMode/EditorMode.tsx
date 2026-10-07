@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
 import { useSetAtom, useAtomValue, useAtom } from 'jotai';
 import type { ConfigTheme } from '@nimbalyst/runtime';
+import { asTeamJwt } from '@nimbalyst/runtime/auth/jwtScopes';
 import { useTabsActions, useTabNavigationShortcuts, type TabData } from '../../contexts/TabsContext';
+import { useRepresentedFileSync } from '../../hooks/useRepresentedFileSync';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { fileDeletedAtomFamily } from '../../store/atoms/fileWatch';
 import { pushNavigationEntryAtom, isRestoringNavigationAtom, historyDialogFileAtom } from '../../store';
@@ -13,7 +15,7 @@ import { handleWorkspaceFileSelect as handleWorkspaceFileSelectUtil } from '../.
 import { createInitialFileContent, createMockupContent } from '../../utils/fileUtils';
 import { getFileName } from '../../utils/pathUtils';
 import { canPersistWorkspaceHydratedState } from '../../utils/workspaceHydration';
-import { isCollabUri } from '../../utils/collabUri';
+import { isCollabUri } from '@nimbalyst/collab-protocol';
 import { aiToolService } from '../../services/AIToolService';
 import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
 import { getExtensionLoader } from '@nimbalyst/runtime';
@@ -41,6 +43,7 @@ import {
   aiChatCollapsedAtomFamily,
 } from '../../store/atoms/workspaceLayout';
 import { refreshFileTree } from '../../store/listeners/fileTreeListeners';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
 
 export interface EditorModeRef {
   closeActiveTab: () => void;
@@ -51,7 +54,9 @@ export interface EditorModeRef {
   openHistoryDialog: () => void;
   toggleSidebarCollapsed: () => void;
   toggleAIChatCollapsed: () => void;
+  toggleEditorMaximized: () => void;
   createNewChatSession: () => Promise<void>;
+  createNewFile: (initialType?: NewFileType) => void;
   tabs: {
     addTab: (filePath: string, content?: string) => string | undefined;
     removeTab: (tabId: string) => void;
@@ -186,6 +191,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   // Get tab actions from context (doesn't subscribe to state - no re-renders)
   const tabsActions = useTabsActions();
   useTabNavigationShortcuts(isActive);
+  useRepresentedFileSync(isActive);
 
   // Refs for imperative DOM updates - NO re-renders for tab visibility
   const tabsContainerRef = useRef<HTMLDivElement>(null);
@@ -368,11 +374,14 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       : 'disconnected';
 
     if (isCollabUri(tab.filePath) && hasCollabUnsyncedChanges(collabStatus)) {
-      const confirmed = window.confirm(
-        collabStatus === 'replaying'
+      const confirmed = await requestConfirmation({
+        title: 'Close document?',
+        message: collabStatus === 'replaying'
           ? 'This collaborative document is still replaying local changes to the server. Close it anyway?'
-          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?'
-      );
+          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?',
+        confirmLabel: 'Close Anyway',
+        destructive: true,
+      });
       if (!confirmed) {
         return;
       }
@@ -403,7 +412,8 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   const currentFileName = currentFileInfo.fileName;
 
   // Expose current document path and workspace path to window for image paste/rendering
-  // __workspacePath is used by MockupPlatformServiceImpl and DataModelPlatformServiceImpl
+  // __workspacePath is read by EmbedFrame, the document-link plugin and the
+  // extension editors, none of which take it as a prop
   useEffect(() => {
     (window as any).__currentDocumentPath = currentFilePath;
     (window as any).workspacePath = workspacePath;
@@ -424,8 +434,8 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         console.error('[openCollabDoc] No workspace path');
         return;
       }
-      const { openCollabDocumentViaIPC } = await import('../../utils/collabDocumentOpener');
-      const tabId = await openCollabDocumentViaIPC({
+      const { openCollabDocumentViaIPCForDesktop } = await import('../../utils/collabDocumentOpener');
+      const tabId = await openCollabDocumentViaIPCForDesktop({
         workspacePath,
         documentId,
         title,
@@ -454,7 +464,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       documentType?: string;
       serverUrl: string;
       orgId: string;
-      userId: string;
+      teamMemberId: string;
       /** Optional query-string suffix appended to the WS URL (no leading ?). */
       urlExtraQuery?: string;
     }) => {
@@ -466,7 +476,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         {
           serverUrl: params.serverUrl,
           orgId: params.orgId,
-          userId: params.userId,
+          teamMemberId: params.teamMemberId,
           documentId: params.documentId,
           title: params.title ?? params.documentId,
         },
@@ -477,34 +487,35 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         );
       }
       const cfg = testResult.config;
-      const { openCollabDocument, createProxiedWebSocket } = await import(
+      const { openCollabDocument, createProxiedWebSocket, appendCollabUrlQuery } = await import(
         '../../utils/collabDocumentOpener'
       );
       const hasWsProxy = !!(window as any).electronAPI?.documentSync?.wsConnect;
       const createWebSocket = hasWsProxy
-        ? (url: string) => {
-            const target = params.urlExtraQuery
-              ? `${url}${url.includes('?') ? '&' : '?'}${params.urlExtraQuery}`
-              : url;
-            return createProxiedWebSocket(target);
-          }
+        ? (url: string) => createProxiedWebSocket(
+            appendCollabUrlQuery(url, params.urlExtraQuery),
+          )
         : undefined;
 
       const tabId = openCollabDocument({
-        workspacePath,
+        scope: {
+          scopeKey: workspacePath,
+          orgId: cfg.orgId,
+          indexConfig: { serverUrl: cfg.serverUrl, teamMemberId: cfg.teamMemberId },
+        },
         orgId: cfg.orgId,
         documentId: cfg.documentId,
         title: cfg.title,
         documentType: params.documentType,
         serverUrl: cfg.serverUrl,
-        accountId: cfg.accountId ?? cfg.userId,
-        userId: cfg.userId,
+        accountId: cfg.accountId ?? cfg.teamMemberId,
+        teamMemberId: cfg.teamMemberId,
         userName: cfg.userName ?? 'Test User',
         userEmail: cfg.userEmail ?? 'test@test.com',
         initialContent: params.initialContent,
         urlExtraQuery: params.urlExtraQuery,
         createWebSocket,
-        getJwt: async () => 'test-jwt',
+        getJwt: async () => asTeamJwt('test-jwt'),
         addTab: tabsActions.addTab,
       });
       console.log('[openCollabDocTest] Opened tab:', tabId);
@@ -521,7 +532,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       documentType?: string;
       serverUrl: string;
       orgId: string;
-      userId: string;
+      teamMemberId: string;
       urlExtraQuery?: string;
     }) => {
       if (!workspacePath) {
@@ -532,7 +543,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         {
           serverUrl: params.serverUrl,
           orgId: params.orgId,
-          userId: params.userId,
+          teamMemberId: params.teamMemberId,
           documentId: params.documentId,
           title: params.title ?? params.documentId,
         },
@@ -543,32 +554,33 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         );
       }
       const cfg = testResult.config;
-      const { registerCollabConfig, createProxiedWebSocket } = await import(
+      const { registerCollabConfig, createProxiedWebSocket, appendCollabUrlQuery } = await import(
         '../../utils/collabDocumentOpener'
       );
       const hasWsProxy = !!(window as any).electronAPI?.documentSync?.wsConnect;
       const createWebSocket = hasWsProxy
-        ? (url: string) => {
-            const target = params.urlExtraQuery
-              ? `${url}${url.includes('?') ? '&' : '?'}${params.urlExtraQuery}`
-              : url;
-            return createProxiedWebSocket(target);
-          }
+        ? (url: string) => createProxiedWebSocket(
+            appendCollabUrlQuery(url, params.urlExtraQuery),
+          )
         : undefined;
       return registerCollabConfig({
-        workspacePath,
+        scope: {
+          scopeKey: workspacePath,
+          orgId: cfg.orgId,
+          indexConfig: { serverUrl: cfg.serverUrl, teamMemberId: cfg.teamMemberId },
+        },
         orgId: cfg.orgId,
         documentId: cfg.documentId,
         title: cfg.title,
         documentType: params.documentType,
         serverUrl: cfg.serverUrl,
-        accountId: cfg.accountId ?? cfg.userId,
-        userId: cfg.userId,
+        accountId: cfg.accountId ?? cfg.teamMemberId,
+        teamMemberId: cfg.teamMemberId,
         userName: cfg.userName ?? 'Test User',
         userEmail: cfg.userEmail ?? 'test@test.com',
         urlExtraQuery: params.urlExtraQuery,
         createWebSocket,
-        getJwt: async () => 'test-jwt',
+        getJwt: async () => asTeamJwt('test-jwt'),
       });
     };
 
@@ -1006,11 +1018,28 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     },
     toggleSidebarCollapsed,
     toggleAIChatCollapsed,
+    // Menu/shortcut path for the same action as double-clicking a tab. With no
+    // tab open there is nothing to expand into, so only the restore direction
+    // stays live.
+    toggleEditorMaximized: () => {
+      const hasTabs = (tabsRef.current?.getSnapshot()?.tabOrder.length ?? 0) > 0;
+      if (isEditorMaximized || hasTabs) toggleEditorMaximized();
+    },
     createNewChatSession: async () => {
       if (isAIChatCollapsed) {
         setIsAIChatCollapsed(false);
       }
       await chatSidebarRef.current?.createNewSession();
+    },
+    // Same path the Cmd+N accelerator takes, so the title bar's left control
+    // and the keyboard land the file in the same place: the selected folder if
+    // the tree has one, else the workspace root.
+    createNewFile: (initialType: NewFileType = 'markdown') => {
+      if (selectedFolderPath) {
+        setNewFileDirectory(selectedFolderPath);
+      }
+      setNewFileInitialType(initialType);
+      setIsNewFileDialogOpen(true);
     },
     tabs: {
       addTab: (filePath: string, content?: string) => {
@@ -1073,6 +1102,8 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     handleTabClose,
     toggleSidebarCollapsed,
     toggleAIChatCollapsed,
+    toggleEditorMaximized,
+    isEditorMaximized,
     isAIChatCollapsed,
     setIsAIChatCollapsed,
   ]);

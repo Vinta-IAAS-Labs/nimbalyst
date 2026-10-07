@@ -7,6 +7,16 @@ import NimbalystNative
 class AppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        // Must happen here: iOS delivers the notification tap that launched the
+        // app only to a delegate claimed before launch finishes.
+        NotificationManager.registerAsNotificationCenterDelegate()
+        return true
+    }
+
+    func application(
+        _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         NotificationManager.shared.didRegisterForRemoteNotifications(withDeviceToken: deviceToken)
@@ -46,8 +56,14 @@ struct NimbalystAppMain: App {
 
     init() {
         #if DEBUG
-        if CommandLine.arguments.contains("--screenshot-mode") {
-            _appState = StateObject(wrappedValue: AppState.forScreenshots())
+        if CommandLine.arguments.contains("--screenshot-mode"), CommandLine.arguments.contains("--session-creation-fixture") {
+            _appState = StateObject(wrappedValue: AppState.forSessionCreationTesting())
+        } else if CommandLine.arguments.contains("--screenshot-mode"),
+           let server = CommandLine.arguments.first(where: { $0.hasPrefix("--document-sync-fixture=") }) {
+            _appState = StateObject(wrappedValue: AppState.forDocumentSyncTesting(serverUrl: String(server.dropFirst("--document-sync-fixture=".count))))
+        } else if CommandLine.arguments.contains("--screenshot-mode") {
+            _appState = StateObject(wrappedValue: CommandLine.arguments.contains("--loading-fixture")
+                ? AppState.forLoadingScreenshots() : AppState.forScreenshots())
         } else {
             _appState = StateObject(wrappedValue: AppState())
         }
@@ -81,10 +97,11 @@ struct NimbalystAppMain: App {
             NSLog("[ScenePhase] changed to: \(String(describing: newPhase))")
             switch newPhase {
             case .active:
-                appState.syncManager?.setAppInForeground(true)
-                appState.documentSyncManager?.reconnectIfNeeded()
-            case .inactive, .background:
-                appState.syncManager?.setAppInForeground(false)
+                appState.setAppInForeground(true)
+            case .background:
+                appState.setAppInForeground(false)
+            case .inactive:
+                break
             @unknown default:
                 break
             }
@@ -104,6 +121,12 @@ struct NimbalystAppMain: App {
             // Surface the in-app scanner only; the link's payload is never applied.
             NSLog("[DeepLink] Opening in-app pairing scanner (payload ignored)")
             appState.pairingScannerRequested = true
+        case .session(let sessionId):
+            // Same channel a notification tap uses, so the Live Activity gets
+            // the navigation that was already built and tested for pushes
+            // instead of a second path that has to be kept in step with it.
+            NSLog("[DeepLink] Opening session \(sessionId)")
+            NotificationManager.shared.pendingSessionId = sessionId
         case .unsupported:
             NSLog("[DeepLink] Ignored: URL is not allowlisted")
         }

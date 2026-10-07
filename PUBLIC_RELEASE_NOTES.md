@@ -1,8 +1,33 @@
-# July 28th 2026 Release
+# September 30th, 2026 Release
+
+### New Features
+
+- **Sonnet 5.5** for Claude Agent and the Claude API. The Sonnet row now runs Sonnet 5.5, and Sonnet 5 stays selectable.
+- **GPT-6.1 Sol** in the Codex and OpenAI model pickers, now the default Codex model.
+- **Crew Extension (alpha, off by default):** persistent agent teammates that work scheduled shifts within token budgets and flag you when something needs you. Use `/crew:hire` in any agent session to design a new Crew member.
+- **Opt-in unlimited open projects**, with a scrollable project rail and cleanup of resources for projects you are not using (#1579, contributed by @jszobody).
+- Extensions can start and drive their own agent sessions.
+
+### Improvements
+
+- Claude Code sessions waiting on a background shell or sub-agent show a distinct indicator and name the task in the transcript.
+- Quick Track's Cmd+Enter creates the item and closes the popup without switching to Tracker mode, and the title field now spans the popup.
+- Improved load performance for very large Codex sessions.
 
 ### Fixed
 
-- Windows and Linux get the File/Edit/View menus back, now drawn in the project window's title bar.
-- Menus and popups that open over the title bar respond to clicks again on Windows and Linux, including "Open folder…" in the project switcher (#1052).
-- Tracker types defined in one project no longer overwrite another open project's identically-named types (#1035).
-- Codex sessions now reach for Nimbalyst's own browser tools instead of dead-ending on a third-party in-app browser plugin.
+- Compound Bash commands no longer prompt for permission after a user PreToolUse hook has allowed them (#426, contributed by @yanekm).
+- Overlapping file-tree scans no longer exhaust memory while files change in large projects (#1604, contributed by @jszobody).
+- Agent sessions no longer read and cache large or binary files written into the workspace, which flooded the log and grew memory.
+- Inline diffs no longer freeze the window for agent edits across long, list-heavy markdown files (#1606).
+- A sent prompt no longer stays duplicated below the transcript when the turn is slow to start (#1620).
+- Transcript messages no longer flash and redraw while a session is streaming.
+- Sessions no longer stay marked as running, or lose their waiting-for-you state, around an open question. A question left unanswered by sending a new message now shows as skipped.
+- Claude Agent sessions in an externally created worktree no longer stay stuck on "running" after a background command finishes.
+- Following external Claude Code sessions keeps importing after the agent changes directory, and skips unchanged logs.
+- Codex auto-review and subagent threads no longer appear as separate "# AGENTS.md instructions" sessions.
+- File @-mention suggestions pick up newly created and renamed files without a reload.
+- Clicking the Dock or tray icon brings back the project window after the app sat in the background.
+- Context menus and popovers no longer open under the title bar, where their first item could not be clicked.
+- Workstream sessions in the session list keep their "updated" time current.
+- Tracker types defined in a background project's window now appear in its tracker pane without a reload.

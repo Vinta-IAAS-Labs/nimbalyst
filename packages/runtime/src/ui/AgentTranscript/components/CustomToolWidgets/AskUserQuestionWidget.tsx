@@ -17,6 +17,28 @@ import {
   clearAskUserQuestionDraft,
   EMPTY_ASK_USER_QUESTION_DRAFT,
 } from '../../../../store/atoms/askUserQuestionDraft';
+import {
+  InteractiveWidgetBody,
+  InteractiveWidgetCard,
+  InteractiveWidgetHeader,
+  WidgetActionButton,
+  WidgetBlock,
+  WidgetFooter,
+  WidgetNoteRow,
+  WidgetOptionList,
+  WidgetOptionRow,
+  WidgetStatusPill,
+} from './shared/InteractiveWidgetChrome';
+
+// Shared with the feedback surfaces via InteractiveWidgetChrome; the glyph
+// itself stays local because it is this widget's identity.
+const QuestionMarkIcon: React.FC = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" className="w-full h-full">
+    <path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    <path d="M6.06 6a2 2 0 0 1 3.88.67c0 1.33-2 2-2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    <path d="M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+);
 
 // ============================================================
 // Types
@@ -160,14 +182,23 @@ function parseAnswers(args: any, result: any): Record<string, string> {
   return {};
 }
 
-function parseCancelledResult(result: unknown): boolean {
-  if (!result) return false;
+interface CancelledState {
+  cancelled: boolean;
+  /** Why the prompt closed, e.g. `superseded` when the user sent a new message instead. */
+  reason?: string;
+}
+
+const NOT_CANCELLED: CancelledState = { cancelled: false };
+
+function parseCancelledResult(result: unknown): CancelledState {
+  if (!result) return NOT_CANCELLED;
 
   if (typeof result === 'string') {
     try {
       return parseCancelledResult(JSON.parse(result));
     } catch {
-      return result.toLowerCase().includes('cancelled') || result.toLowerCase().includes('canceled');
+      const lower = result.toLowerCase();
+      return { cancelled: lower.includes('cancelled') || lower.includes('canceled') };
     }
   }
 
@@ -175,34 +206,29 @@ function parseCancelledResult(result: unknown): boolean {
   if (Array.isArray(result)) {
     for (const item of result) {
       if (item && typeof item === 'object' && (item as any).type === 'text' && typeof (item as any).text === 'string') {
-        if (parseCancelledResult((item as any).text)) return true;
+        const nested = parseCancelledResult((item as any).text);
+        if (nested.cancelled) return nested;
       }
     }
-    return false;
+    return NOT_CANCELLED;
   }
 
   if (typeof result !== 'object') {
-    return false;
+    return NOT_CANCELLED;
   }
 
   const record = result as Record<string, unknown>;
   if (record.cancelled === true || record.canceled === true) {
-    return true;
+    return { cancelled: true, reason: typeof record.reason === 'string' ? record.reason : undefined };
   }
 
-  if (record.result !== undefined && parseCancelledResult(record.result)) {
-    return true;
+  for (const nestedValue of [record.result, record.content, record.text]) {
+    if (nestedValue === undefined) continue;
+    const nested = parseCancelledResult(nestedValue);
+    if (nested.cancelled) return nested;
   }
 
-  if (record.content !== undefined && parseCancelledResult(record.content)) {
-    return true;
-  }
-
-  if (record.text !== undefined && parseCancelledResult(record.text)) {
-    return true;
-  }
-
-  return false;
+  return NOT_CANCELLED;
 }
 
 // ============================================================
@@ -212,6 +238,7 @@ function parseCancelledResult(result: unknown): boolean {
 export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
   message,
   sessionId,
+  superseded,
 }) => {
   const toolCall = message.toolCall;
   const questionId = toolCall?.providerToolCallId || '';
@@ -237,11 +264,13 @@ export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
   const hasResult = rawResult !== undefined && rawResult !== null && rawResult !== '';
 
   // Check if cancelled
-  const isCancelled = useMemo(() => {
-    return parseCancelledResult(rawResult);
-  }, [rawResult]);
+  const cancelledState = useMemo(() => parseCancelledResult(rawResult), [rawResult]);
+  const isCancelled = cancelledState.cancelled;
+  // The user sent a new message instead of answering. Older transcripts have
+  // no durable result for this, so the transcript also passes `superseded`.
+  const isSkipped = cancelledState.reason === 'superseded' || (!hasResult && superseded === true);
 
-  const isCompleted = hasResult;
+  const isCompleted = hasResult || isSkipped;
   const isPending = !isCompleted;
 
   // Draft state lives in a jotai atomFamily keyed by questionId so it survives
@@ -413,9 +442,10 @@ export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
   }
 
   // Determine display result (local takes precedence while waiting)
-  const displayResult = localResult || (isCompleted ? { answers: parsedAnswers, cancelled: isCancelled } : null);
+  const displayResult = localResult || (isCompleted ? { answers: isSkipped ? {} : parsedAnswers, cancelled: isCancelled || isSkipped } : null);
   const displayAnswers = displayResult?.answers || {};
   const displayCancelled = displayResult?.cancelled || false;
+  const displaySkipped = !localResult && isSkipped;
 
   // Check if all questions have selections (for enabling submit button)
   const allAnswered = questions.every(q => {
@@ -426,110 +456,85 @@ export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
 
   // Show completed state
   if (displayResult || hasResponded) {
-    const statusText = displayCancelled ? 'Question Cancelled' : 'Questions Answered';
+    const statusText = displaySkipped
+      ? 'Question Skipped'
+      : displayCancelled ? 'Question Cancelled' : 'Questions Answered';
 
     return (
-      <div
-        data-testid="ask-user-question-widget"
-        data-state={displayCancelled ? 'cancelled' : 'completed'}
-        className={`ask-user-question-widget rounded-lg bg-nim-secondary border border-nim overflow-hidden opacity-85`}
+      <InteractiveWidgetCard
+        rootClassName="ask-user-question-widget"
+        testId="ask-user-question-widget"
+        state={displaySkipped ? 'skipped' : displayCancelled ? 'cancelled' : 'completed'}
+        tone="resolved"
       >
-        <div className="flex items-center gap-2 py-3 px-4 border-b border-nim bg-nim-tertiary">
-          <div className="w-5 h-5 text-nim-primary shrink-0">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" className="w-full h-full">
-              <path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-              <path d="M6.06 6a2 2 0 0 1 3.88.67c0 1.33-2 2-2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-              <path d="M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </div>
-          <span className="text-sm font-semibold text-nim flex-1">
-            {statusText}
-          </span>
-          {!displayCancelled && (
-            <span
-              data-testid="ask-user-question-completed"
-              className="flex items-center gap-1 text-xs font-medium text-nim-success py-1 px-2 bg-[color-mix(in_srgb,var(--nim-success)_12%,transparent)] rounded-full"
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M10 3L4.5 8.5L2 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-              Submitted
-            </span>
-          )}
-          {displayCancelled && (
-            <span
-              data-testid="ask-user-question-cancelled"
-              className="flex items-center gap-1 text-xs font-medium text-nim-muted py-1 px-2 bg-nim-tertiary rounded-full"
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M9 3L3 9M3 3l6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-              Cancelled
-            </span>
-          )}
-        </div>
+        <InteractiveWidgetHeader
+          icon={<QuestionMarkIcon />}
+          title={statusText}
+          trailing={
+            displaySkipped ? (
+              <WidgetStatusPill tone="muted" testId="ask-user-question-skipped">
+                Skipped
+              </WidgetStatusPill>
+            ) : displayCancelled ? (
+              <WidgetStatusPill tone="muted" testId="ask-user-question-cancelled">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M9 3L3 9M3 3l6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+                Cancelled
+              </WidgetStatusPill>
+            ) : (
+              <WidgetStatusPill tone="success" testId="ask-user-question-completed">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M10 3L4.5 8.5L2 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+                Submitted
+              </WidgetStatusPill>
+            )
+          }
+        />
 
-        <div className="p-3 flex flex-col gap-3">
+        <InteractiveWidgetBody>
+          {displaySkipped && (
+            <WidgetNoteRow rootClassName="ask-user-question-skipped-note" testId="ask-user-question-skipped-note">
+              You sent a new message instead of answering.
+            </WidgetNoteRow>
+          )}
           {questions.map((question, qIndex) => {
             const answer = displayAnswers[question.question];
 
             return (
-              <div key={qIndex} className="bg-nim border border-nim rounded-md p-3">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-[0.6875rem] font-semibold uppercase tracking-wide text-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_12%,transparent)] py-0.5 px-2 rounded-full">{question.header}</span>
-                  {question.multiSelect && (
-                    <span className="text-[0.6875rem] text-nim-faint italic">Multiple selection</span>
-                  )}
-                </div>
-                <div className="text-sm text-nim leading-normal mb-3">
-                  {question.question}
-                </div>
-                <div className="flex flex-col gap-1.5">
+              <WidgetBlock
+                key={qIndex}
+                tag={question.header}
+                hint={question.multiSelect ? 'Multiple selection' : undefined}
+                question={question.question}
+              >
+                <WidgetOptionList>
                   {question.options.map((option, oIndex) => {
                     const isSelected = question.multiSelect
                       ? (answer?.split(', ') || []).includes(option.label)
                       : answer === option.label;
 
                     return (
-                      <div
+                      <WidgetOptionRow
                         key={oIndex}
-                        className={`flex items-start gap-2 py-2 px-2.5 rounded border cursor-default ${
-                          isSelected
-                            ? 'border-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_8%,var(--nim-bg-secondary))]'
-                            : 'border-nim bg-nim-secondary'
-                        }`}
-                      >
-                        <div className={`w-4 h-4 mt-0.5 shrink-0 border rounded-sm flex items-center justify-center ${
-                          isSelected
-                            ? 'bg-nim-primary border-nim-primary text-nim-on-primary'
-                            : 'bg-nim border-nim text-nim-primary'
-                        }`}>
-                          {isSelected && (
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
-                              <path d="M8.5 2.5L3.75 7.25L1.5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                            </svg>
-                          )}
-                        </div>
-                        <div className="flex flex-col gap-0.5 flex-1 min-w-0">
-                          <span className="text-[0.8125rem] font-medium text-nim leading-snug">{option.label}</span>
-                          {option.description && (
-                            <span className="text-xs text-nim-muted leading-snug">{option.description}</span>
-                          )}
-                        </div>
-                      </div>
+                        label={option.label}
+                        description={option.description || undefined}
+                        selected={isSelected}
+                      />
                     );
                   })}
-                </div>
+                </WidgetOptionList>
                 {answer && (
                   <div className="mt-2 pt-2 border-t border-nim text-xs text-nim-muted italic">
                     Selected: {answer}
                   </div>
                 )}
-              </div>
+              </WidgetBlock>
             );
           })}
-        </div>
-      </div>
+        </InteractiveWidgetBody>
+      </InteractiveWidgetCard>
     );
   }
 
@@ -541,79 +546,51 @@ export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
   // returned a bare "Waiting..." header with no question body, which made the
   // widget look broken after switching to Files mode and back.
   return (
-    <div
-      data-testid="ask-user-question-widget"
-      data-state="pending"
-      className="ask-user-question-widget rounded-lg bg-nim-secondary border border-nim-primary overflow-hidden"
+    <InteractiveWidgetCard
+      rootClassName="ask-user-question-widget"
+      testId="ask-user-question-widget"
+      state="pending"
+      tone="active"
     >
-      <div className="flex items-center gap-2 py-3 px-4 border-b border-nim bg-nim-tertiary">
-        <div className="w-5 h-5 text-nim-primary shrink-0">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" className="w-full h-full">
-            <path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M6.06 6a2 2 0 0 1 3.88.67c0 1.33-2 2-2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </div>
-        <span className="text-sm font-semibold text-nim flex-1">
-          Questions from Claude
-        </span>
-        {!host && (
-          <span data-testid="ask-user-question-pending" className="text-xs text-nim-muted">Waiting...</span>
-        )}
-      </div>
+      <InteractiveWidgetHeader
+        icon={<QuestionMarkIcon />}
+        title="Questions from Claude"
+        trailing={
+          !host ? (
+            <span data-testid="ask-user-question-pending" className="text-xs text-nim-muted">Waiting...</span>
+          ) : undefined
+        }
+      />
 
-      <div className="p-3 flex flex-col gap-3">
+      <InteractiveWidgetBody>
         {questions.map((question, qIndex) => {
           const selectedOptions = selections[question.question] || [];
 
           return (
-            <div key={qIndex} className="bg-nim border border-nim rounded-md p-3">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[0.6875rem] font-semibold uppercase tracking-wide text-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_12%,transparent)] py-0.5 px-2 rounded-full">{question.header}</span>
-                {question.multiSelect && (
-                  <span className="text-[0.6875rem] text-nim-faint italic">Select multiple</span>
-                )}
-              </div>
-              <div className="text-sm text-nim leading-normal mb-3">
-                {question.question}
-              </div>
-              <div className="flex flex-col gap-1.5">
+            <WidgetBlock
+              key={qIndex}
+              tag={question.header}
+              hint={question.multiSelect ? 'Select multiple' : undefined}
+              question={question.question}
+            >
+              <WidgetOptionList>
                 {question.options.map((option, oIndex) => {
                   const isSelected = selectedOptions.includes(option.label);
 
                   return (
-                    <button
+                    <WidgetOptionRow
                       key={oIndex}
-                      type="button"
-                      data-testid="ask-user-question-option"
-                      data-option-label={option.label}
-                      data-selected={isSelected}
-                      onClick={() => handleOptionToggle(question, option.label)}
+                      testId="ask-user-question-option"
+                      dataAttributes={{
+                        'data-option-label': option.label,
+                        'data-selected': isSelected,
+                      }}
+                      label={option.label}
+                      description={option.description || undefined}
+                      selected={isSelected}
+                      onSelect={() => handleOptionToggle(question, option.label)}
                       disabled={isSubmitting}
-                      className={`flex items-start gap-2 py-2 px-2.5 rounded border transition-all duration-150 cursor-pointer text-left bg-transparent disabled:opacity-50 disabled:cursor-not-allowed ${
-                        isSelected
-                          ? 'border-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_8%,var(--nim-bg-secondary))]'
-                          : 'border-nim bg-nim-secondary hover:bg-nim-hover'
-                      }`}
-                    >
-                      <div className={`w-4 h-4 mt-0.5 shrink-0 border rounded-sm flex items-center justify-center transition-colors ${
-                        isSelected
-                          ? 'bg-nim-primary border-nim-primary text-nim-on-primary'
-                          : 'bg-nim border-nim text-nim-primary'
-                      }`}>
-                        {isSelected && (
-                          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M8.5 2.5L3.75 7.25L1.5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                          </svg>
-                        )}
-                      </div>
-                      <div className="flex flex-col gap-0.5 flex-1 min-w-0">
-                        <span className="text-[0.8125rem] font-medium text-nim leading-snug">{option.label}</span>
-                        {option.description && (
-                          <span className="text-xs text-nim-muted leading-snug">{option.description}</span>
-                        )}
-                      </div>
-                    </button>
+                    />
                   );
                 })}
                 {/* "Other" option with inline text input */}
@@ -666,33 +643,31 @@ export const AskUserQuestionWidget: React.FC<CustomToolWidgetProps> = ({
                     </div>
                   )}
                 </div>
-              </div>
-            </div>
+              </WidgetOptionList>
+            </WidgetBlock>
           );
         })}
 
         {/* Action buttons */}
-        <div className="flex gap-2 justify-end pt-2 border-t border-nim">
-          <button
-            type="button"
-            data-testid="ask-user-question-cancel"
+        <WidgetFooter>
+          <WidgetActionButton
+            variant="secondary"
+            testId="ask-user-question-cancel"
             onClick={handleCancel}
             disabled={isSubmitting || !host}
-            className="px-3 py-1.5 rounded-md text-[13px] cursor-pointer border border-nim transition-colors duration-150 hover:bg-nim-hover bg-nim-tertiary text-nim-muted disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Cancel
-          </button>
-          <button
-            type="button"
-            data-testid="ask-user-question-submit"
+          </WidgetActionButton>
+          <WidgetActionButton
+            variant="primary"
+            testId="ask-user-question-submit"
             onClick={handleSubmit}
             disabled={!allAnswered || isSubmitting || !host}
-            className="px-4 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border-none transition-colors duration-150 hover:opacity-90 bg-nim-primary text-nim-on-primary disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isSubmitting ? 'Submitting...' : 'Submit'}
-          </button>
-        </div>
-      </div>
-    </div>
+          </WidgetActionButton>
+        </WidgetFooter>
+      </InteractiveWidgetBody>
+    </InteractiveWidgetCard>
   );
 };

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  parseTrackerReferenceHref,
   resolveTranscriptFilePathFromHref,
+  resolveTranscriptFileTargetFromHref,
   transcriptUrlTransform,
 } from '../MarkdownRenderer';
 
@@ -160,5 +162,70 @@ describe('transcriptUrlTransform', () => {
     expect(transcriptUrlTransform('nimbalyst://NIM-1315')).toBe(
       'nimbalyst://NIM-1315'
     );
+  });
+});
+
+describe('parseTrackerReferenceHref', () => {
+  it('accepts tracker issue-key and local-id URNs only', () => {
+    expect(parseTrackerReferenceHref('nimbalyst://NIM-123')).toBe('NIM-123');
+    expect(parseTrackerReferenceHref('nimbalyst://tk_a1b2c3')).toBe('tk_a1b2c3');
+    expect(
+      parseTrackerReferenceHref('nimbalyst://action/open-project-manager'),
+    ).toBeNull();
+    expect(parseTrackerReferenceHref('nimbalyst://doc/document-1')).toBeNull();
+  });
+});
+
+describe('resolveTranscriptFileTargetFromHref', () => {
+  it('keeps the line and column a link carried', () => {
+    expect(resolveTranscriptFileTargetFromHref('/Users/test/src/file.ts:42:7')).toEqual({
+      path: '/Users/test/src/file.ts',
+      line: 42,
+      column: 7,
+    });
+  });
+
+  it('keeps a bare line with no column', () => {
+    expect(
+      resolveTranscriptFileTargetFromHref('/Users/test/plans/design.md:653')
+    ).toEqual({ path: '/Users/test/plans/design.md', line: 653 });
+  });
+
+  it('reports no location when the link has no suffix', () => {
+    expect(resolveTranscriptFileTargetFromHref('/Users/test/src/file.ts')).toEqual({
+      path: '/Users/test/src/file.ts',
+    });
+  });
+
+  // A Windows drive colon sits at the front, not the end, so the end-anchored
+  // suffix match must leave it alone -- otherwise `D:/work/x.ts` loses its drive.
+  it('does not mistake a Windows drive letter for a location', () => {
+    expect(resolveTranscriptFileTargetFromHref('D:/work/Source/icThemes.pas')).toEqual({
+      path: 'D:/work/Source/icThemes.pas',
+    });
+    expect(resolveTranscriptFileTargetFromHref('D:/work/Source/icThemes.pas:42:7')).toEqual({
+      path: 'D:/work/Source/icThemes.pas',
+      line: 42,
+      column: 7,
+    });
+  });
+
+  it('keeps the location through the Claude Code /abs/path/ prefix', () => {
+    expect(
+      resolveTranscriptFileTargetFromHref('/abs/path//Users/test/src/file.ts:236')
+    ).toEqual({ path: '/Users/test/src/file.ts', line: 236 });
+  });
+
+  // A zero line would be clamped to 1 downstream and scroll somewhere the link
+  // never pointed at, so no location is reported. The path keeps its
+  // pre-existing shape -- the suffix is still stripped, as it always was.
+  it('reports no location for an implausible line number', () => {
+    expect(resolveTranscriptFileTargetFromHref('/Users/test/src/file.ts:0')).toEqual({
+      path: '/Users/test/src/file.ts',
+    });
+  });
+
+  it('still returns null for external links', () => {
+    expect(resolveTranscriptFileTargetFromHref('https://nimbalyst.com/docs')).toBeNull();
   });
 });

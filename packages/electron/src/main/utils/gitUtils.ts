@@ -1,7 +1,9 @@
-import { execFile, execFileSync, execSync } from 'child_process';
+import { execFile, execSync } from 'child_process';
 import { readdirSync } from 'fs';
 import { relative } from 'path';
 import { promisify } from 'util';
+
+import { createGitRemoteCache } from './gitRemoteCache';
 
 const execFileAsync = promisify(execFile);
 
@@ -77,9 +79,46 @@ export function resetGitAvailableCache(): void {
   gitAvailableCache = null;
 }
 
+// `git ls-files` output is bounded by the repo's ignore rules, but an untracked
+// tree of source files can still be large. 64MB matches what the previous
+// per-directory implementation allowed; lowering it would silently erase
+// untracked files from the changed-files UI and the commit-context prompt.
+const LS_FILES_MAX_BUFFER = 64 * 1024 * 1024;
+
+// Pathspecs are passed as argv, which the OS caps (ARG_MAX: 1MB on macOS, less
+// on some platforms). A repo with thousands of untracked directories would blow
+// past that and fail the whole batch, so split into chunks well under the cap.
+// Normal repos have a handful of untracked directories and use a single chunk.
+const LS_FILES_MAX_PATHSPEC_BYTES = 96 * 1024;
+const LS_FILES_MAX_PATHSPECS_PER_CALL = 500;
+
+function chunkPathspecs(pathspecs: string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let currentBytes = 0;
+  for (const pathspec of pathspecs) {
+    const bytes = Buffer.byteLength(pathspec) + 1; // + argv NUL terminator
+    if (
+      current.length > 0 &&
+      (currentBytes + bytes > LS_FILES_MAX_PATHSPEC_BYTES ||
+        current.length >= LS_FILES_MAX_PATHSPECS_PER_CALL)
+    ) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(pathspec);
+    currentBytes += bytes;
+  }
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
 /**
- * List untracked, non-ignored files inside an untracked directory, honoring
- * `.gitignore`.
+ * List untracked, non-ignored files inside a set of untracked directories,
+ * honoring `.gitignore`, using ONE asynchronous `git ls-files` per repository.
  *
  * `git status --porcelain` collapses an untracked directory into a single
  * `?? dir/` entry. Callers that need the individual files (the edited-files UI,
@@ -87,28 +126,97 @@ export function resetGitAvailableCache(): void {
  * descends into gitignored `node_modules`/`dist`/`out` and can explode a single
  * untracked package dir into tens of thousands of paths (NIM-1782: a worktree
  * "Commit with AI" enumerated 90k files / ~3.1M tokens). `git ls-files` applies
- * the repo's ignore rules, so only files the user would actually commit return.
+ * the repo's ignore rules AND stops at nested-repository boundaries, so only
+ * files the user would actually commit return. Git stays the authority for
+ * both; do not replace this with a filesystem walk.
+ *
+ * Takes every directory at once because the previous per-directory version
+ * spawned a SYNCHRONOUS child process each time (NIM-2286): a repo with N
+ * untracked directories blocked the Electron main thread on N subprocesses.
+ * `--no-optional-locks` keeps this read-only call from touching `.git/index`
+ * and contending with concurrent git writers (NIM-2285).
  *
  * @param repoRoot Absolute path to the git working-tree root (or worktree root).
- * @param dirAbsolutePath Absolute path to the untracked directory to expand.
- * @returns File paths relative to `repoRoot`, forward-slashed (git's native
- *          output). Empty array on any git error.
+ * @param dirAbsolutePaths Absolute paths of the untracked directories to expand.
+ * @returns Map from each input directory path to the files inside it, relative
+ *          to `repoRoot` and forward-slashed (git's native output). Directories
+ *          with no git-visible files are absent from the map. Empty map on any
+ *          git error.
  */
-export function getUntrackedFilesInDirectory(repoRoot: string, dirAbsolutePath: string): string[] {
-  try {
-    const relDir = relative(repoRoot, dirAbsolutePath);
+export async function getUntrackedFilesInDirectories(
+  repoRoot: string,
+  dirAbsolutePaths: string[]
+): Promise<Map<string, string[]>> {
+  const byDirectory = new Map<string, string[]>();
+  if (dirAbsolutePaths.length === 0) {
+    return byDirectory;
+  }
+
+  // Several input paths can normalize onto the same pathspec (duplicate entries,
+  // differing separators), so keep every input that maps to a given pathspec.
+  const inputsByPathspec = new Map<string, string[]>();
+  for (const dirAbsolutePath of dirAbsolutePaths) {
+    const relDir = relative(repoRoot, dirAbsolutePath).replace(/\\/g, '/');
     // An empty pathspec would match the whole repo; scope to the directory.
     const pathspec = relDir === '' ? '.' : relDir;
-    const stdout = execFileSync(
-      'git',
-      ['ls-files', '--others', '--exclude-standard', '-z', '--', pathspec],
-      { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
-    );
-    // `-z` gives NUL-separated paths so filenames with spaces/newlines survive.
-    return stdout.split('\0').filter(Boolean);
-  } catch {
-    return [];
+    const existing = inputsByPathspec.get(pathspec);
+    if (existing) {
+      existing.push(dirAbsolutePath);
+    } else {
+      inputsByPathspec.set(pathspec, [dirAbsolutePath]);
+    }
   }
+
+  let stdout: string;
+  try {
+    const chunks = chunkPathspecs(Array.from(inputsByPathspec.keys()));
+    const outputs = await Promise.all(chunks.map(chunk => new Promise<string>((resolveOutput, rejectOutput) => {
+      execFile(
+        'git',
+        ['--no-optional-locks', 'ls-files', '--others', '--exclude-standard', '-z', '--', ...chunk],
+        { cwd: repoRoot, encoding: 'utf8', maxBuffer: LS_FILES_MAX_BUFFER },
+        (error, chunkStdout) => {
+          if (error) {
+            rejectOutput(error);
+            return;
+          }
+          resolveOutput(chunkStdout);
+        }
+      );
+    })));
+    stdout = outputs.join('\0');
+  } catch (error) {
+    // Don't swallow this silently: a failure here makes untracked files vanish
+    // from the changed-files UI with no other symptom.
+    logEbadfDiagnostic('getUntrackedFilesInDirectories', error);
+    console.error('[gitUtils] git ls-files failed while expanding untracked directories', repoRoot, error);
+    return byDirectory;
+  }
+
+  // `-z` gives NUL-separated paths so filenames with spaces/newlines survive.
+  for (const filePath of stdout.split('\0')) {
+    if (!filePath) continue;
+    // Attribute the file to the longest matching input directory. Porcelain
+    // never reports nested untracked directories (the outer one collapses the
+    // inner), but longest-match is the correct semantic regardless.
+    const parts = filePath.split('/');
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const prefix = i === 0 ? '.' : parts.slice(0, i).join('/');
+      const inputs = inputsByPathspec.get(prefix);
+      if (!inputs) continue;
+      for (const input of inputs) {
+        const list = byDirectory.get(input);
+        if (list) {
+          list.push(filePath);
+        } else {
+          byDirectory.set(input, [filePath]);
+        }
+      }
+      break;
+    }
+  }
+
+  return byDirectory;
 }
 
 /**
@@ -146,13 +254,122 @@ export function logEbadfDiagnostic(context: string, error: unknown): void {
 }
 
 /**
- * Get the normalized git remote URL for a workspace path.
+ * Get the LEGACY normalized git remote for a workspace path -- the form that
+ * existing stored hashes were computed from. See `legacyNormalizeGitRemote`.
  *
- * Runs `git remote get-url origin` asynchronously (no shell), then normalizes
- * the result by stripping protocol, git@ prefix, .git suffix, and lowercasing.
- * Returns null if the workspace is not a git repo or has no origin remote.
+ * Runs `git remote get-url origin` asynchronously (no shell). Returns null if
+ * the workspace is not a git repo or has no origin remote.
+ *
+ * Matching only. To mint a new identity, hash `normalizeGitRemote` instead --
+ * or take both forms at once from `getGitRemoteIdentities`.
  */
 export async function getNormalizedGitRemote(workspacePath: string): Promise<string | null> {
+  return legacyNormalizeGitRemote(await getRawGitRemote(workspacePath));
+}
+
+/** Both identifier forms of a workspace's `origin`, from a single git spawn. */
+export interface GitRemoteIdentities {
+  /** Credential-free. Hash THIS for anything newly written. */
+  canonical: string;
+  /** The historical form every already-stored hash was computed from. */
+  legacy: string;
+}
+
+/**
+ * Both identifier forms of a workspace's `origin` remote, or null when it has
+ * none. One `git remote get-url` spawn, because callers on the workspace-init
+ * hot path need both and must not pay twice for it.
+ */
+export async function getGitRemoteIdentities(
+  workspacePath: string,
+): Promise<GitRemoteIdentities | null> {
+  const raw = await getRawGitRemote(workspacePath);
+  const canonical = normalizeGitRemote(raw);
+  const legacy = legacyNormalizeGitRemote(raw);
+  if (!canonical || !legacy) return null;
+  return { canonical, legacy };
+}
+
+/**
+ * The canonical identifier form of a remote URL: no scheme, no userinfo, no
+ * `.git`, lowercased. Two clones of one repository normalize to the same string
+ * however each was addressed -- with an embedded token, with a bare username,
+ * over SCP-style SSH, or plainly over HTTPS.
+ *
+ * Hash THIS for every identity newly written to the server. Do not use it to
+ * look up an existing row: rows written before this existed are keyed on
+ * `legacyNormalizeGitRemote` and cannot be re-derived (SHA-256 is one-way).
+ */
+export function normalizeGitRemote(remoteUrl: string | null): string | null {
+  if (!remoteUrl) return null;
+  const trimmed = remoteUrl.trim();
+  if (!trimmed) return null;
+
+  let identity: string;
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      // `host` keeps a non-default port, which genuinely distinguishes remotes.
+      // Userinfo is dropped whole: it identifies whoever configured the clone,
+      // never the repository.
+      identity = `${parsed.host}${parsed.pathname}`;
+    } catch {
+      return null;
+    }
+  } else {
+    // SCP-style `[user@]host:org/repo.git`, which is not a parseable URL. The
+    // colon-to-slash step is what makes this form agree with the URL forms.
+    identity = trimmed.replace(/^[^/]*@/, '').replace(/:/, '/');
+  }
+
+  // Trailing slashes come off first so `repo.git/` still loses its suffix.
+  return identity
+    .replace(/\/+$/, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase() || null;
+}
+
+/**
+ * The historical identifier form. It is wrong -- it mangles `user:pass@` into
+ * a path segment, and leaves `git@` in place for `ssh://` remotes, so the same
+ * repository yields different identifiers depending on how each teammate
+ * addressed it.
+ *
+ * It survives because its output is a PERSISTED KEY, not because it is correct:
+ * every project row, D1 discovery entry, and personal-index hash written before
+ * `normalizeGitRemote` existed is a SHA-256 of this, and a one-way hash cannot
+ * be migrated. Re-keying them would silently unbind those workspaces from their
+ * organizations, including `ssh://git@host/...` remotes that carry no
+ * credentials at all and match correctly today.
+ *
+ * Use it to MATCH existing rows, alongside the canonical form. Never use it to
+ * mint a new identity.
+ */
+export function legacyNormalizeGitRemote(remoteUrl: string | null): string | null {
+  if (!remoteUrl) return null;
+  return remoteUrl
+    .replace(/^https?:\/\//, '')
+    .replace(/^git@/, '')
+    .replace(/:/, '/')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+/**
+ * The workspace's `origin` remote exactly as git reports it, or null when it
+ * has none.
+ *
+ * The normalized form above is an identifier, not an address — it has lost the
+ * scheme and its case. Anything that has to hand the remote back to git (the
+ * post-sign-in project walk's clone step) needs this one.
+ */
+export async function getRawGitRemote(workspacePath: string): Promise<string | null> {
+  return gitRemoteCache.get(workspacePath);
+}
+
+async function spawnGitRemote(workspacePath: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], {
       cwd: workspacePath,
@@ -160,19 +377,24 @@ export async function getNormalizedGitRemote(workspacePath: string): Promise<str
       timeout: 5000,
       maxBuffer: 1024 * 1024,
     });
-    const remoteUrl = stdout.trim();
-
-    if (!remoteUrl) return null;
-
-    // Normalize: strip protocol, .git suffix, trailing slashes
-    return remoteUrl
-      .replace(/^https?:\/\//, '')
-      .replace(/^git@/, '')
-      .replace(/:/, '/')
-      .replace(/\.git$/, '')
-      .replace(/\/+$/, '')
-      .toLowerCase();
+    return stdout.trim() || null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Callers walk every recent workspace on a hot path, so each one must not cost
+ * a git spawn. See `gitRemoteCache.ts` for the measurements and for why the
+ * entries expire instead of living forever.
+ */
+const gitRemoteCache = createGitRemoteCache(spawnGitRemote);
+
+/**
+ * Forget a cached `origin`. Call this after anything that can change a
+ * workspace's remote (a clone into an existing path, `git remote set-url`
+ * issued through the app), so the next lookup re-reads it.
+ */
+export function invalidateGitRemoteCache(workspacePath?: string): void {
+  gitRemoteCache.invalidate(workspacePath);
 }

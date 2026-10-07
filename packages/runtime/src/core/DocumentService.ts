@@ -90,51 +90,8 @@ export interface ExternalSourceRef {
   upstreamBodyChanged?: boolean;
 }
 
-/**
- * How a local tracker item entered Nimbalyst. Replaces the loose
- * `source`/`sourceRef` pair (kept deprecated for one release for back-compat).
- * Absent on legacy items — default to `{ kind: 'native' }` at read time via
- * {@link normalizeTrackerOrigin}.
- */
-export type TrackerOrigin =
-  | { kind: 'native' }
-  | { kind: 'inline'; filePath: string }
-  | { kind: 'frontmatter'; filePath: string }
-  | { kind: 'external'; external: ExternalSourceRef };
-
-/**
- * Identity record for tracker item authorship and attribution.
- * Email is the canonical key for matching users across orgs and login states.
- * Display info is snapshotted at write time for offline rendering.
- */
-export interface TrackerIdentity {
-  /** Email -- stable cross-org identifier, canonical key for "is this the same person?" */
-  email: string | null;
-  /** Display name snapshotted at write time */
-  displayName: string;
-  /** Git user.name (fallback matching when no email) */
-  gitName: string | null;
-  /** Git user.email (fallback matching when no email) */
-  gitEmail: string | null;
-}
-
-/**
- * Activity log entry for tracker item mutations.
- * Stored as a JSONB array on the tracker item's data.activity field.
- */
-export interface TrackerActivity {
-  id: string;
-  authorIdentity: TrackerIdentity;
-  action: 'created' | 'updated' | 'commented' | 'comment_updated' | 'comment_deleted' | 'status_changed' | 'assigned' | 'archived' | 'type_changed';
-  /** Which field changed (for 'updated' actions) */
-  field?: string;
-  /** Previous value */
-  oldValue?: string;
-  /** New value */
-  newValue?: string;
-  /** Epoch ms */
-  timestamp: number;
-}
+import type { TrackerActivity, TrackerIdentity, TrackerOrigin } from '@nimbalyst/tracker-core';
+export type { TrackerActivity, TrackerIdentity, TrackerOrigin } from '@nimbalyst/tracker-core';
 
 /**
  * Tracker item entry in the database cache
@@ -145,6 +102,12 @@ export interface TrackerItem {
   issueNumber?: number;
   /** Human-readable key like NIM-123 assigned by the shared tracker room. */
   issueKey?: string;
+  /**
+   * This machine's private number for the item, like NIM.12 -- a dot, never a
+   * dash. Never synced, and the same value on another machine means a
+   * different item, so it is a private handle rather than a shared reference.
+   */
+  localKey?: string;
   type: TrackerItemType;
   /** All type tags including primary type. Enables multi-type items. */
   typeTags?: string[];

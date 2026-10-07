@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import {
   BUILTIN_RELATIONSHIP_TYPES,
@@ -11,7 +12,8 @@ import {
   deriveRelationshipEdges,
   computeInverseFieldDeltas,
 } from '../trackerRelationships';
-import type { FieldDefinition, TrackerRelationshipValue } from '../TrackerDataModel';
+import { parseBuiltinTrackers } from '../ModelLoader';
+import type { FieldDefinition, TrackerRelationshipValue } from '@nimbalyst/tracker-schema';
 
 /**
  * Epic C Phase 1: pure relationship value-model. Field-backed relationships sync
@@ -64,6 +66,27 @@ describe('normalizeRelationshipValue', () => {
 
   it('drops entries with no resolvable id', () => {
     expect(normalizeRelationshipValue([{ title: 'no id' }, ''])).toEqual([]);
+  });
+
+  // The coercer is an allow-list, so a key it does not name is dropped -- and
+  // `addRelationshipValue` normalizes the EXISTING entries before appending,
+  // which is how adding a second target silently strips the first one's pinned
+  // revision (contract 4.2). Relations carry no qualifiers, so a stale bag is
+  // the one key that SHOULD go.
+  it('carries the pinned revision through an add and drops a stale qualifier bag', () => {
+    const pinned = {
+      itemId: 'a',
+      revisionId: '9f2c1d4a-7b31-4e59-a0c8-5d6e2f1b3a77',
+      serverRevision: 4,
+      qualifiers: { operations: ['read'] },
+    } as TrackerRelationshipValue;
+    const next = addRelationshipValue(relField(), [pinned], { itemId: 'b' });
+    const kept = next.find((v) => v.itemId === 'a');
+    expect(kept).toMatchObject({
+      revisionId: '9f2c1d4a-7b31-4e59-a0c8-5d6e2f1b3a77',
+      serverRevision: 4,
+    });
+    expect(kept).not.toHaveProperty('qualifiers');
   });
 });
 
@@ -219,5 +242,53 @@ describe('computeInverseFieldDeltas (Phase 3)', () => {
 
   it('no-ops when the target set is unchanged', () => {
     expect(computeInverseFieldDeltas(def, source, [{ itemId: 'bug-1' }], [{ itemId: 'bug-1' }])).toEqual([]);
+  });
+
+  it('materializes and reverses a cross-type builtin bug-to-plan dependency', () => {
+    const models = new Map(parseBuiltinTrackers().map((model) => [model.type, model]));
+    const bugDependsOn = models.get('bug')!.fields.find((field) => field.name === 'dependsOn')!;
+    const planBlocks = models.get('plan')!.fields.find((field) => field.name === 'blocks')!;
+
+    expect(validateRelationshipValue(
+      bugDependsOn,
+      [{ itemId: 'plan-1', trackerType: 'plan' }],
+      { sourceItemId: 'bug-1' },
+    )).toEqual([]);
+
+    const [materializeOnPlan] = computeInverseFieldDeltas(
+      bugDependsOn,
+      { itemId: 'bug-1', issueKey: 'NIM-1', trackerType: 'bug' },
+      [],
+      [{ itemId: 'plan-1', trackerType: 'plan' }],
+    );
+    expect(materializeOnPlan).toMatchObject({
+      targetItemId: 'plan-1',
+      inverseFieldId: planBlocks.name,
+      op: 'add',
+      value: {
+        itemId: 'bug-1',
+        trackerType: 'bug',
+        relationshipTypeKey: 'blocks',
+      },
+    });
+
+    const materializedBlocks = addRelationshipValue(planBlocks, undefined, materializeOnPlan.value);
+    expect(computeInverseFieldDeltas(
+      planBlocks,
+      { itemId: 'plan-1', trackerType: 'plan' },
+      [],
+      materializedBlocks,
+    )).toEqual([
+      expect.objectContaining({
+        targetItemId: 'bug-1',
+        inverseFieldId: bugDependsOn.name,
+        op: 'add',
+        value: expect.objectContaining({
+          itemId: 'plan-1',
+          trackerType: 'plan',
+          relationshipTypeKey: 'depends-on',
+        }),
+      }),
+    ]);
   });
 });

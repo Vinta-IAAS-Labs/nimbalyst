@@ -14,6 +14,7 @@ running either.
 | --- | --- | --- |
 | `data->'key'` sub-extraction | returns parsed JS object/value | returns JSON-encoded TEXT |
 | Whole-column JSONB read | parsed object | TEXT (already handled at most call sites) |
+| Boolean column read | `true` / `false` | `1` / `0` (column is `INTEGER`) |
 | Concurrent writers | single worker; PID lock | WriteCoordinator serializes write lane |
 
 **JSONB sub-extraction is not shape-uniform.** A query like
@@ -33,6 +34,19 @@ A real bug from this divergence (2026-06-02): `applyRemoteItem` in
 was a parsed object, and on SQLite produced corrupted tracker rows whose
 `labelsMap` was a hybrid character-keyed string spread with the real CRDT
 entries merged on top.
+
+**Boolean columns need coercion on both sides.** SQLite declares them `INTEGER`
+and hands back `0`/`1`, so a `row.flag ?? false` mapping (which only guards
+null/undefined) leaks a number into a value typed `boolean`. Truthiness checks
+keep working, which is what makes this hard to spot -- only strict comparisons
+(`=== false`, `=== true`) silently go the wrong way. Bind writes through
+`toDbBoolean` and normalize reads through `fromDbBoolean`
+(`src/main/services/tracker/trackerDbValue.ts`).
+
+Two real bugs from this divergence: PGLite rejected integer flags on write
+(`Invalid input for boolean type`, NIM-864), and on SQLite an un-normalized
+`archived` made every Trackers sidebar type badge read 0 while the list and
+kanban still showed the items (NIM-2280 / #1071).
 
 **CRITICAL: Never use localStorage in the renderer process.** All persistent state must be stored via IPC to the main process using either:
 - **app-settings store** (`src/main/utils/store.ts`) for global app settings
@@ -66,6 +80,8 @@ Past incident (NIM-899): the transcript backfill ran un-awaited at startup with 
 - **`project_state`**: Per-project state including window bounds, UI layout, open tabs, file tree, and editor settings
 - **`session_state`**: Global session restoration data for windows and focus order
 - **`document_history`**: Compressed document edit history with binary content storage
+- **`personal_page_documents`**, **`personal_page_type_placements`**, **`personal_page_item_placements`**: Per-workspace personal pages (no account needed), one page tree: pages with their markdown body, body version and sibling `sort_order` (null until the group is first reordered), tracker-type placements and typed-page (tracker item) placements. Every parent column has a `parent_kind` beside it (`'page'`, or `'item'` when the parent is a tracker item id; schema 0051). Owned by `PersonalPagesService`; body snapshots go to `document_history` under `personal-doc://<documentId>`
+- **`personal_page_folders`**: The personal folder tree from before schema 0050, kept read-only as a recoverable record (`converted_at` marks each folder once its page exists)
 
 ## Data Locations (macOS)
 

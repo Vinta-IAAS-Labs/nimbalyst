@@ -1,13 +1,14 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createStore } from 'jotai';
 import {
-  convertToWorkstreamAtom,
+  transferSessionStateToWrapperAtom,
   initWorkstreamState,
   workstreamStateAtom,
 } from '../workstreamState';
 
 /**
- * Unit tests for convertToWorkstreamAtom covering both:
+ * Unit tests for transferSessionStateToWrapperAtom covering both:
  *   - the sibling-creation path (existing behavior)
  *   - the drag-drop path (new: siblingId omitted)
  *
@@ -16,7 +17,7 @@ import {
  * fully-initialized behavior so future refactors can't silently regress it.
  */
 
-describe('convertToWorkstreamAtom', () => {
+describe('transferSessionStateToWrapperAtom', () => {
   let store: ReturnType<typeof createStore>;
   const sessionId = 'session-original';
   const parentId = 'parent-workstream';
@@ -30,7 +31,7 @@ describe('convertToWorkstreamAtom', () => {
 
   describe('with siblingId (normal conversion)', () => {
     it('initializes parent state with both children and sibling as active', () => {
-      store.set(convertToWorkstreamAtom, { sessionId, parentId, siblingId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId, siblingId });
 
       const parent = store.get(workstreamStateAtom(parentId));
       expect(parent.type).toBe('workstream');
@@ -39,7 +40,7 @@ describe('convertToWorkstreamAtom', () => {
     });
 
     it('clears the original session state to type=single', () => {
-      store.set(convertToWorkstreamAtom, { sessionId, parentId, siblingId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId, siblingId });
 
       const original = store.get(workstreamStateAtom(sessionId));
       expect(original.type).toBe('single');
@@ -48,7 +49,7 @@ describe('convertToWorkstreamAtom', () => {
     });
 
     it('initializes sibling state to defaults', () => {
-      store.set(convertToWorkstreamAtom, { sessionId, parentId, siblingId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId, siblingId });
 
       const sibling = store.get(workstreamStateAtom(siblingId));
       expect(sibling.type).toBe('single');
@@ -65,7 +66,7 @@ describe('convertToWorkstreamAtom', () => {
         sessionChatSessionIds: { [sessionId]: 'paired-chat' },
       });
 
-      store.set(convertToWorkstreamAtom, { sessionId, parentId, siblingId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId, siblingId });
 
       const parent = store.get(workstreamStateAtom(parentId));
       expect(parent.layoutMode).toBe('editor');
@@ -78,7 +79,7 @@ describe('convertToWorkstreamAtom', () => {
 
   describe('without siblingId (drag-drop conversion)', () => {
     it('initializes parent with the original session as the only child', () => {
-      store.set(convertToWorkstreamAtom, { sessionId, parentId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId });
 
       const parent = store.get(workstreamStateAtom(parentId));
       expect(parent.type).toBe('workstream');
@@ -87,7 +88,7 @@ describe('convertToWorkstreamAtom', () => {
     });
 
     it('still clears the original session state to type=single', () => {
-      store.set(convertToWorkstreamAtom, { sessionId, parentId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId });
 
       const original = store.get(workstreamStateAtom(sessionId));
       expect(original.type).toBe('single');
@@ -102,7 +103,7 @@ describe('convertToWorkstreamAtom', () => {
         filesSidebarVisible: true,
       });
 
-      store.set(convertToWorkstreamAtom, { sessionId, parentId });
+      store.set(transferSessionStateToWrapperAtom, { sessionId, parentId });
 
       const parent = store.get(workstreamStateAtom(parentId));
       expect(parent.layoutMode).toBe('split');

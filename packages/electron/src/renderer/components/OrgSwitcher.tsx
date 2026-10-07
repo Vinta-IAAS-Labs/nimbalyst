@@ -14,13 +14,31 @@
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
 import {
   useFloating, offset, flip, shift, autoUpdate,
   FloatingPortal, useClick, useDismiss, useRole, useInteractions,
 } from '@floating-ui/react';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { activeWorkspacePathAtom } from '../store/atoms/openProjects';
+import { useProjectOrg } from '../hooks/useProjectOrg';
+import { orgProjectWalkAtom } from '../store/atoms/orgProjectWalk';
+import { openOrgProjectWalk } from '../store/listeners/orgProjectWalkListeners';
+import { organizationCreationEnabled } from '../store/atoms/settingsDomains';
+import { dialogRef } from '../contexts/DialogContext';
+// The registry/context directly rather than the `dialogs` barrel, which would
+// pull every dialog component into this rail element.
+import { DIALOG_IDS } from '../dialogs/registry';
+import type { AdminTab } from './TeamMode/orgWindowState';
+import { teamInboxSnapshotAtom } from '../store/atoms/teamInbox';
+import { setWindowModeAtom } from '../store/atoms/windowMode';
+import { resolveOrgMessagingDestination } from '../../shared/orgMessagingRouting';
+import {
+  formatUnreadCount,
+  selectProjectWindowUnreadSummary,
+} from '../store/projectWindowUnreadViewModel';
+import './OrgSwitcher.css';
 
 interface OrgEntry {
   orgId: string;
@@ -39,9 +57,20 @@ function initials(name: string): string {
 
 export function OrgSwitcher() {
   const activePath = useAtomValue(activeWorkspacePathAtom);
+  const inboxSnapshot = useAtomValue(teamInboxSnapshotAtom);
+  // These rows open the org's MESSAGES, which is not a way into its project.
+  // For a member with nothing bound here, that is the actual dead end.
+  const projectWalk = useAtomValue(orgProjectWalkAtom);
+  const setWindowMode = useSetAtom(setWindowModeAtom);
+
+  // The project's organization comes from the shared hook rather than a second
+  // `findForWorkspace` here. This element used to hold the answer in state that
+  // no workspace switch cleared, so the menu rendered — and routed — against
+  // the previous project's org while the new lookup was still in flight.
+  const { org: projectOrg, loading: projectOrgLoading } = useProjectOrg();
+  const activeOrgId = projectOrg?.orgId ?? null;
 
   const [orgs, setOrgs] = useState<OrgEntry[]>([]);
-  const [activeOrgId, setActiveOrgId] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [pendingInviteCount, setPendingInviteCount] = useState(0);
   const [pendingOrgId, setPendingOrgId] = useState<string | null>(null);
@@ -72,33 +101,34 @@ export function OrgSwitcher() {
           setPendingOrgId(pending[0]?.orgId ?? null);
         }
         if (!cancelled) setOrgs(entries);
-
-        if (activePath) {
-          const found = await api()?.team?.findForWorkspace(activePath);
-          if (!cancelled) setActiveOrgId(found?.team?.orgId ?? null);
-        } else if (!cancelled) {
-          setActiveOrgId(entries[0]?.orgId ?? null);
-        }
       } catch {
-        if (!cancelled) {
-          setOrgs([]);
-          setActiveOrgId(null);
-        }
+        if (!cancelled) setOrgs([]);
       }
     })();
     return () => { cancelled = true; };
+    // The directory is account-scoped, not workspace-scoped, but moving between
+    // projects is also the moment a membership acquired elsewhere should show
+    // up here — so the path stays a refresh trigger even though it is not read.
   }, [activePath, directoryNonce]);
 
   const activeOrg = useMemo(
     () => orgs.find((o) => o.orgId === activeOrgId) ?? orgs[0] ?? null,
     [orgs, activeOrgId],
   );
+  const unreadSummary = useMemo(
+    () => selectProjectWindowUnreadSummary(inboxSnapshot),
+    [inboxSnapshot],
+  );
+  const unreadByOrg = useMemo(
+    () => new Map(unreadSummary.orgs.map((org) => [org.orgId, org.unreadCount])),
+    [unreadSummary.orgs],
+  );
 
   const { refs, floatingStyles, context } = useFloating({
     open,
     onOpenChange: setOpen,
     placement: 'right-start',
-    middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 })],
+    middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
     whileElementsMounted: autoUpdate,
   });
   const click = useClick(context);
@@ -110,13 +140,29 @@ export function OrgSwitcher() {
   // the personal org and no teams (keeps the rail clean for solo users).
   if (orgs.length === 0 && pendingInviteCount === 0) return null;
 
-  // Org administration opens in its own window (2026-07-17 decision-log
-  // correction), not a mode inside the project window.
-  const goToTeamSurface = (orgId?: string) => {
+  // The rows above the divider are this menu's unread list. The project org
+  // stays in this window's Org mode; another org uses the retargetable window.
+  const openOrgMessages = (orgId?: string) => {
     setOpen(false);
     const target = orgId ?? activeOrg?.orgId;
     if (!target) return;
+    // An unresolved lookup cannot be read as "this is the project's org". The
+    // window shows any org correctly; the mode would show a different one than
+    // the row the user clicked.
+    if (!projectOrgLoading && resolveOrgMessagingDestination(activeOrgId, target) === 'project-mode') {
+      setWindowMode('org');
+      return;
+    }
     void api()?.team?.openManagementWindow({ orgId: target, workspacePath: activePath ?? undefined });
+  };
+
+  // Administration is a dialog in this window rather than a second one
+  // (NIM-2322).
+  const openOrgManagement = (orgId?: string, initialTab?: AdminTab) => {
+    setOpen(false);
+    const target = orgId ?? activeOrg?.orgId;
+    if (!target) return;
+    dialogRef.current?.open(DIALOG_IDS.ORG_MANAGEMENT, { orgId: target, initialTab });
   };
 
   return (
@@ -130,6 +176,15 @@ export function OrgSwitcher() {
         aria-label="Switch organization"
       >
         {activeOrg ? initials(activeOrg.name) : <MaterialSymbol icon="corporate_fare" size={18} />}
+        {unreadSummary.totalUnread > 0 && (
+          <span
+            className="org-switcher-unread-badge"
+            data-testid="org-switcher-unread-badge"
+            aria-label={`${unreadSummary.totalUnread} unread across organizations`}
+          >
+            {formatUnreadCount(unreadSummary.totalUnread)}
+          </span>
+        )}
       </button>
 
       {open && (
@@ -138,54 +193,89 @@ export function OrgSwitcher() {
             ref={refs.setFloating}
             style={floatingStyles}
             {...getFloatingProps()}
-            className="org-switcher-menu z-[1000] min-w-[220px] bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-lg shadow-lg py-1.5"
+            className="org-switcher-menu z-[1000] min-w-[260px] bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-lg shadow-lg py-1.5"
           >
             <div className="px-3 py-1.5 text-[10px] uppercase tracking-wide text-[var(--nim-text-faint)]">
-              Organizations
+              Unread messages
             </div>
             {orgs.map((o) => (
               <button
                 key={o.orgId}
                 className={`org-switcher-item w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--nim-bg-secondary)] ${o.orgId === activeOrgId ? 'bg-[var(--nim-bg-secondary)]' : ''}`}
-                onClick={() => goToTeamSurface(o.orgId)}
+                data-testid={`org-switcher-org-row-${o.orgId}`}
+                onClick={() => openOrgMessages(o.orgId)}
               >
-                <span className="w-6 h-6 rounded bg-gradient-to-br from-[#60a5fa] to-[#a78bfa] text-white text-[10px] font-semibold flex items-center justify-center shrink-0">
+                <span className="org-switcher-org-avatar w-6 h-6 rounded bg-gradient-to-br from-[#60a5fa] to-[#a78bfa] text-white text-[10px] font-semibold flex items-center justify-center shrink-0">
                   {initials(o.name)}
                 </span>
                 <span className="flex-1 min-w-0">
                   <span className="block text-[13px] text-[var(--nim-text)] truncate">{o.name}</span>
-                  <span className="block text-[10px] text-[var(--nim-text-faint)] font-mono">{o.role}</span>
+                  <span className="block text-[10px] text-[var(--nim-text-faint)]">
+                    {(unreadByOrg.get(o.orgId) ?? 0) > 0
+                      ? `${unreadByOrg.get(o.orgId)} unread`
+                      : 'No unread messages'}
+                  </span>
                 </span>
-                {o.orgId === activeOrgId && <MaterialSymbol icon="check" size={14} className="text-[var(--nim-text-muted)]" />}
+                {(unreadByOrg.get(o.orgId) ?? 0) > 0 ? (
+                  <span className="org-switcher-row-unread-pill">
+                    {formatUnreadCount(unreadByOrg.get(o.orgId) ?? 0)}
+                  </span>
+                ) : (
+                  o.orgId === activeOrgId && <MaterialSymbol icon="check" size={14} className="text-[var(--nim-text-muted)]" />
+                )}
               </button>
             ))}
             {pendingInviteCount > 0 && (
               <button className="org-switcher-pending-invites w-full px-3 py-2 text-left text-xs text-[var(--nim-link)] hover:bg-[var(--nim-bg-secondary)]" data-testid="org-switcher-pending-invites" onClick={() => {
                 setOpen(false);
-                if (pendingOrgId) goToTeamSurface(pendingOrgId);
+                // An invitation is acted on in the Members panel, so this lands
+                // on that tab rather than the organization's default one.
+                if (pendingOrgId) openOrgManagement(pendingOrgId, 'members');
               }}>
                 {pendingInviteCount} pending invitation{pendingInviteCount === 1 ? '' : 's'}
               </button>
             )}
             <div className="border-t border-[var(--nim-border)] mt-1 pt-1">
+              {projectWalk.enterableOrgs[0] && (
+                <button
+                  className="org-switcher-join-project w-full flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--nim-text)] hover:bg-[var(--nim-bg-secondary)]"
+                  data-testid="org-switcher-join-project"
+                  onClick={() => {
+                    setOpen(false);
+                    openOrgProjectWalk();
+                  }}
+                >
+                  <MaterialSymbol icon="drive_folder_upload" size={14} />
+                  Join {projectWalk.enterableOrgs[0].name} project
+                </button>
+              )}
               <button
                 className="w-full flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-secondary)]"
-                onClick={() => goToTeamSurface()}
+                data-testid="org-switcher-manage-organization"
+                onClick={() => openOrgManagement()}
               >
                 <MaterialSymbol icon="settings" size={14} />
                 Manage organization…
               </button>
-              <button
-                className="org-switcher-new-organization w-full flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-secondary)]"
-                data-testid="org-switcher-new-organization"
-                onClick={() => {
-                  setOpen(false);
-                  void api()?.team?.openManagementWindow({ workspacePath: activePath ?? undefined });
-                }}
-              >
-                <MaterialSymbol icon="add" size={14} />
-                New organization
-              </button>
+              {/* Opening the org window untargeted dumped the user on a create
+                  card in a window for an organization that does not exist yet.
+                  The wizard is the one place an org is created, and it starts
+                  in this window. */}
+              {organizationCreationEnabled && (
+                <button
+                  className="org-switcher-new-organization w-full flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-secondary)]"
+                  data-testid="org-switcher-new-organization"
+                  onClick={() => {
+                    setOpen(false);
+                    dialogRef.current?.open(DIALOG_IDS.ORG_CREATION_WIZARD, {
+                      onOrganizationCreated: () => setDirectoryNonce((nonce) => nonce + 1),
+                    });
+                  }}
+                >
+                  <MaterialSymbol icon="add" size={14} />
+                  New organization
+                </button>
+              )}
             </div>
           </div>
         </FloatingPortal>

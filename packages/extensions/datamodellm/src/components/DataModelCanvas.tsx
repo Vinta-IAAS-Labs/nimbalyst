@@ -22,11 +22,14 @@ import {
   applyEdgeChanges,
   type NodeTypes,
   type EdgeTypes,
+  type OnNodeDrag,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { EntityNode, type EntityNodeData } from './EntityNode';
 import { RelationshipEdge, type RelationshipEdgeData } from './RelationshipEdge';
 import type { DataModelStoreApi } from '../store';
+import { useLayout } from '../layout/useLayout';
+import { indexPresences, type RemotePresence } from '../collab/presence';
 
 interface DataModelCanvasProps {
   store: DataModelStoreApi;
@@ -40,14 +43,26 @@ interface DataModelCanvasProps {
    * Used by inline embeds when in view mode.
    */
   readOnly?: boolean;
+  /**
+   * Remote collaborators' selections. Rendered as a colored ring plus a name
+   * chip on the matching entity, and a colored stroke on the matching
+   * relationship. Empty outside collaborative documents.
+   */
+  presences?: RemotePresence[];
 }
+
+/** Stable identity so a presence-free canvas never re-renders its nodes. */
+const NO_PRESENCE: RemotePresence[] = [];
 
 export interface DataModelCanvasRef {
   getCanvasElement: () => HTMLElement | null;
 }
 
 export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasProps>(
-  function DataModelCanvas({ store, theme, screenshotMode = false, readOnly = false }, ref) {
+  function DataModelCanvas(
+    { store, theme, screenshotMode = false, readOnly = false, presences = NO_PRESENCE },
+    ref,
+  ) {
     // `screenshotMode` is the legacy aggressive lock-down (pan/zoom off,
     // controls hidden, etc.); `readOnly` is the lighter "no edits but
     // still navigate" mode. Treat editing handlers as gated by either.
@@ -55,6 +70,8 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
   // Use refs to ensure stable references
   const nodeTypesRef = useRef<NodeTypes>({ entity: EntityNode as any });
   const canvasRef = useRef<HTMLDivElement>(null);
+
+  const layout = useLayout(store, canvasRef, noEdits);
 
   // Expose canvas element for screenshot capture
   useImperativeHandle(ref, () => ({
@@ -66,6 +83,8 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
   const state = store.getState();
   const { entities, relationships, database, entityViewMode, selectedEntityId, selectedRelationshipId, hoveredEntityId } =
     state;
+
+  const presenceIndex = useMemo(() => indexPresences(presences), [presences]);
 
   // Convert entities to React Flow nodes
   const nodes: Node<EntityNodeData>[] = useMemo(
@@ -81,9 +100,10 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
           viewMode: entityViewMode,
           database,
           store,
+          presences: presenceIndex.entities.get(entity.id) ?? NO_PRESENCE,
         },
       })),
-    [entities, selectedEntityId, hoveredEntityId, entityViewMode, database, store]
+    [entities, selectedEntityId, hoveredEntityId, entityViewMode, database, store, presenceIndex]
   );
 
   // Convert relationships to React Flow edges
@@ -98,52 +118,10 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
         continue;
       }
 
-      // Look up fields by name
-      const sourceField =
-        relationship.sourceFieldName && sourceEntity
-          ? sourceEntity.fields.find((f) => f.name === relationship.sourceFieldName)
-          : undefined;
-
-      const targetField =
-        relationship.targetFieldName && targetEntity
-          ? targetEntity.fields.find((f) => f.name === relationship.targetFieldName)
-          : undefined;
-
-      let sourceHandle: string;
-      let targetHandle: string;
-
-      // In compact view, always use entity-wide handles
-      const useFieldHandles = entityViewMode !== 'compact' && sourceField && targetField;
-
-      if (useFieldHandles) {
-        const dx = targetEntity.position.x - sourceEntity.position.x;
-        const sourceHandleSide = dx >= 0 ? 'right' : 'left';
-        const targetHandleSide = dx >= 0 ? 'left' : 'right';
-
-        sourceHandle = `field-${sourceField.id}-source-${sourceHandleSide}`;
-        targetHandle = `field-${targetField.id}-target-${targetHandleSide}`;
-      } else {
-        const dx = targetEntity.position.x - sourceEntity.position.x;
-        const dy = targetEntity.position.y - sourceEntity.position.y;
-
-        if (Math.abs(dx) > Math.abs(dy)) {
-          if (dx > 0) {
-            sourceHandle = 'source-right';
-            targetHandle = 'target-left';
-          } else {
-            sourceHandle = 'source-left';
-            targetHandle = 'target-right';
-          }
-        } else {
-          if (dy > 0) {
-            sourceHandle = 'source-bottom';
-            targetHandle = 'target-top';
-          } else {
-            sourceHandle = 'source-top';
-            targetHandle = 'target-bottom';
-          }
-        }
-      }
+      const route = layout.routes.get(relationship.id);
+      if (!route) continue;
+      const sourceHandle = `source-${route.source.side}`;
+      const targetHandle = `target-${route.target.side}`;
 
       validEdges.push({
         id: relationship.id,
@@ -153,12 +131,16 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
         sourceHandle,
         targetHandle,
         selected: selectedRelationshipId === relationship.id,
-        data: { relationship },
+        data: {
+          relationship,
+          route,
+          presences: presenceIndex.relationships.get(relationship.id) ?? NO_PRESENCE,
+        },
       });
     }
 
     return validEdges;
-  }, [relationships, selectedRelationshipId, entities, entityViewMode]);
+  }, [relationships, selectedRelationshipId, entities, entityViewMode, presenceIndex, layout.routes]);
 
   const [localNodes, setLocalNodes] = useNodesState(nodes);
   const [localEdges, setLocalEdges] = useEdgesState(edges);
@@ -184,11 +166,12 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
   );
 
   // Handle node drag stop - save position to store
-  const onNodeDragStop = useCallback(
-    (_event: React.MouseEvent, node: Node) => {
+  const onNodeDragStop: OnNodeDrag<Node<EntityNodeData>> = useCallback(
+    (_event, node) => {
       store.getState().updateEntity(node.id, { position: node.position });
+      layout.controller.dragEnd();
     },
-    [store]
+    [store, layout.controller]
   );
 
   const onEdgesChange = useCallback(
@@ -234,11 +217,14 @@ export const DataModelCanvas = forwardRef<DataModelCanvasRef, DataModelCanvasPro
 
   return (
     <div className="datamodel-canvas" ref={canvasRef}>
+      {layout.error && <div className="datamodel-layout-error" role="status">{layout.error}</div>}
       <ReactFlow
         nodes={localNodes}
         edges={localEdges}
         onNodesChange={noEdits ? undefined : onNodesChange}
         onEdgesChange={noEdits ? undefined : onEdgesChange}
+        onNodeDragStart={noEdits ? undefined : layout.controller.dragStart}
+        onMoveStart={(_event) => { if (_event) layout.controller.navigated(); }}
         onNodeDragStop={noEdits ? undefined : onNodeDragStop}
         onNodeClick={noEdits ? undefined : onNodeClick}
         onEdgeClick={noEdits ? undefined : onEdgeClick}

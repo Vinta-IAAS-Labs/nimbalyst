@@ -15,20 +15,27 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Same electron / ipc / chokidar mocks as the sibling TrackerSchemaService tests
 // so the real service can run headless against temp workspace dirs.
-const { mockSafeHandle, mockWatch, mockWindowSend } = vi.hoisted(() => ({
-  mockSafeHandle: vi.fn(),
-  mockWatch: vi.fn(() => ({
-    on() {
-      return this;
+const { mockSafeHandle, mockWatch, mockWindowSend, testWindows, windowWorkspaces } = vi.hoisted(() => {
+  const mockWindowSend = vi.fn();
+  return {
+    mockSafeHandle: vi.fn(),
+    mockWatch: vi.fn(() => ({
+      on() {
+        return this;
+      },
+      close: vi.fn().mockResolvedValue(undefined),
+    })),
+    mockWindowSend,
+    testWindows: {
+      list: [] as Array<{ id: number; isDestroyed: () => boolean; webContents: { send: (...args: unknown[]) => void } }>,
     },
-    close: vi.fn().mockResolvedValue(undefined),
-  })),
-  mockWindowSend: vi.fn(),
-}));
+    windowWorkspaces: new Map<number, string>(),
+  };
+});
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/tmp'),
+    getPath: (await import('../../../../test-stubs/privateUserData')).testApp.getPath,
     isPackaged: false,
     getName: vi.fn(() => 'Nimbalyst'),
     getVersion: vi.fn(() => '0.0.0-test'),
@@ -40,8 +47,13 @@ vi.mock('electron', () => ({
     quit: vi.fn(),
   },
   BrowserWindow: {
-    getAllWindows: () => [{ webContents: { send: mockWindowSend } }],
+    getAllWindows: () => testWindows.list,
   },
+}));
+
+vi.mock('../../window/windowState', () => ({
+  getWindowIdForWindow: (win: { id: number }) => win.id,
+  resolveActiveWorkspacePathForWindowId: (id: number) => windowWorkspaces.get(id),
 }));
 
 vi.mock('../../utils/ipcRegistry', () => ({
@@ -59,6 +71,14 @@ vi.mock('chokidar', () => ({
 // it so this file owns its state; DB writes are best-effort and tolerate null.
 vi.mock('../../database/initialize', () => ({
   getDatabase: () => null,
+}));
+
+// Keep schema loading independent of the team/auth graph during hook setup.
+vi.mock('../TeamService', () => ({
+  findTeamForWorkspace: vi.fn(async () => null),
+}));
+vi.mock('../TrackerIdentityService', () => ({
+  getCurrentIdentity: vi.fn(() => ({ displayName: 'Test User', email: 'test@example.com' })),
 }));
 
 interface FieldLike {
@@ -136,6 +156,42 @@ roles:
 `;
 }
 
+/**
+ * A type that exists ONLY in workspace B and is explicitly the team's. The
+ * policy read must answer `team` for it on B's behalf; a registry miss answers
+ * `personal`, so the two verdicts are distinguishable (they are not for a
+ * `sharing: personal` type, which is why `gadget` cannot carry this test).
+ */
+function sprocketYaml(): string {
+  return `packageVersion: 1.0.0
+packageId: developer
+
+type: sprocket
+displayName: Sprocket
+displayNamePlural: Sprockets
+icon: campaign
+color: "#0f766e"
+
+modes:
+  inline: true
+  fullDocument: false
+
+sharing: team
+draftByDefault: false
+
+idPrefix: spr
+idFormat: ulid
+
+fields:
+  - name: title
+    type: string
+    required: true
+
+roles:
+  title: title
+`;
+}
+
 async function writeSchema(workspacePath: string, fileName: string, content: string): Promise<void> {
   const dir = path.join(workspacePath, '.nimbalyst', 'trackers');
   await fs.mkdir(dir, { recursive: true });
@@ -164,10 +220,47 @@ describe('TrackerSchemaService cross-workspace isolation (#1035)', () => {
     // custom type that exists only in B.
     await writeSchema(wsB, 'widget.yaml', widgetYaml(true, ['open']));
     await writeSchema(wsB, 'gadget.yaml', gadgetYaml());
+    await writeSchema(wsB, 'sprocket.yaml', sprocketYaml());
+
+    testWindows.list = [{ id: 1, isDestroyed: () => false, webContents: { send: mockWindowSend } }];
+    windowWorkspaces.clear();
+    mockWindowSend.mockClear();
 
     service = await import('../TrackerSchemaService');
     scope = await import('../tracker/trackerSchemaScope');
-    ({ globalRegistry } = await import('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel'));
+    ({ globalRegistry } = await import('@nimbalyst/tracker-schema'));
+  });
+
+  it('pushes a type defined in a non-active workspace to that workspace window', async () => {
+    // Window 1 shows A (the active schema workspace); window 2 shows B. An agent
+    // in B defines a new type. B's window only learns about types through
+    // `tracker-schema:changed`, so without a push the type is missing from its
+    // tracker pane until the window reloads.
+    const sendA = vi.fn();
+    const sendB = vi.fn();
+    testWindows.list = [
+      { id: 1, isDestroyed: () => false, webContents: { send: sendA } },
+      { id: 2, isDestroyed: () => false, webContents: { send: sendB } },
+    ];
+    windowWorkspaces.set(1, wsA);
+    windowWorkspaces.set(2, wsB);
+    service.initTrackerSchemaService(wsA);
+
+    await service.upsertWorkspaceTrackerSchema(wsB, gadgetYaml().replace(/gadget/g, 'keystone').replace(/Gadget/g, 'Keystone'));
+
+    await vi.waitFor(() => {
+      const pushedToB = sendB.mock.calls
+        .filter(([channel]) => channel === 'tracker-schema:changed')
+        .flatMap(([, schemas]) => (schemas as Array<{ type: string }>).map((s) => s.type));
+      expect(pushedToB).toContain('keystone');
+    });
+    // A's window must not receive B's type.
+    const pushedToA = sendA.mock.calls
+      .filter(([channel]) => channel === 'tracker-schema:changed')
+      .flatMap(([, schemas]) => (schemas as Array<{ type: string }>).map((s) => s.type));
+    expect(pushedToA).not.toContain('keystone');
+    // And the active view stays A's.
+    expect(service.getTrackerSchema('keystone')).toBeUndefined();
   });
 
   it('keeps the active workspace schema intact after a call targeting another workspace', () => {
@@ -247,6 +340,72 @@ describe('TrackerSchemaService cross-workspace isolation (#1035)', () => {
 
     expect(service.getTrackerSchema('gadget')?.type).toBe('gadget');
     expect(ownerRequired(service.getTrackerSchema('widget') as any)).toBe(true);
+  });
+
+  /**
+   * NIM-3702 leg 1. The sync lane is UNSCOPED -- it is driven from a WebSocket
+   * `onStatusChange` callback with no relationship to whoever opened the
+   * workspace -- so it cannot rely on `runWithTrackerSchemaWorkspace`. It passes
+   * a workspace path explicitly, and until now that argument was discarded.
+   */
+  describe('policy resolution for a non-active workspace (NIM-3702)', () => {
+    let policy: typeof import('../TrackerPolicyService');
+
+    beforeEach(async () => {
+      policy = await import('../TrackerPolicyService');
+    });
+
+    it('answers with the workspace own schema without an ambient scope', () => {
+      service.initTrackerSchemaService(wsA);
+      service.ensureWorkspaceTrackerSchemasLoaded(wsB);
+
+      // No runWithTrackerSchemaWorkspace here -- this is the sync lane's shape.
+      const resolution = policy.resolveTrackerSharingPolicy(wsB, 'sprocket');
+
+      expect(resolution).toEqual({
+        known: true,
+        policy: { sharing: 'team', draftByDefault: false },
+      });
+    });
+
+    it('does not answer for workspace B using workspace A view', () => {
+      service.initTrackerSchemaService(wsA);
+      service.ensureWorkspaceTrackerSchemasLoaded(wsB);
+
+      // `sprocket` does not exist in A at all. The old unscoped read returned
+      // A's `models`, missed, and collapsed to personal -- which for a
+      // previously-shared row meant `delete`.
+      expect(policy.resolveTrackerSharingPolicy(wsA, 'sprocket').known).toBe(false);
+      expect(policy.resolveTrackerSharingPolicy(wsB, 'sprocket').known).toBe(true);
+    });
+
+    it('keeps resolving a workspace after it stops being the active one', () => {
+      // The realistic shape: B was open and active, then the user focused A.
+      // Nothing else ever asked for B's schemas, so without a demotion hook the
+      // only copy of B's custom types was the live view A just overwrote -- and
+      // B's drain would then resolve nothing and hold its items back forever.
+      service.initTrackerSchemaService(wsB);
+      expect(service.getTrackerSchema('sprocket')?.type).toBe('sprocket');
+
+      service.updateTrackerSchemaWorkspace(wsA);
+
+      expect(policy.resolveTrackerSharingPolicy(wsB, 'sprocket')).toEqual({
+        known: true,
+        policy: { sharing: 'team', draftByDefault: false },
+      });
+    });
+
+    it('resolves built-ins for a workspace that has no layer at all', async () => {
+      const wsC = await fs.mkdtemp(path.join(os.tmpdir(), 'tracker-ws-c-'));
+      service.initTrackerSchemaService(wsA);
+
+      // The unscoped path used to lose the builtin fallback that the scoped path
+      // has, so `bug` -- `sharing: team` in its shipped YAML -- missed entirely.
+      expect(policy.resolveTrackerSharingPolicy(wsC, 'bug')).toEqual({
+        known: true,
+        policy: { sharing: 'team', draftByDefault: false },
+      });
+    });
   });
 
   it('drops a cached layer type whose YAML was deleted', async () => {

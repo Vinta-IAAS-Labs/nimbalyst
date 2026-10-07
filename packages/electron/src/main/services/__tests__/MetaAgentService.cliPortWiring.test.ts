@@ -10,13 +10,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // config. So there is no longer a port to wire; the meaningful invariant is that
 // `start()` still injects the tool fns that the unified server's
 // `dispatchMetaAgentTool` calls.
-vi.mock('@nimbalyst/runtime', () => ({
+vi.mock('@nimbalyst/runtime/storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: {
     create: vi.fn(),
     updateMetadata: vi.fn(),
     get: vi.fn(),
   },
+}));
+vi.mock('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository', () => ({
   AgentMessagesRepository: {},
+}));
+vi.mock('@nimbalyst/runtime/storage/repositories/SessionFilesRepository', () => ({
   SessionFilesRepository: {},
 }));
 
@@ -58,7 +62,7 @@ vi.mock('../metaAgentMessageText', () => ({
 }));
 
 import { setMetaAgentToolFns } from '../../mcp/metaAgentServer';
-import { AISessionsRepository } from '@nimbalyst/runtime';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { MetaAgentService } from '../MetaAgentService';
 
 describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', () => {
@@ -92,6 +96,7 @@ describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', (
 
     vi.mocked(AISessionsRepository.get).mockResolvedValue({
       id: 'caller-session',
+      title: 'Build release',
       workspacePath: '/workspace',
     } as never);
 
@@ -103,12 +108,13 @@ describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', (
     const notificationOptions = showNotificationWithResult.mock.calls[0][0];
 
     expect(notificationOptions.title).toHaveLength(120);
-    expect(notificationOptions.title).toBe(`${'T'.repeat(117)}...`);
+    expect(notificationOptions.title).toBe(`Build release -- ${'T'.repeat(100)}...`);
     expect(notificationOptions.body).toHaveLength(1_000);
     expect(notificationOptions.body).toBe(`${'B'.repeat(997)}...`);
     expect(notificationOptions).toMatchObject({
       sessionId: 'caller-session',
       workspacePath: '/workspace',
+      sourceLabel: 'Build release',
       provider: 'agent',
       bypassFocusCheck: true,
       silent: false,

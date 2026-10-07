@@ -12,7 +12,10 @@
 // Client -> Server Messages
 // ============================================================================
 
+import type { DocDecisionCommandMessage, DocDecisionStateMessage, DocDecisionChangedMessage } from './documentDecision.js';
+
 export type DocClientMessage =
+  | DocDecisionCommandMessage
   | DocSyncRequestMessage
   | DocUpdateMessage
   | DocCompactMessage
@@ -61,6 +64,8 @@ export interface DocSetMetadataMessage {
 // ============================================================================
 
 export type DocServerMessage =
+  | DocDecisionStateMessage
+  | DocDecisionChangedMessage
   | DocSyncResponseMessage
   | DocUpdateBroadcastMessage
   | DocUpdateAckMessage
@@ -107,6 +112,18 @@ export interface DocSyncResponseMessage {
    */
   lastWriterUserId?: string | null;
   lastUpdatedAt?: number | null;
+  /**
+   * Whether this connection may write, as the room resolved it while serving
+   * this request. The room re-checks TeamRoom policy before every sync, so this
+   * is a current answer rather than a connect-time snapshot.
+   *
+   * Without it a client can only learn it has write access by attempting a
+   * write and being acknowledged, which leaves a reader who never edits unable
+   * to tell "not permitted" from "not yet known". Optional only for
+   * compatibility with servers that predate the verdict; treat an absent field
+   * as unknown, never as a refusal.
+   */
+  canWrite?: boolean;
 }
 
 /** Broadcast an encrypted Yjs update to other connections */

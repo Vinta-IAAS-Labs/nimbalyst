@@ -2,18 +2,22 @@
 
 This doc covers tracker-item workflows for decisions and bugs.
 
-## Decision Logging
+## Recording Decisions
 
-When choosing between alternatives that affect more than the immediate task — a library, an architecture pattern, an API design, or deciding NOT to do something — log it as a **decision** tracker item using `tracker_create`.
+Record a decision where the next reader will look for it. Not every choice needs a record; most need one sentence in the right place.
 
-**When to log:**
-- Choosing a library or dependency
-- Picking an architecture pattern over alternatives
-- Designing an API contract or data model
-- Deciding NOT to do something (e.g., "we won't use Redux because...")
-- Any choice where future-you would ask "why did we do it this way?"
+**In a project with Pages,** follow the project's "How we write this wiki" page. In short: mark the decision by default, as one sentence in the page it affects, with who decided, when, and what was not chosen. Also add a **decision** tracker item when any of these holds:
 
-**How to log:**
+1. No single page owns it: it changes behavior across several areas, both repos, or every client.
+2. Work or code hangs off it: commits close it with `Fixes NIM-…`, or tasks and other decisions depend on it.
+3. It is not settled: it is still being evaluated, or it holds only while something stays true and someone has to watch that.
+4. The reasons don't fit in a mark: more than one alternative worth keeping, or reasoning a later agent must read in full before undoing it.
+
+A record never replaces the mark. Keep the mark and put the record's key right after it.
+
+**Without Pages,** write the decision in the plan doc it belongs to. Use a decision tracker item when there is no plan doc or one of the four conditions above holds.
+
+**How to create a record:**
 
 ```
 tracker_create({
@@ -25,7 +29,7 @@ tracker_create({
 })
 ```
 
-**Before making a similar decision**, search existing decisions with `tracker_list({ type: "decision", search: "{topic}" })`. Follow prior decisions unless new information invalidates the reasoning — in which case, log a new decision that supersedes the old one and reference it.
+**Before making a similar decision**, read the page about the thing it governs and search existing decisions with `tracker_list({ type: "decision", search: "{topic}" })`. Follow prior decisions unless new information invalidates the reasoning. In that case, rewrite the marked sentence and say what it replaced and when; update or supersede the record if there is one.
 
 ## Bug Tracking
 
@@ -36,6 +40,11 @@ When fixing a bug, **always ensure a tracker bug item exists** before starting t
 2. **Create if missing**: If no tracker item exists, create one before writing any fix code
 3. **Keep it updated**: Update the tracker item's status as you progress (`to-do` → `in-progress` → `in-review`)
 4. **Link the session**: Always call `tracker_link_session` so the bug and session are cross-referenced
+5. **Close it on the commit**: When the user commits the fix, put a closing reference on its own line in the commit message — `Fixes NIM-123`, using the item's issue key. That commit is the user's sign-off, and `CommitTrackerLinker` moves the item to `done` and marks the session `complete`. A bare `NIM-123` only links the commit; it does not close.
+
+Do not stop at step 3. An item left in `in-review` after its fix shipped is a false backlog entry — the user has to clear it by hand. If the item has no issue key, say so when you propose the commit rather than silently omitting the reference.
+
+`Fixes NIM-123` belongs in the **commit message only**. Issue keys are scoped to a tracker room or local workspace: peers in the same room share an identity, but the same key can name a different item in an unrelated workspace. A `NIM-###` in a code comment or runtime log string therefore means nothing reliable to anyone reading this public repo. Cite the GitHub issue (`#123`) there instead. See the tracker-key rule in [CLAUDE.md](../CLAUDE.md).
 
 **How to create:**
 

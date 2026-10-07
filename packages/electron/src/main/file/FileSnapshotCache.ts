@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from '../utils/logger';
+import { GitCatFileBatch } from './GitCatFileBatch';
 
 function execFileAsync(cmd: string, args: string[], opts: { cwd?: string; timeout?: number; maxBuffer?: number } = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -45,6 +46,14 @@ export class FileSnapshotCache {
   private sessionId: string | null = null;
   private isGitRepo = false;
   private startSha: string | null = null;
+  /**
+   * Lazily started per session. Baseline lookups used to spawn a `git show`
+   * per file; on a memory-pressured machine one spawn measured ~1.9s and
+   * twelve of them accounted for 22.4s of a single 23s freeze.
+   */
+  private catFile: GitCatFileBatch | null = null;
+  /** The cap warning fires once per session; per-file logging flooded main.log (#1599). */
+  private capWarned = false;
 
   async startSession(workspacePath: string, sessionId: string): Promise<void> {
     this.stopSession();
@@ -69,6 +78,9 @@ export class FileSnapshotCache {
     this.sessionId = null;
     this.isGitRepo = false;
     this.startSha = null;
+    this.catFile?.dispose();
+    this.catFile = null;
+    this.capWarned = false;
   }
 
   async getBeforeState(filePath: string): Promise<string | null> {
@@ -140,7 +152,15 @@ export class FileSnapshotCache {
 
     // Enforce memory cap - skip caching if over limit (git fallback still works)
     if (this.totalBytes + byteLen > MAX_CACHE_BYTES && existing === undefined) {
-      logger.main.warn('[FileSnapshotCache] Memory cap reached, skipping cache for:', filePath);
+      if (!this.capWarned) {
+        this.capWarned = true;
+        logger.main.warn('[FileSnapshotCache] Memory cap reached; further files use git fallback only:', {
+          sessionId: this.sessionId,
+          fileCount: this.cache.size,
+          totalBytes: this.totalBytes,
+          firstSkipped: filePath,
+        });
+      }
       return;
     }
 
@@ -178,7 +198,10 @@ export class FileSnapshotCache {
 
     // Get dirty files (tracked + untracked) via git status
     try {
-      const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
+      // `--no-optional-locks` keeps this read-only status from refreshing (and
+      // so locking) `.git/index`, where it would contend with concurrent git
+      // writers such as the commit path (NIM-2285).
+      const { stdout } = await execFileAsync('git', ['--no-optional-locks', 'status', '--porcelain'], {
         cwd: workspacePath,
         timeout: 10000,
         maxBuffer: 5_000_000, // 5MB cap on git status output
@@ -271,13 +294,22 @@ export class FileSnapshotCache {
     }
   }
 
+  /**
+   * Content at `sha`, served by one long-lived `git cat-file --batch` process
+   * for the whole session rather than a spawn per file.
+   *
+   * Throws when the object is absent so the existing caller contract holds:
+   * `getBeforeState` treats a throw as "the file did not exist at startSha".
+   */
   private async gitShow(workspacePath: string, sha: string, relativePath: string): Promise<string> {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['show', `${sha}:${relativePath}`],
-      { cwd: workspacePath, timeout: 5000, maxBuffer: MAX_FILE_SIZE }
-    );
-    return stdout;
+    if (!this.catFile) {
+      this.catFile = new GitCatFileBatch(workspacePath, { maxObjectBytes: MAX_FILE_SIZE });
+    }
+    const content = await this.catFile.read(sha, relativePath);
+    if (content === null) {
+      throw new Error(`not in ${sha}: ${relativePath}`);
+    }
+    return content;
   }
 
   /**

@@ -2,7 +2,7 @@ import { Dirent } from 'fs';
 import { readdir, stat } from 'fs/promises';
 import { join } from 'path';
 import { FileTreeItem } from '../types';
-import { shouldExcludeDir } from './fileFilters';
+import { shouldExcludeDir, shouldExcludePath } from './fileFilters';
 
 /**
  * Resolve a directory entry's type, following symlinks to their target.
@@ -64,11 +64,72 @@ function sortItems(items: FileTreeItem[]): void {
     });
 }
 
-export async function getFolderContents(dirPath: string, depth: number = 0): Promise<FileTreeItem[]> {
+/**
+ * Every file under `dirPath`, as folder-relative POSIX paths.
+ *
+ * Deliberately NOT `getFolderContents`: that function's MAX_DEPTH and
+ * MAX_ITEMS_PER_DIR exist so the sidebar stays cheap to paint, and silently
+ * dropping the 201st file is fine for a tree a human is scrolling. It is not
+ * fine for "share this folder with my team", where a dropped file is a file the
+ * team never gets and nobody is told about. This walk has one global cap and
+ * reports when it hits it, so the caller can say so out loud.
+ */
+export async function listFolderFilesRecursive(
+    dirPath: string,
+    options: { limit?: number } = {}
+): Promise<{ files: string[]; truncated: boolean }> {
+    const limit = options.limit ?? 5000;
+    const files: string[] = [];
+    let truncated = false;
+
+    const walk = async (currentPath: string, relativePrefix: string): Promise<void> => {
+        if (truncated) return;
+        let entries: Dirent[];
+        try {
+            entries = await readdir(currentPath, { withFileTypes: true });
+        } catch (error: any) {
+            if (error.code !== 'ENOENT') {
+                console.error('Error listing folder files:', error);
+            }
+            return;
+        }
+
+        const subdirectories: Array<{ path: string; prefix: string }> = [];
+        for (const entry of entries) {
+            if (entry.name === '.DS_Store') continue;
+            const fullPath = join(currentPath, entry.name);
+            const resolved = await resolveEntryType(entry, fullPath);
+            if (!resolved) continue; // Broken symlink
+            const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+
+            if (resolved.isDir) {
+                if (shouldExcludeDir(entry.name) || shouldExcludePath(fullPath)) continue;
+                subdirectories.push({ path: fullPath, prefix: relativePath });
+            } else if (resolved.isFile) {
+                if (files.length >= limit) {
+                    truncated = true;
+                    return;
+                }
+                files.push(relativePath);
+            }
+        }
+
+        for (const subdirectory of subdirectories) {
+            await walk(subdirectory.path, subdirectory.prefix);
+            if (truncated) return;
+        }
+    };
+
+    await walk(dirPath, '');
+    files.sort((left, right) => naturalCollator.compare(left, right));
+    return { files, truncated };
+}
+
+export async function getFolderContents(dirPath: string, depth: number = 0, signal?: AbortSignal): Promise<FileTreeItem[]> {
     const result: FileTreeItem[] = [];
     const directoriesToPopulate: FileTreeItem[] = [];
 
-    if (depth > MAX_DEPTH) {
+    if (signal?.aborted || depth > MAX_DEPTH) {
         return result;
     }
 
@@ -77,6 +138,7 @@ export async function getFolderContents(dirPath: string, depth: number = 0): Pro
         let visibleCount = 0;
 
         for (const entry of entries) {
+            if (signal?.aborted) return [];
             if (entry.name === '.DS_Store') continue;
             if (visibleCount >= MAX_ITEMS_PER_DIR) break;
 
@@ -87,7 +149,7 @@ export async function getFolderContents(dirPath: string, depth: number = 0): Pro
             const { isDir, isFile } = resolved;
 
             if (isDir) {
-                if (shouldExcludeDir(entry.name)) continue;
+                if (shouldExcludeDir(entry.name) || shouldExcludePath(fullPath)) continue;
                 const dirItem: FileTreeItem = {
                     name: entry.name,
                     type: 'directory',
@@ -112,7 +174,8 @@ export async function getFolderContents(dirPath: string, depth: number = 0): Pro
         // Recurse sequentially to avoid unbounded file-descriptor fan-out.
         // Each call is still async (non-blocking), so the main thread stays responsive.
         for (const directory of directoriesToPopulate) {
-            directory.children = await getFolderContents(directory.path, depth + 1);
+            if (signal?.aborted) return [];
+            directory.children = await getFolderContents(directory.path, depth + 1, signal);
         }
     } catch (error: any) {
         if (error.code !== 'ENOENT') {

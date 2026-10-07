@@ -30,18 +30,33 @@ import {
   useRole,
   useInteractions,
 } from '@floating-ui/react';
+import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
 import {
   ProviderIcon,
   MaterialSymbol,
   SearchReplaceStateManager,
 } from '@nimbalyst/runtime';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
+import type { TranscriptFileLocation } from '@nimbalyst/runtime/ui/AgentTranscript/components/MarkdownRenderer';
+import { AgentWorkstreamLayout } from './AgentWorkstreamLayout';
+import { agentFilePlacementAtom } from '../../store/atoms/agentFilePlacement';
+import { fileViewerWidthAtom, revealWorkstreamEditorAtom } from '../../store/atoms/agentFileViewer';
 import { WorkstreamEditorTabs, type WorkstreamEditorTabsRef } from './WorkstreamEditorTabs';
+import { usePushRepresentedFile } from '../../hooks/useRepresentedFileSync';
+import { resolveRepresentedFile } from '../../utils/representedFile';
 import { WorkstreamSessionTabs } from './WorkstreamSessionTabs';
 import { FilesEditedSidebar } from './FilesEditedSidebar';
 import { AgentReviewPanel } from './AgentReviewPanel';
 import { ChatSidebar } from '../ChatSidebar/ChatSidebar';
 import { LayoutControls } from '../UnifiedAI/LayoutControls';
+import { ActiveSessionMcpStatusChip } from '../AgenticCoding/McpSessionStatusChip';
+import { WorktreeIcon } from '../common/WorktreeIcon';
+import { toggleWorkstreamHeaderPin } from './workstreamHeaderPin';
+import {
+  worktreeRecordAtom,
+  setWorktreeRecordAtom,
+  patchWorktreeRecordAtom,
+} from '../../store/atoms/worktrees';
 import {
   workstreamSessionsAtom,
   workstreamTitleAtom,
@@ -57,6 +72,7 @@ import {
   updateSessionStoreAtom,
   setActiveSessionInWorkstreamAtom,
   refreshSessionListAtom,
+  publishSessionPinnedUpdateAtom,
   type WorkstreamType,
 } from '../../store';
 import {
@@ -82,7 +98,6 @@ import {
   filesEditedWidthAtom,
   setFilesEditedWidthAtom,
   clampAgentRightPanelWidth,
-  MIN_AGENT_MAIN_PANEL_WIDTH,
   sessionHistoryCollapsedAtom,
   toggleSessionHistoryCollapsedAtom,
 } from '../../store/atoms/agentMode';
@@ -101,6 +116,7 @@ import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 
 export interface AgentWorkstreamPanelRef {
   closeActiveTab: () => void;
+  toggleEditorMaximized: () => void;
 }
 
 export interface AgentWorkstreamPanelProps {
@@ -203,7 +219,7 @@ const WorkstreamHeaderTagsRow: React.FC<{ workstreamId: string }> = ({ workstrea
     open: overflowOpen,
     onOpenChange: setOverflowOpen,
     placement: 'bottom-end',
-    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
+    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
   });
   const overflowClick = useClick(overflowContext);
   const overflowDismiss = useDismiss(overflowContext);
@@ -275,7 +291,7 @@ const WorkstreamHeaderTagsRow: React.FC<{ workstreamId: string }> = ({ workstrea
   }, [tagInput, allTags, tags]);
 
   // Content key so the layout effect only re-runs when tag contents change.
-  const tagsKey = tags.join(' ');
+  const tagsKey = tags.join('\u0000');
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -368,7 +384,7 @@ const WorkstreamHeaderTagsRow: React.FC<{ workstreamId: string }> = ({ workstrea
   return (
     <div
       ref={containerRef}
-      className="workstream-header-tags self-stretch flex items-center gap-1 flex-nowrap overflow-hidden min-w-0 relative"
+      className="workstream-header-tags flex-1 self-stretch flex items-center gap-1 flex-nowrap overflow-hidden min-w-0 relative"
     >
       {/* Hidden measurement layer. Mirrors visible-pill sizes without taking layout space. */}
       <div
@@ -458,28 +474,45 @@ const WorkstreamHeaderTagsRow: React.FC<{ workstreamId: string }> = ({ workstrea
 };
 
 /**
+ * atomFamily key used when the workstream is not a worktree. The family needs a
+ * string, and this never resolves to a record.
+ */
+const NO_WORKTREE_KEY = '__no_worktree__';
+
+/**
  * Header showing workstream title, provider icon, processing state, and layout controls.
  * Subscribes to atoms directly for isolated re-renders.
  */
 const WorkstreamHeader: React.FC<{
   workstreamId: string;
   workspacePath: string;
+  /**
+   * The session currently in view — the workstream's active child, or the
+   * workstream itself when it is a solo session. Per-session chrome (today:
+   * the MCP status chip) keys off this rather than workstreamId, since a
+   * workstream's tabs can be on different providers.
+   */
+  activeSessionId?: string | null;
   worktreeId?: string | null;
   worktreePath?: string | null;
   onArchiveStatusChange?: () => void;
   onOpenTerminal?: () => void;
   onCreateNewTerminal?: () => void;
   onShowArchiveDialog?: () => void;
-}> = React.memo(({ workstreamId, workspacePath, worktreeId, worktreePath, onArchiveStatusChange, onOpenTerminal, onCreateNewTerminal, onShowArchiveDialog }) => {
+}> = React.memo(({ workstreamId, workspacePath, activeSessionId, worktreeId, worktreePath, onArchiveStatusChange, onOpenTerminal, onCreateNewTerminal, onShowArchiveDialog }) => {
   const title = useAtomValue(workstreamTitleAtom(workstreamId));
   const isProcessing = useAtomValue(workstreamProcessingAtom(workstreamId));
   const sessionData = useAtomValue(sessionStoreAtom(workstreamId));
   const layoutMode = useAtomValue(workstreamLayoutModeAtom(workstreamId));
+  const filePlacement = useAtomValue(agentFilePlacementAtom);
   const hasTabs = useAtomValue(workstreamHasOpenResourcesAtom(workstreamId));
   const sessions = useAtomValue(workstreamSessionsAtom(workstreamId));
   const [isArchived, setIsArchived] = useAtom(sessionArchivedAtom(workstreamId));
+  const worktreeRecord = useAtomValue(worktreeRecordAtom(worktreeId ?? NO_WORKTREE_KEY));
   const setLayoutMode = useSetAtom(setWorkstreamLayoutModeAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
+  const patchWorktreeRecord = useSetAtom(patchWorktreeRecordAtom);
+  const publishSessionPinnedUpdate = useSetAtom(publishSessionPinnedUpdateAtom);
 
   // Inline editing state
   const [isEditing, setIsEditing] = useState(false);
@@ -582,12 +615,40 @@ const WorkstreamHeader: React.FC<{
     setLayoutMode({ workstreamId, mode });
   }, [workstreamId, setLayoutMode]);
 
-  // Determine session type label for archive button
+  // Determine session type label for archive and pin buttons
   const getSessionTypeLabel = useCallback(() => {
     if (worktreeId) return 'Worktree';
     if (hasChildren) return 'Workstream';
     return 'Session';
   }, [worktreeId, hasChildren]);
+
+  // The header title stays the session title, so the chip shows the worktree's
+  // own name (its directory/branch slug) — the one piece of worktree identity
+  // that appears nowhere else in Agent mode. Falls back to the cached path so
+  // the chip is populated before `worktree:get` resolves.
+  const worktreeChipName = worktreeId
+    ? (worktreeRecord?.name || (worktreePath ? getWorktreeNameFromPath(worktreePath, '') : ''))
+    : '';
+
+  // Pin state lives on the worktree record for worktrees and on the session
+  // record otherwise — the same split the sidebar context menus use.
+  const isPinned = worktreeId ? (worktreeRecord?.isPinned ?? false) : (sessionData?.isPinned ?? false);
+
+  const handlePinToggle = useCallback(async () => {
+    try {
+      await toggleWorkstreamHeaderPin({
+        workstreamId,
+        worktreeId,
+        isPinned: !isPinned,
+        invoke: window.electronAPI.invoke,
+        patchWorktreeRecord,
+        updateSessionStore,
+        publishSessionPinnedUpdate,
+      });
+    } catch (error) {
+      console.error('[WorkstreamHeader] Failed to toggle pin:', error);
+    }
+  }, [isPinned, worktreeId, workstreamId, patchWorktreeRecord, updateSessionStore, publishSessionPinnedUpdate]);
 
   const handleArchive = useCallback(async () => {
     // For worktrees, show confirmation dialog first
@@ -622,8 +683,10 @@ const WorkstreamHeader: React.FC<{
   return (
     <div className="workstream-header shrink-0 h-14 px-4 border-b border-[var(--nim-border)] bg-[var(--nim-bg)]">
       <div className="workstream-header-main flex items-center gap-3 h-full">
-        <div className="workstream-header-icon shrink-0 text-[var(--nim-text-muted)]">
-          {hasChildren ? (
+        <div className="workstream-header-icon shrink-0 text-[var(--nim-text-muted)]" title={getSessionTypeLabel()}>
+          {worktreeId ? (
+            <WorktreeIcon size={20} />
+          ) : hasChildren ? (
             <MaterialSymbol icon="account_tree" size={20} />
           ) : (
             <ProviderIcon provider={sessionData?.provider || 'claude-code'} size={20} />
@@ -650,7 +713,18 @@ const WorkstreamHeader: React.FC<{
               {title}
             </h2>
           )}
-          <WorkstreamHeaderTagsRow workstreamId={workstreamId} />
+          <div className="workstream-header-meta-row flex items-center gap-1.5 w-full min-w-0">
+            {worktreeChipName && (
+              <span
+                className="workstream-header-worktree-chip shrink-0 flex items-center gap-1 max-w-[14rem] px-1.5 py-px rounded text-[0.625rem] font-medium text-[var(--nim-text-muted)] bg-[var(--nim-bg-secondary)] whitespace-nowrap overflow-hidden text-ellipsis"
+                title={worktreePath ? `Worktree: ${worktreeChipName}\n${worktreePath}` : `Worktree: ${worktreeChipName}`}
+              >
+                <WorktreeIcon size={10} />
+                {worktreeChipName}
+              </span>
+            )}
+            <WorkstreamHeaderTagsRow workstreamId={workstreamId} />
+          </div>
         </div>
 
         {isProcessing && (
@@ -658,6 +732,11 @@ const WorkstreamHeader: React.FC<{
             <span className="workstream-header-spinner w-4 h-4 border-2 border-[var(--nim-border)] border-t-[var(--nim-primary)] rounded-full animate-spin" />
           </div>
         )}
+
+        {/* MCP servers for the session currently in view. Hides itself for
+            providers with no MCP status channel and for sessions that have not
+            run a turn yet, so a healthy or irrelevant session shows nothing. */}
+        {activeSessionId && <ActiveSessionMcpStatusChip sessionId={activeSessionId} />}
 
         {/* Terminal button - only show for worktree sessions, positioned before layout controls */}
         {worktreeId && onOpenTerminal && (
@@ -694,11 +773,21 @@ const WorkstreamHeader: React.FC<{
         )}
 
         {/* Layout controls - shared component with Files/Agent labels */}
-        <LayoutControls
-          mode={layoutMode}
-          hasTabs={hasTabs}
-          onModeChange={handleLayoutChange}
-        />
+        {filePlacement === 'above' && (
+          <LayoutControls mode={layoutMode} hasTabs={hasTabs} onModeChange={handleLayoutChange} />
+        )}
+
+        {/* Pin/Unpin toggle - routes to the worktree or the session per type */}
+        <button
+          className={`workstream-pin-button w-8 h-8 flex items-center justify-center rounded cursor-pointer border-none bg-transparent hover:bg-[var(--nim-bg-hover)] ${
+            isPinned ? 'text-[var(--nim-primary)]' : 'text-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)]'
+          }`}
+          onClick={handlePinToggle}
+          aria-pressed={isPinned}
+          title={`${isPinned ? 'Unpin' : 'Pin'} ${getSessionTypeLabel().toLowerCase()}`}
+        >
+          <MaterialSymbol icon="push_pin" size={18} fill={isPinned} />
+        </button>
 
         {/* Archive/Unarchive button */}
         <button
@@ -750,6 +839,8 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   const setWorkstreamState = useSetAtom(workstreamStateAtom(workstreamId));
   const sessionParentId = useAtomValue(sessionParentIdDerivedAtom(workstreamId));
   const sessionWorktreeId = useAtomValue(sessionWorktreeIdAtom(workstreamId));
+  const worktreeRecord = useAtomValue(worktreeRecordAtom(sessionWorktreeId ?? NO_WORKTREE_KEY));
+  const setWorktreeRecord = useSetAtom(setWorktreeRecordAtom);
 
   // Debug: log when activeSessionId changes
   // useEffect(() => {
@@ -758,6 +849,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
 
   // Layout state (persisted via workstreamStateAtom)
   const layoutMode = useAtomValue(workstreamLayoutModeAtom(workstreamId));
+  const filePlacement = useAtomValue(agentFilePlacementAtom);
   const sidebarVisible = useAtomValue(workstreamFilesSidebarVisibleAtom(workstreamId));
   const rightPanelMode = useAtomValue(workstreamRightPanelModeAtom(workstreamId));
   const sessionChatSessionIds = useAtomValue(workstreamSessionChatIdsAtom(workstreamId));
@@ -771,7 +863,14 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   const defaultModel = useAtomValue(defaultAgentModelAtom);
 
   // Files sidebar width (project-level state from agentMode)
-  const sidebarWidth = useAtomValue(filesEditedWidthAtom);
+  const auxiliaryWidth = useAtomValue(filesEditedWidthAtom);
+  const fileViewerWidth = useAtomValue(fileViewerWidthAtom(workstreamId));
+  const viewerSelected = rightPanelMode === 'file-viewer';
+  const sidebarWidth = viewerSelected ? (fileViewerWidth ?? '45%') : auxiliaryWidth;
+  const revealEditor = useSetAtom(revealWorkstreamEditorAtom);
+  const worktreePathReady = !sessionWorktreeId || !!worktreePath;
+  const showEditorTabs = worktreePathReady && (layoutMode === 'editor' || (filePlacement === 'right'
+    ? sidebarVisible && viewerSelected : layoutMode === 'split'));
   const setSidebarWidth = useSetAtom(setFilesEditedWidthAtom);
   const chatTargetId = activeSessionId || (workstreamType === 'session' ? workstreamId : null);
   const chatTargetSession = useAtomValue(sessionStoreAtom(chatTargetId || '__no_chat_target__'));
@@ -872,8 +971,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   // Double-click a tab to maximize the editor to the whole window: hide the
   // transcript (layoutMode 'editor'), the files-edited sidebar, and the
   // session-history sidebar. Second double-click restores the exact prior
-  // layout. The captured layoutMode is always 'editor' or 'split' since editor
-  // tabs are only visible (and double-clickable) in those modes.
+  // layout, including a viewer docked on the right.
   const { isMaximized: isEditorMaximized, toggle: toggleEditorMaximized, clearMaximize: clearEditorMaximized } =
     useEditorMaximize<{ layoutMode: WorkstreamLayoutMode; filesSidebar: boolean; historyCollapsed: boolean }>({
       scopeKey: workstreamId,
@@ -904,19 +1002,16 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     loadWorkstreamState(workstreamId);
   }, [workstreamId]);
 
-  // Auto-collapse editor area when last tab is closed
-  // Use a ref to track if we just opened a file to prevent immediate collapse
-  const justOpenedFileRef = useRef(false);
-
+  // Collapse only after the last live tab closes. A hidden, mounted editor can
+  // receive an open before its tab mirror updates; an empty snapshot during
+  // that transition must not undo the reveal.
+  const previouslyHadTabs = useRef(hasTabs);
   useEffect(() => {
-    // If we're in editor or split mode and there are no tabs, switch to transcript mode
-    // But don't collapse if we just opened a file (wait for it to actually open)
-    if (!hasTabs && (layoutMode === 'editor' || layoutMode === 'split') && !justOpenedFileRef.current) {
+    if (previouslyHadTabs.current && !hasTabs) {
       setLayoutMode({ workstreamId, mode: 'transcript' });
     }
-    // Reset the flag after each check
-    justOpenedFileRef.current = false;
-  }, [hasTabs, layoutMode, workstreamId, setLayoutMode]);
+    previouslyHadTabs.current = hasTabs;
+  }, [hasTabs, workstreamId, setLayoutMode]);
 
   // Load session data and children when workstream changes
   // This is critical for workstreams with child sessions to work properly
@@ -976,7 +1071,10 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     }
   }, [workstreamId, workspacePath, sessionDataLoaded, sessionParentId, workstreamStatesLoaded, loadSessionChildren]);
 
-  // Resolve worktree path if this is a worktree session and not yet cached in atom
+  // Resolve the worktree if this is a worktree session and not yet cached.
+  // `worktreePath` is persisted with the workstream, but the record (name, pin
+  // state) is renderer-only, so a fresh launch needs the fetch even when the
+  // path is already known.
   useEffect(() => {
     if (!sessionWorktreeId) {
       if (worktreePath) {
@@ -985,23 +1083,31 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       return;
     }
 
-    // Skip IPC if already cached in workstream state
-    if (worktreePath) return;
+    if (worktreePath && worktreeRecord) return;
 
-    // Query worktree path via IPC and cache in workstream state atom
     (async () => {
       try {
         const result = await window.electronAPI.invoke('worktree:get', sessionWorktreeId);
         if (result?.success && result.worktree) {
-          setWorkstreamState({ worktreePath: result.worktree.path });
+          const worktree = result.worktree;
+          if (!worktreePath) {
+            setWorkstreamState({ worktreePath: worktree.path });
+          }
+          setWorktreeRecord({
+            id: sessionWorktreeId,
+            name: worktree.name,
+            displayName: worktree.displayName ?? null,
+            path: worktree.path,
+            isPinned: worktree.isPinned ?? false,
+          });
         } else {
-          console.error('[AgentWorkstreamPanel] Failed to resolve worktree path:', result?.error);
+          console.error('[AgentWorkstreamPanel] Failed to resolve worktree:', result?.error);
         }
       } catch (error) {
-        console.error('[AgentWorkstreamPanel] Error resolving worktree path:', error);
+        console.error('[AgentWorkstreamPanel] Error resolving worktree:', error);
       }
     })();
-  }, [sessionWorktreeId, worktreePath, setWorkstreamState]);
+  }, [sessionWorktreeId, worktreePath, worktreeRecord, setWorkstreamState, setWorktreeRecord]);
 
   // Local state for drag states
   const [isDraggingVertical, setIsDraggingVertical] = useState(false);
@@ -1016,11 +1122,10 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   } = useArchiveWorktreeDialog();
 
   // Ref for the content container (used for resize calculations)
-  const contentRef = useRef<HTMLDivElement>(null);
   const verticalResizeRef = useRef({ startY: 0, startRatio: splitRatio, containerHeight: 0 });
   const sidebarResizeRef = useRef({
     startX: 0,
-    startWidth: sidebarWidth,
+    startWidth: auxiliaryWidth,
     availableWidth: 0,
   });
 
@@ -1088,27 +1193,26 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     }
   }, [updateSessionStore, sessionWorktreeId, sessions.length]);
 
-  // Track pending file open when switching to split mode
-  const pendingFileOpenRef = useRef<string | null>(null);
+  // Track pending file open when switching to split mode. Carries the line
+  // location too, so a `file.md:653` link survives the layout flip.
+  const pendingFileOpenRef = useRef<{ filePath: string; location?: TranscriptFileLocation } | null>(null);
 
   // File clicks open in the workstream editor tabs
-  const handleFileClick = useCallback((filePath: string) => {
+  const handleFileClick = useCallback((filePath: string, location?: TranscriptFileLocation) => {
+    revealEditor(workstreamId);
     if (editorTabsRef.current) {
       // Editor is mounted, open the file directly
-      editorTabsRef.current.openFile(filePath);
+      editorTabsRef.current.openFile(filePath, location);
     } else {
-      // Editor not mounted (transcript mode), switch to split and queue file open
-      // Set flag to prevent auto-collapse during this transition
-      justOpenedFileRef.current = true;
-      pendingFileOpenRef.current = filePath;
-      setLayoutMode({ workstreamId, mode: 'split' });
+      // The worktree path is still resolving; replay after its editor mounts.
+      pendingFileOpenRef.current = { filePath, location };
     }
-  }, [workstreamId, setLayoutMode]);
+  }, [workstreamId, revealEditor]);
 
   // Get document context from the workstream editor tabs (for AI selection/file context)
   // This is called on-demand when sending a message to capture fresh selection state
   const getDocumentContext = useCallback(async (): Promise<SerializableDocumentContext> => {
-    const activeTab = editorTabsRef.current?.getActiveTab();
+    const activeTab = showEditorTabs ? editorTabsRef.current?.getActiveTab() : null;
     if (!activeTab) {
       return {
         filePath: undefined,
@@ -1140,7 +1244,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       mockupSelection,
       mockupDrawing,
     };
-  }, []);
+  }, [showEditorTabs]);
 
   // Archive dialog handler
   const handleShowArchiveDialog = useCallback(async () => {
@@ -1229,8 +1333,6 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   // Determine what to show based on layout mode
   // Editor tabs are shown in editor and split modes, but wait for worktree path to resolve
   // before rendering (TabContent captures workspaceId permanently on first render)
-  const worktreePathReady = !sessionWorktreeId || worktreePath;
-  const showEditorTabs = (layoutMode === 'split' || layoutMode === 'editor') && worktreePathReady;
   // Session tabs are always shown - in editor mode, the transcript is collapsed but tabs + input remain visible
   const showSessionTabs = true;
   // Collapse the transcript content (hide messages) when in editor mode
@@ -1253,10 +1355,18 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     [showEditorTabs, activeEditorFile]
   );
 
+  // #1375: report the visible document to macOS as this window's AXDocument.
+  // Visibility belongs to the layout; hidden editors remain mounted to preserve state.
+  usePushRepresentedFile(
+    isActive,
+    showEditorTabs ? resolveRepresentedFile(activeEditorFile) : null
+  );
+
   // Open pending file once editor mounts after layout mode change
   useEffect(() => {
-    if (pendingFileOpenRef.current && showEditorTabs && editorTabsRef.current) {
-      editorTabsRef.current.openFile(pendingFileOpenRef.current);
+    const pending = pendingFileOpenRef.current;
+    if (pending && showEditorTabs && editorTabsRef.current) {
+      editorTabsRef.current.openFile(pending.filePath, pending.location);
       pendingFileOpenRef.current = null;
     }
   }, [showEditorTabs]); // Re-run when editor becomes visible
@@ -1281,7 +1391,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
 
   const handleVerticalResizeStart = useCallback((event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
-    const container = contentRef.current;
+    const container = panelRef.current;
     if (!container) return;
     verticalResizeRef.current = {
       startY: event.clientY,
@@ -1298,9 +1408,9 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     onMove: (event) => {
       const deltaX = sidebarResizeRef.current.startX - event.clientX;
       const newWidth = sidebarResizeRef.current.startWidth + deltaX;
-      setSidebarWidth(
-        clampAgentRightPanelWidth(newWidth, sidebarResizeRef.current.availableWidth),
-      );
+      const width = clampAgentRightPanelWidth(newWidth, sidebarResizeRef.current.availableWidth);
+      if (viewerSelected) setWorkstreamState({ fileViewerWidth: width });
+      else setSidebarWidth(width);
     },
     onEnd: () => {
       setIsDraggingSidebar(false);
@@ -1309,8 +1419,9 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
 
   const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
-    const availableWidth = panelRef.current?.getBoundingClientRect().width ?? sidebarWidth;
-    const renderedWidth = rightPanelRef.current?.getBoundingClientRect().width ?? sidebarWidth;
+    const availableWidth = panelRef.current?.getBoundingClientRect().width ?? auxiliaryWidth;
+    const renderedPanel = viewerSelected ? editorAreaRef.current : rightPanelRef.current;
+    const renderedWidth = renderedPanel?.getBoundingClientRect().width ?? auxiliaryWidth;
     sidebarResizeRef.current = {
       startX: event.clientX,
       startWidth: renderedWidth,
@@ -1318,7 +1429,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     };
     setIsDraggingSidebar(true);
     startSidebarResizeDrag(event);
-  }, [sidebarWidth, startSidebarResizeDrag]);
+  }, [auxiliaryWidth, viewerSelected, startSidebarResizeDrag]);
 
   // Track which panel was last clicked to route CMD+F correctly.
   // document.activeElement is unreliable because clicking tab bars, non-focusable
@@ -1343,7 +1454,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   // Trigger find in the active editor. Two strategies based on editor type:
   // - Monaco: dispatch synthetic Cmd+F keydown to its internal textarea, which
   //   Monaco's keybinding system processes to open its built-in find widget.
-  // - Lexical: use SearchReplaceStateManager.toggle() directly (same as Files mode).
+  // - Lexical: use SearchReplaceStateManager.openAndFocus() directly (same as Files mode).
   //   We can't use synthetic keydown because Lexical's SearchReplacePlugin checks
   //   isEditorActive (based on React state), which won't be true synchronously
   //   after focusing the contenteditable.
@@ -1367,8 +1478,8 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       // Lexical or other editor - use SearchReplaceStateManager
       const activeFilePath = editorTabsRef.current?.getActiveFilePath();
       if (activeFilePath) {
-        console.log('[AgentWorkstreamPanel] triggerEditorFind: toggling SearchReplaceStateManager for', activeFilePath);
-        SearchReplaceStateManager.toggle(activeFilePath);
+        console.log('[AgentWorkstreamPanel] triggerEditorFind: opening SearchReplaceStateManager for', activeFilePath);
+        SearchReplaceStateManager.openAndFocus(activeFilePath);
       } else {
         console.log('[AgentWorkstreamPanel] triggerEditorFind: no active file path');
       }
@@ -1394,9 +1505,10 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   // Editor panel: triggerEditorFind handles Monaco vs Lexical differently.
   // Session panel: dispatch transcript:find CustomEvent.
   useEffect(() => {
+    if (!isActive) return;
     const handleFind = () => {
       const activeFilePath = editorTabsRef.current?.getActiveFilePath();
-      const editorIsTarget = lastFocusedPanelRef.current === 'editor' && activeFilePath;
+      const editorIsTarget = showEditorTabs && lastFocusedPanelRef.current === 'editor' && activeFilePath;
 
       console.log('[AgentWorkstreamPanel] handleFind: lastFocusedPanel=' + lastFocusedPanelRef.current +
         ' activeFilePath=' + activeFilePath + ' activeSessionId=' + activeSessionId);
@@ -1410,9 +1522,18 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       }
     };
 
+    // An open Lexical find bar takes Find Next / Previous directly; it has no
+    // Cmd+G key handler, so the synthetic keydown only reaches Monaco (#1578).
+    const navigateEditorFind = (activeFilePath: string, direction: 'next' | 'previous') => {
+      if (!SearchReplaceStateManager.navigate(activeFilePath, direction)) {
+        dispatchEditorKeyEvent('g', 'KeyG', true, direction === 'previous');
+      }
+    };
+
     const handleFindNext = () => {
-      if (lastFocusedPanelRef.current === 'editor' && editorTabsRef.current?.getActiveFilePath()) {
-        dispatchEditorKeyEvent('g', 'KeyG', true);
+      const activeFilePath = editorTabsRef.current?.getActiveFilePath();
+      if (showEditorTabs && lastFocusedPanelRef.current === 'editor' && activeFilePath) {
+        navigateEditorFind(activeFilePath, 'next');
       } else if (activeSessionId) {
         window.dispatchEvent(new CustomEvent('transcript:find-next', {
           detail: { sessionId: activeSessionId }
@@ -1421,8 +1542,9 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     };
 
     const handleFindPrevious = () => {
-      if (lastFocusedPanelRef.current === 'editor' && editorTabsRef.current?.getActiveFilePath()) {
-        dispatchEditorKeyEvent('g', 'KeyG', true, true);
+      const activeFilePath = editorTabsRef.current?.getActiveFilePath();
+      if (showEditorTabs && lastFocusedPanelRef.current === 'editor' && activeFilePath) {
+        navigateEditorFind(activeFilePath, 'previous');
       }
     };
 
@@ -1435,115 +1557,81 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       window.removeEventListener('menu:find-next', handleFindNext);
       window.removeEventListener('menu:find-previous', handleFindPrevious);
     };
-  }, [activeSessionId, triggerEditorFind, dispatchEditorKeyEvent]);
+  }, [isActive, activeSessionId, showEditorTabs, triggerEditorFind, dispatchEditorKeyEvent]);
 
   // Expose ref methods
   useImperativeHandle(ref, () => ({
     closeActiveTab: () => {
       // Only close editor tabs if the editor panel was last focused
-      if (lastFocusedPanelRef.current === 'editor' && editorTabsRef.current) {
+      if (showEditorTabs && lastFocusedPanelRef.current === 'editor' && editorTabsRef.current) {
         editorTabsRef.current.closeActiveTab();
       }
       // If transcript has focus, do nothing - we don't want to close AI sessions with CMD+W
-    }
-  }), []);
+    },
+    // Menu/shortcut path for the same action as double-clicking a tab. With no
+    // editor tab open, maximizing would force layoutMode 'editor' only for the
+    // auto-collapse effect to bounce it back to the transcript, so only the
+    // restore direction stays live.
+    toggleEditorMaximized: () => {
+      if (isEditorMaximized || hasTabs) toggleEditorMaximized();
+    },
+  }), [isEditorMaximized, hasTabs, showEditorTabs, toggleEditorMaximized]);
 
   return (
-    <div ref={panelRef} className="agent-workstream-panel flex flex-row h-full overflow-hidden">
-      {/* Main column - header + content */}
-      <div className="agent-workstream-panel-main flex flex-col flex-1 min-w-0 overflow-hidden">
-        <WorkstreamHeader
-          workstreamId={workstreamId}
-          workspacePath={workspacePath}
-          worktreeId={sessionWorktreeId}
-          worktreePath={worktreePath}
-          onOpenTerminal={sessionWorktreeId ? handleOpenTerminal : undefined}
-          onCreateNewTerminal={sessionWorktreeId ? handleCreateNewTerminal : undefined}
-          onShowArchiveDialog={sessionWorktreeId ? handleShowArchiveDialog : undefined}
-          onArchiveStatusChange={onWorktreeArchived}
-        />
-
-        <div ref={contentRef} className="agent-workstream-panel-content flex-1 min-h-0 flex flex-col overflow-hidden">
-          {/* Editor tabs for the entire workstream */}
-          {showEditorTabs && (
-            <div
-              ref={editorAreaRef}
-              className={`agent-workstream-editor-area shrink-0 border-b border-[var(--nim-border)] min-h-0 flex flex-col ${layoutMode === 'editor' ? 'maximized flex-1 border-b-0' : ''}`}
-              style={layoutMode === 'split' ? { height: `${splitRatio * 100}%`, minHeight: '100px' } : undefined}
-            >
-              <WorkstreamEditorTabs
-                key={workstreamId}
-                ref={editorTabsRef}
-                workstreamId={workstreamId}
-                workspacePath={workspacePath}
-                basePath={worktreePath || workspacePath}
-                isActive={isActive}
-                onSwitchToAgentMode={onSwitchToAgentMode}
-                onOpenSessionInChat={onOpenSessionInChat}
-                onTabDoubleClick={toggleEditorMaximized}
-              />
-            </div>
-          )}
-
-          {/* Vertical resizer between editor and session */}
-          {layoutMode === 'split' && (
-            <div
-              className={`agent-workstream-vertical-resizer h-1 shrink-0 cursor-ns-resize bg-[var(--nim-border)] transition-colors duration-150 hover:bg-[var(--nim-primary)] ${isDraggingVertical ? 'dragging bg-[var(--nim-primary)]' : ''}`}
-              data-testid="agent-workstream-vertical-resize-handle"
-              onPointerDown={handleVerticalResizeStart}
-              role="separator"
-              aria-label="Resize workstream editor area"
-              aria-orientation="horizontal"
-            />
-          )}
-
-          {/* Session tabs + active session panel */}
-          {showSessionTabs && (
-            <div ref={sessionAreaRef} className={`agent-workstream-session-area flex flex-col overflow-hidden ${collapseTranscript ? 'shrink-0' : 'flex-1 min-h-0'} ${layoutMode === 'transcript' ? 'maximized' : ''}`}>
-              <WorkstreamSessionTabs
-                workspacePath={workspacePath}
-                workstreamId={workstreamId}
-                sessions={sessions}
-                activeSessionId={activeSessionId}
-                onSessionSelect={handleSessionSelect}
-                onFileClick={handleFileClick}
-                worktreeId={sessionWorktreeId}
-                onAddSessionToWorktree={onAddSessionToWorktree}
-                onCreateWorktreeSession={onCreateWorktreeSession}
-                onSessionArchive={handleSessionArchive}
-                onSessionUnarchive={handleSessionUnarchive}
-                onSessionRename={handleSessionRename}
-                documentContext={sessionDocumentContext}
-                getDocumentContext={getDocumentContext}
-                collapseTranscript={collapseTranscript}
-              />
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Sidebar resizer */}
-      {sidebarVisible && activeSessionId && (
-        <div
-          className={`agent-workstream-sidebar-resizer w-1 shrink-0 cursor-ew-resize bg-[var(--nim-border)] transition-colors duration-150 hover:bg-[var(--nim-primary)] ${isDraggingSidebar ? 'dragging bg-[var(--nim-primary)]' : ''}`}
-          data-testid="agent-files-sidebar-resize-handle"
-          onPointerDown={handleSidebarResizeStart}
-          role="separator"
-          aria-label="Resize Agent right panel"
-          aria-orientation="vertical"
-        />
-      )}
-
-      {/* Agent right panel - full height on the right, sibling of main column */}
-      {sidebarVisible && (
-        <div
-          ref={rightPanelRef}
-          className="agent-workstream-right-panel shrink-0 min-w-0 h-full overflow-hidden"
-          style={{
-            width: sidebarWidth,
-            maxWidth: `calc(100% - ${MIN_AGENT_MAIN_PANEL_WIDTH}px)`,
-          }}
-        >
+    <>
+      <AgentWorkstreamLayout
+        panelRef={panelRef} editorRef={editorAreaRef} sessionRef={sessionAreaRef} rightPanelRef={rightPanelRef}
+        placement={filePlacement} layoutMode={layoutMode} editorVisible={showEditorTabs}
+        sidebarVisible={sidebarVisible} viewerSelected={viewerSelected} sidebarWidth={sidebarWidth}
+        splitRatio={splitRatio} draggingVertical={isDraggingVertical} draggingSidebar={isDraggingSidebar}
+        onVerticalResize={handleVerticalResizeStart} onSidebarResize={handleSidebarResizeStart}
+        header={
+          <WorkstreamHeader
+            workstreamId={workstreamId}
+            workspacePath={workspacePath}
+            activeSessionId={chatTargetId}
+            worktreeId={sessionWorktreeId}
+            worktreePath={worktreePath}
+            onOpenTerminal={sessionWorktreeId ? handleOpenTerminal : undefined}
+            onCreateNewTerminal={sessionWorktreeId ? handleCreateNewTerminal : undefined}
+            onShowArchiveDialog={sessionWorktreeId ? handleShowArchiveDialog : undefined}
+            onArchiveStatusChange={onWorktreeArchived}
+          />
+        }
+        editor={worktreePathReady ? (
+          <WorkstreamEditorTabs
+            key={workstreamId}
+            ref={editorTabsRef}
+            workstreamId={workstreamId}
+            workspacePath={workspacePath}
+            basePath={worktreePath || workspacePath}
+            isActive={isActive && showEditorTabs}
+            onSwitchToAgentMode={onSwitchToAgentMode}
+            onOpenSessionInChat={onOpenSessionInChat}
+            onTabDoubleClick={toggleEditorMaximized}
+            onBeforeMove={isEditorMaximized ? toggleEditorMaximized : undefined}
+          />
+        ) : null}
+        transcript={
+          <WorkstreamSessionTabs
+            workspacePath={workspacePath}
+            workstreamId={workstreamId}
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            onSessionSelect={handleSessionSelect}
+            onFileClick={handleFileClick}
+            worktreeId={sessionWorktreeId}
+            onAddSessionToWorktree={onAddSessionToWorktree}
+            onCreateWorktreeSession={onCreateWorktreeSession}
+            onSessionArchive={handleSessionArchive}
+            onSessionUnarchive={handleSessionUnarchive}
+            onSessionRename={handleSessionRename}
+            documentContext={sessionDocumentContext}
+            getDocumentContext={getDocumentContext}
+            collapseTranscript={collapseTranscript}
+          />
+        }
+        sidebar={sidebarVisible ? <>
           {rightPanelMode === 'edited-files' && (
             <FilesEditedSidebar
               workstreamId={workstreamId}
@@ -1604,9 +1692,8 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
               </div>
             )
           )}
-        </div>
-      )}
-
+        </> : null}
+      />
       {/* Archive worktree confirmation dialog */}
       {archiveDialogState && (
         <ArchiveWorktreeDialog
@@ -1619,7 +1706,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
           unmergedCommitCount={archiveDialogState.unmergedCommitCount}
         />
       )}
-    </div>
+    </>
   );
 }));
 

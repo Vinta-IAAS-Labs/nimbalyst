@@ -29,23 +29,17 @@ interface BrowserSurfaceProps {
  */
 export function BrowserSurface({ sessionId, visible }: BrowserSurfaceProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  // Track the last-pushed bounds so we don't spam IPC during rAF-paced resize.
-  const lastBoundsRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
-  const attachedRef = useRef(false);
-
   useEffect(() => {
     const el = containerRef.current;
-    if (!el) return;
-    if (!visible) {
-      if (attachedRef.current) {
-        void detachBrowserSession(sessionId);
-        attachedRef.current = false;
-        lastBoundsRef.current = null;
-      }
-      return;
-    }
+    if (!el || !visible) return;
 
     let cancelled = false;
+    // State belongs to this effect, so a late IPC reply cannot alter the next
+    // visible surface. Track requests before awaiting their acknowledgements:
+    // main-process attach/detach handlers apply synchronously in IPC order.
+    let attached = false;
+    let lastBounds: { x: number; y: number; w: number; h: number } | null = null;
+    let revision = 0;
 
     const rectsIntersect = (
       a: { left: number; top: number; right: number; bottom: number },
@@ -96,10 +90,13 @@ export function BrowserSurface({ sessionId, visible }: BrowserSurfaceProps): JSX
       // covers the remaining cases. Either means "not on screen" -> no bounds.
       if (el.offsetParent === null) return null;
       const rect = el.getBoundingClientRect();
-      // Bounds are CSS pixels relative to the host window's content area.
-      // The renderer's <body> origin lines up with the content area origin in
-      // a normal Electron window, so getBoundingClientRect (which is relative
-      // to the viewport) is the correct frame of reference.
+      // Bounds are reported in *our* CSS pixels: the renderer's <body> origin
+      // lines up with the window content area origin in a normal Electron
+      // window, so getBoundingClientRect (relative to the viewport) is the
+      // right frame of reference. It is not the same grid the native view is
+      // positioned on once the window is zoomed -- BrowserSessionService
+      // converts CSS pixels to device-independent pixels using the host
+      // window's zoom factor.
       const x = Math.round(rect.left);
       const y = Math.round(rect.top);
       const width = Math.max(0, Math.round(rect.width));
@@ -120,14 +117,15 @@ export function BrowserSurface({ sessionId, visible }: BrowserSurfaceProps): JSX
         // Placeholder is not on screen. Detach the native view so it stops
         // covering the now-visible content (other tab, agent mode, etc.).
         // It re-attaches below once the placeholder is laid out again.
-        if (attachedRef.current) {
+        if (attached) {
+          revision++;
           void detachBrowserSession(sessionId);
-          attachedRef.current = false;
-          lastBoundsRef.current = null;
+          attached = false;
+          lastBounds = null;
         }
         return;
       }
-      const last = lastBoundsRef.current;
+      const last = lastBounds;
       if (
         last &&
         last.x === bounds.x &&
@@ -137,18 +135,22 @@ export function BrowserSurface({ sessionId, visible }: BrowserSurfaceProps): JSX
       ) {
         return;
       }
-      lastBoundsRef.current = { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
+      lastBounds = { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
+      const requestRevision = attached ? revision : ++revision;
       try {
-        if (!attachedRef.current) {
+        if (!attached) {
+          attached = true;
           await attachBrowserSession(sessionId, bounds);
-          attachedRef.current = true;
         } else {
           await setBrowserSessionBounds(sessionId, bounds);
         }
       } catch (err) {
         // If attach fails (e.g. session was destroyed under us), drop the
         // attached flag so a later visibility flip re-tries from scratch.
-        attachedRef.current = false;
+        if (!cancelled && revision === requestRevision) {
+          attached = false;
+          lastBounds = null;
+        }
         console.warn('[BrowserSurface] attach/setBounds failed:', err);
       }
     };
@@ -210,10 +212,8 @@ export function BrowserSurface({ sessionId, visible }: BrowserSurfaceProps): JSX
       if (moRaf) cancelAnimationFrame(moRaf);
       window.removeEventListener('resize', onWindowResize);
       cancelAnimationFrame(raf);
-      if (attachedRef.current) {
+      if (attached) {
         void detachBrowserSession(sessionId);
-        attachedRef.current = false;
-        lastBoundsRef.current = null;
       }
     };
   }, [sessionId, visible]);

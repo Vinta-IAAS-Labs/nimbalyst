@@ -4,6 +4,7 @@ import { usePostHog } from 'posthog-js/react';
 import { dialogRef, dialogReadyAtom } from '../contexts/DialogContext';
 import { DIALOG_IDS } from '../dialogs';
 import type { OnboardingData, UnifiedOnboardingData, WindowsClaudeCodeWarningData, RosettaWarningData } from '../dialogs';
+import type { OnboardingIntent } from '../components/UnifiedOnboarding/UnifiedOnboarding';
 import OnboardingService from '../services/OnboardingService';
 import type { ContentMode } from '../types/WindowModeTypes';
 import { setDeveloperFeatureSettingsAtom } from '../store/atoms/appSettings';
@@ -11,6 +12,7 @@ import {
   unifiedOnboardingRequestAtom,
   windowsClaudeCodeWarningRequestAtom,
 } from '../store/atoms/appCommands';
+import { persistOnboardingCompletion } from '../utils/onboardingCompletion';
 
 interface UseOnboardingOptions {
   workspacePath: string | null;
@@ -49,20 +51,11 @@ export function useOnboarding({
   const forcedModeRef = useRef<'new' | 'existing' | null>(null);
 
   // Handle unified onboarding completion
-  const handleOnboardingComplete = useCallback(async (data: OnboardingData) => {
-    const roleToStore = data.customRole || data.role || undefined;
-
-    // Store onboarding data in electron-store (app settings)
-    await window.electronAPI.invoke('onboarding:update', {
-      userRole: roleToStore,
-      userEmail: data.email || undefined,
-      referralSource: data.referralSource || undefined,
-      unifiedOnboardingCompleted: true,
-      onboardingCompleted: true, // Keep for backward compatibility
-    });
-
-    // Store developer mode globally in app settings
-    await window.electronAPI.invoke('developer-mode:set', data.developerMode);
+  const handleOnboardingComplete = useCallback(async (
+    data: OnboardingData,
+    intent: OnboardingIntent,
+  ) => {
+    await persistOnboardingCompletion(data);
 
     // Update the atom so UI reflects the change immediately (without requiring refresh)
     updateDeveloperSettings({ developerMode: data.developerMode });
@@ -72,93 +65,19 @@ export function useOnboarding({
       setActiveMode('agent');
     }
 
-    if (posthog) {
-      // Set person properties (persist to user profile). `user_role` and `referral_source`
-      // must be raw enum values so cohorts/insights can filter on them with exact match.
-      // Custom text from "Other" inputs goes into separate `*_text` properties.
-      const personProperties: Record<string, string | boolean> = {
-        developer_mode: data.developerMode,
-      };
-      if (data.email) {
-        personProperties.email = data.email;
-      }
-      if (data.role) {
-        personProperties.user_role = data.role;
-        if (data.customRole) {
-          personProperties.custom_role_text = data.customRole;
-        }
-      }
-      if (data.referralSource) {
-        if (data.referralSource.startsWith('ai:')) {
-          personProperties.referral_source = 'ai';
-          personProperties.referral_ai_detail = data.referralSource.substring('ai:'.length);
-        } else if (data.referralSource.startsWith('search:')) {
-          personProperties.referral_source = 'search';
-          personProperties.referral_search_detail = data.referralSource.substring('search:'.length);
-        } else if (data.referralSource.startsWith('other:')) {
-          personProperties.referral_source = 'other';
-          personProperties.referral_other_detail = data.referralSource.substring('other:'.length);
-        } else if (data.referralSource.startsWith('social:')) {
-          personProperties.referral_source = 'social';
-          personProperties.referral_social_detail = data.referralSource.substring('social:'.length);
-        } else {
-          personProperties.referral_source = data.referralSource;
-        }
-      }
-      posthog.people.set(personProperties);
+    // Person properties and the completion events are reported by
+    // `persistOnboardingCompletion` so every onboarding window reports the same
+    // thing.
 
-      // Track onboarding completion with role and referral data as plain event properties.
-      // Property names and raw values must match existing PostHog cohorts (Devs, Product Managers,
-      // role_other) which filter on `onboarding_completed` events with `user_role = "developer"`,
-      // `"product_manager"`, `"other"`, etc.
-      if (data.role || data.referralSource) {
-        const eventProps: Record<string, string | boolean> = {
-          developer_mode: data.developerMode,
-          email_provided: !!data.email,
-        };
-
-        if (data.role) {
-          eventProps['user_role'] = data.role;
-          if (data.customRole) {
-            eventProps['custom_role_text'] = data.customRole;
-          }
-        }
-        if (data.referralSource) {
-          // Split prefixed referrals into raw category + detail field so cohorts can filter
-          // on the bare category value (e.g. "ai", "search", "other", "social").
-          if (data.referralSource.startsWith('ai:')) {
-            eventProps['referral_source'] = 'ai';
-            eventProps['referral_ai_detail'] = data.referralSource.substring('ai:'.length);
-          } else if (data.referralSource.startsWith('search:')) {
-            eventProps['referral_source'] = 'search';
-            eventProps['referral_search_detail'] = data.referralSource.substring('search:'.length);
-          } else if (data.referralSource.startsWith('other:')) {
-            eventProps['referral_source'] = 'other';
-            eventProps['referral_other_detail'] = data.referralSource.substring('other:'.length);
-          } else if (data.referralSource.startsWith('social:')) {
-            eventProps['referral_source'] = 'social';
-            eventProps['referral_social_detail'] = data.referralSource.substring('social:'.length);
-          } else {
-            eventProps['referral_source'] = data.referralSource;
-          }
-        }
-
-        posthog.capture('onboarding_completed', eventProps);
-      }
-
-      // Track mode selection event (initial)
-      posthog.capture('developer_mode_changed', {
-        developer_mode: data.developerMode,
-        source: 'onboarding',
-        is_initial: true,
-      });
+    if (intent === 'tutorial') {
+      await window.electronAPI.tutorial.start('onboarding');
     }
 
     onboardingOpenRef.current = false;
 
     // After onboarding closes, check if we need to show Windows warning
     checkWindowsWarning();
-  }, [posthog, workspacePath, updateDeveloperSettings, setActiveMode]);
+  }, [workspacePath, updateDeveloperSettings, setActiveMode]);
 
   // Handle unified onboarding skip
   const handleOnboardingSkip = useCallback(async () => {

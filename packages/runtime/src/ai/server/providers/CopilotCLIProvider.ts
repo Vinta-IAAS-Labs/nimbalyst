@@ -19,6 +19,7 @@ import os from 'os';
 import path from 'path';
 import { BaseAgentProvider } from './BaseAgentProvider';
 import { buildUserMessageAddition } from './documentContextUtils';
+import { describeUnusableWorkspacePath } from './workspacePreconditions';
 import { buildClaudeCodeSystemPrompt } from '../../prompt';
 import { DEFAULT_MODELS } from '../../modelConstants';
 import {
@@ -133,7 +134,7 @@ export class CopilotCLIProvider extends BaseAgentProvider {
     this.config = config;
   }
 
-  getProviderName(): string {
+  getProviderName(): AIProviderType {
     return 'copilot-cli';
   }
 
@@ -227,12 +228,15 @@ export class CopilotCLIProvider extends BaseAgentProvider {
     workspacePath?: string,
     attachments?: ChatAttachment[]
   ): AsyncIterableIterator<StreamChunk> {
-    if (!workspacePath) {
-      yield { type: 'error', error: '[CopilotCLIProvider] workspacePath is required but was not provided' };
+    const unusableWorkspace = describeUnusableWorkspacePath(workspacePath);
+    if (unusableWorkspace || !workspacePath) {
+      yield { type: 'error', error: unusableWorkspace ?? 'No project folder is set for this session.' };
       return;
     }
 
-    const systemPrompt = this.buildSystemPrompt(documentContext);
+    const systemPrompt = this.buildSystemPrompt(
+      documentContext, await this.getSessionDirective(sessionId), this.isNamedOutOfBand(sessionId, documentContext),
+    );
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
 
     if (sessionId && (systemPrompt || userMessageAddition)) {
@@ -248,7 +252,7 @@ export class CopilotCLIProvider extends BaseAgentProvider {
     const prompt = messageWithContext;
 
     if (sessionId) {
-      const metadataToLog: Record<string, unknown> = {};
+      const metadataToLog: Record<string, unknown> = this.withPromptProvenanceMetadata(documentContext);
       if (documentContext?.mode) {
         metadataToLog.mode = documentContext.mode;
       }
@@ -423,14 +427,20 @@ export class CopilotCLIProvider extends BaseAgentProvider {
     super.destroy();
   }
 
-  protected buildSystemPrompt(documentContext?: DocumentContext): string {
+  protected buildSystemPrompt(
+    documentContext?: DocumentContext,
+    sessionDirective?: string,
+    hasOutOfBandNaming: boolean = false,
+  ): string {
     const hasSessionNaming = isInternalMcpServerEnabled();
     const worktreePath = documentContext?.worktreePath;
 
     return buildClaudeCodeSystemPrompt({
       hasSessionNaming,
+      hasOutOfBandNaming,
       toolReferenceStyle: 'codex',
       worktreePath,
+      sessionDirective,
       isVoiceMode: false,
       enableAgentTeams: false,
       trackersEnabled: areTrackerToolsEnabled(resolveTrackersWorkspacePath(documentContext)),

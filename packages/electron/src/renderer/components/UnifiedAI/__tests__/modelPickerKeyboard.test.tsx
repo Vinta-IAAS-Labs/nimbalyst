@@ -4,12 +4,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Provider, createStore } from 'jotai';
 import { ModelSelector } from '../ModelSelector';
+import { AIInputControls } from '../AIInputControls';
 import { isOpenModelPickerShortcut } from '../AIInput';
 import { advancedSettingsAtom } from '../../../store/atoms/appSettings';
 
-vi.mock('@nimbalyst/runtime', async (importOriginal) => ({
-  ...await importOriginal<typeof import('@nimbalyst/runtime')>(),
+vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: () => null,
+}));
+
+vi.mock('@nimbalyst/runtime/ui/icons/ProviderIcons', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@nimbalyst/runtime/ui/icons/ProviderIcons')>(),
   getProviderIcon: () => null,
 }));
 
@@ -21,6 +25,8 @@ vi.mock('@nimbalyst/runtime/ai/server/types', () => ({
 vi.mock('../../../help', () => ({
   HelpTooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
+
+vi.mock('../ContextUsageDisplay', () => ({ ContextUsageDisplay: () => null }));
 
 afterEach(() => cleanup());
 
@@ -44,6 +50,31 @@ describe('AI model picker keyboard controls', () => {
     expect(isOpenModelPickerShortcut({ key: 'm', metaKey: true, ctrlKey: false, shiftKey: true })).toBe(true);
     expect(isOpenModelPickerShortcut({ key: 'M', metaKey: false, ctrlKey: true, shiftKey: true })).toBe(true);
     expect(isOpenModelPickerShortcut({ key: 'm', metaKey: true, ctrlKey: false, shiftKey: false })).toBe(false);
+  });
+
+  it('preloads the catalog before the picker opens', async () => {
+    const aiGetModels = vi.fn().mockResolvedValue({
+      success: true,
+      grouped: {
+        claude: [{ id: 'claude:haiku', name: 'Haiku', provider: 'claude' }],
+      },
+    });
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { aiGetModels },
+    });
+
+    renderModelSelector(
+      <ModelSelector currentModel="claude:haiku" onModelChange={() => {}} />,
+      true,
+    );
+
+    expect(screen.queryByRole('menu')).toBeNull();
+    await waitFor(() => expect(aiGetModels).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId('model-picker'));
+    expect(await screen.findByRole('button', { name: 'Haiku' })).toBeTruthy();
+    expect(screen.queryByText('Loading models...')).toBeNull();
   });
 
   it('opens from the input shortcut, then changes models with ArrowDown and Enter', async () => {
@@ -264,8 +295,8 @@ describe('AI model picker provider visibility', () => {
     fireEvent.click(screen.getByTestId('model-picker'));
 
     expect(await screen.findByRole('button', { name: 'Haiku' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'GPT-5' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Local Model' })).toBeTruthy();
+    screen.getByRole('button', { name: 'GPT-5' });
+    screen.getByRole('button', { name: 'Local Model' });
   });
 
   it('keeps the current direct provider reachable for a started session', async () => {
@@ -284,5 +315,126 @@ describe('AI model picker provider visibility', () => {
     expect(await screen.findByRole('button', { name: 'Haiku' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'GPT-5' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Local Model' })).toBeNull();
+  });
+});
+
+
+describe('AI input menu handoff', () => {
+  function setup({ showEffort = true, disabledEffort = false, actions = true } = {}) {
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: {
+        aiGetModels: vi.fn().mockResolvedValue({ success: true, grouped: {
+          agents: [{ id: 'agents:example', name: 'Example', provider: 'agents' }],
+        } }),
+        invoke: vi.fn().mockResolvedValue({
+          actions: actions ? [
+            { id: 'review', label: 'Review', body: 'Review the changes' },
+            { id: 'tests', label: 'Write tests', body: 'Write regression tests' },
+            { id: 'types', label: 'Write types', body: 'Write type definitions' },
+          ] : [],
+          fileExists: actions,
+        }),
+      },
+    });
+    const onModelChange = vi.fn();
+    const onLevelChange = vi.fn();
+    const onInsert = vi.fn();
+    function Harness() {
+      const input = React.useRef<HTMLTextAreaElement>(null);
+      const [request, setRequest] = React.useState(0);
+      return <>
+        <textarea aria-label="Prompt" ref={input} onKeyDown={event => {
+          if (isOpenModelPickerShortcut(event)) {
+            event.preventDefault();
+            setRequest(value => value + 1);
+          }
+        }} />
+        <AIInputControls currentModel="agents:example" onModelChange={onModelChange}
+          showEffortLevel={showEffort} effortLevel="high" onEffortLevelChange={onLevelChange}
+          reasoningControlsDisabled={disabledEffort} workspacePath="/menu-test"
+          modelPickerOpenRequest={request} focusInput={() => input.current?.focus()}
+          onActionInsert={onInsert} />
+      </>;
+    }
+    renderModelSelector(<Harness />);
+    const input = screen.getByRole('textbox', { name: 'Prompt' });
+    input.focus();
+    fireEvent.keyDown(input, { key: 'M', metaKey: true, shiftKey: true });
+    return { input, onModelChange, onLevelChange, onInsert };
+  }
+
+  it('hands focus between portaled menus without selecting, and restores the prompt on Escape', async () => {
+    const { input, onModelChange, onLevelChange, onInsert } = setup();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Example' })));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('menuitemradio', { name: 'High' })));
+    expect(screen.getAllByRole('menu')).toHaveLength(1);
+    fireEvent.keyDown(document.activeElement!, { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(screen.getByRole('menuitemradio', { name: 'Medium' }));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('action-prompts-dropdown-panel')));
+    expect(onModelChange).not.toHaveBeenCalled();
+    expect(onLevelChange).not.toHaveBeenCalled();
+    expect(onInsert).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('menuitemradio', { name: 'High' })));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Example' })));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('action-prompts-dropdown-panel')));
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    await act(async () => {});
+    expect(document.activeElement).toBe(input);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it.each([{ showEffort: false }, { disabledEffort: true }])('skips unavailable effort and allows action selection: %j', async options => {
+    const { onInsert } = setup(options);
+    await screen.findByRole('button', { name: 'Example' });
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('action-prompts-dropdown-panel')));
+    await screen.findByTestId('action-prompt-item-review');
+    await act(async () => { fireEvent.keyDown(document.activeElement!, { key: 'Enter' }); });
+    expect(onInsert).toHaveBeenCalledWith('Review the changes');
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('can leave an empty Actions menu using Tab or Escape', async () => {
+    const { input } = setup({ actions: false });
+    await screen.findByRole('button', { name: 'Example' });
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('action-prompts-dropdown-panel')));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Example' })));
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('menuitemradio', { name: 'High' })));
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    await act(async () => {});
+    expect(document.activeElement).toBe(input);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('selects actions by word typeahead, ignoring modifiers and resetting across menu handoffs', async () => {
+    const { onInsert } = setup();
+    await screen.findByRole('button', { name: 'Example' });
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    const panel = await screen.findByTestId('action-prompts-dropdown-panel');
+    await screen.findByTestId('action-prompt-item-types');
+    fireEvent.keyDown(panel, { key: 'x', ctrlKey: true });
+    fireEvent.keyDown(panel, { key: 'x', isComposing: true });
+    for (const key of 'ty') fireEvent.keyDown(panel, { key });
+    expect(onInsert).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.keyDown(panel, { key: 'Enter' }); });
+    expect(onInsert).toHaveBeenLastCalledWith('Write type definitions');
+
+    fireEvent.click(screen.getByTestId('action-prompts-dropdown'));
+    fireEvent.keyDown(screen.getByTestId('action-prompts-dropdown-panel'), { key: 'r' });
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' });
+    const reopenedPanel = screen.getByTestId('action-prompts-dropdown-panel');
+    for (const key of 'te') fireEvent.keyDown(reopenedPanel, { key });
+    await act(async () => { fireEvent.keyDown(reopenedPanel, { key: 'Enter' }); });
+    expect(onInsert).toHaveBeenLastCalledWith('Write regression tests');
   });
 });

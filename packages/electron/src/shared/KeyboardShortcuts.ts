@@ -9,6 +9,9 @@ export const KeyboardShortcuts = {
     newFile: 'Cmd+N',
     newSession: 'Cmd+N',
     sessionLaunchPopup: 'Cmd+Shift+N',
+    // I for Issue. Cmd+Shift+T would be the natural sibling to Cmd+T (Tracker
+    // mode) but it is reopenClosedTab, and displacing that is not worth it.
+    trackerQuickCreate: 'Cmd+Shift+I',
     newBrowserTab: 'Cmd+Shift+B',
     open: 'Cmd+O',
     save: 'Cmd+S',
@@ -50,8 +53,16 @@ export const KeyboardShortcuts = {
     toggleCliTerminalDrawer: 'Ctrl+Shift+`',
     trackerMode: 'Cmd+T',
     collabMode: 'Cmd+D',
+    // The project's organization: inbox, rooms and direct messages. Every plain
+    // Cmd+letter is already spoken for, and this keeps the organization family
+    // together with `window.organizationManager` (Cmd+Alt+O), which still opens
+    // the standalone cross-organization window.
+    orgMode: 'Cmd+Alt+M',
     prReviewMode: 'Cmd+U',
     toggleSidebar: 'Cmd+B',
+    // Expand the active editor tab to fill the window (same action as
+    // double-clicking a tab). Matches Zed's workspace::ToggleZoom binding.
+    toggleExpandedTab: 'Shift+Escape',
 
     // Navigation
     navigateBack: 'Cmd+[',
@@ -84,11 +95,29 @@ export const KeyboardShortcuts = {
     contentSearch: 'Cmd+Shift+F',
     globalSearch: 'Cmd+Shift+O',
     teamQuickOpen: 'Cmd+Shift+D',
+    organizationManager: 'Cmd+Alt+O',
     projectQuickOpen: 'Cmd+Shift+P',
     kanbanView: 'Cmd+Shift+K',
     newWorktree: 'Cmd+Alt+W',
     aiModels: 'Cmd+,',
     minimize: 'Cmd+M'
+  },
+
+  // Messages Menu — organization window only.
+  //
+  // The application menu is a single global menu, so these accelerators are
+  // only attached while the organization window is the focused window (see the
+  // Messages menu in ApplicationMenu.ts). `newMessage` and `searchMessages`
+  // deliberately reuse `view.agentMode` and `edit.find`: both of those commands
+  // are meaningless in the organization window, and the menu hands the key back
+  // to them the moment focus leaves it.
+  orgWindow: {
+    newMessage: 'Cmd+K',
+    searchMessages: 'Cmd+F',
+    markAllRead: 'Cmd+Shift+U',
+    nextConversation: 'Cmd+Shift+]',
+    previousConversation: 'Cmd+Shift+[',
+    goToInbox: 'Cmd+I'
   },
 
   // Developer Menu

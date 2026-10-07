@@ -18,6 +18,10 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './IRawMessageParser';
+import { stagedAttachmentRegistry } from '../../attachments/stagedAttachmentRegistry';
+import { isBackgroundedToolAck, isInteractiveWidgetTool } from '../../interactivePromptTools';
+
+const ATTACHMENT_DENY_MESSAGE = 'File is in a directory that is denied by your permission settings.';
 
 // Tool names that represent sub-agent spawns
 const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
@@ -31,6 +35,7 @@ const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
 const WHOLE_MESSAGE_ELISION_MARKER = /^\[Full .+ message elided from mobile sync:.*\]$/;
 
 export class ClaudeCodeRawParser implements IRawMessageParser {
+  private readonly toolInputsById = new Map<string, { toolName: string; input: Record<string, unknown> }>();
   /**
    * Track API message IDs that have had text content processed.
    * Prevents duplicate text from streaming + accumulated echo chunks.
@@ -121,8 +126,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'tool_result') {
-              const result = this.parseToolResult(block, context);
-              if (result) descriptors.push(result);
+              descriptors.push(...await this.parseToolResult(block, context));
             }
           }
         } else if (typeof content === 'string') {
@@ -251,8 +255,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
               );
               descriptors.push(...toolDescriptors);
             } else if (block.type === 'tool_result') {
-              const result = this.parseToolResult(block, context);
-              if (result) descriptors.push(result);
+              descriptors.push(...await this.parseToolResult(block, context));
             }
           }
         }
@@ -266,6 +269,20 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             type: 'system_message',
             text: summary,
             systemType: 'status',
+            searchable: false,
+            createdAt: msg.createdAt,
+          });
+        }
+      } else if (parsed.type === 'system' && parsed.subtype === 'informational') {
+        // SDKInformationalMessage (SDK 0.3.283+): hook feedback such as a
+        // UserPromptSubmit block reason, and CLI warnings. The SDK renders
+        // `info` only in a verbose transcript mode, so we keep it out.
+        const content = typeof parsed.content === 'string' ? parsed.content.trim() : '';
+        if (content && parsed.level !== 'info') {
+          descriptors.push({
+            type: 'system_message',
+            text: content,
+            systemType: parsed.level === 'warning' ? 'error' : 'status',
             searchable: false,
             createdAt: msg.createdAt,
           });
@@ -305,6 +322,14 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
           ...(deniedReason ? { deniedReason } : {}),
           ...(deniedReasonType ? { deniedReasonType } : {}),
           ...(deniedInput ? { deniedInput } : {}),
+          ...(parsed.is_attachment_staging_denied === true ? {
+            isAttachmentStagingDenied: true,
+            attachmentPath: typeof parsed.attachment_path === 'string' ? parsed.attachment_path : undefined,
+            attachmentFilename: typeof parsed.attachment_filename === 'string' ? parsed.attachment_filename : undefined,
+            attachmentStagingMode: parsed.attachment_staging_mode,
+            attachmentDenyRule: typeof parsed.attachment_deny_rule === 'string' ? parsed.attachment_deny_rule : undefined,
+            attachmentDetection: parsed.attachment_detection === 'preflight' ? 'preflight' : 'reactive',
+          } : {}),
           createdAt: msg.createdAt,
         });
       } else if (parsed.type === 'error' && parsed.error) {
@@ -356,18 +381,17 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         const responseDescriptors = await this.parseGitCommitProposalResponse(parsed, context);
         descriptors.push(...responseDescriptors);
       } else if (parsed.type === 'nimbalyst_tool_result') {
-        const result = this.parseToolResult({
+        const results = await this.parseToolResult({
           tool_use_id: parsed.tool_use_id || parsed.id,
           content: parsed.result,
           is_error: parsed.is_error,
         }, context);
-        if (result) descriptors.push(result);
+        descriptors.push(...results);
       } else if (parsed.type === 'user' && parsed.message) {
         if (Array.isArray(parsed.message.content)) {
           for (const block of parsed.message.content) {
             if (block.type === 'tool_result') {
-              const result = this.parseToolResult(block, context);
-              if (result) descriptors.push(result);
+              descriptors.push(...await this.parseToolResult(block, context));
             }
           }
         } else if (typeof parsed.message.content === 'string' && parsed.message.content.trim()) {
@@ -489,28 +513,31 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
       subagentId: subagentId ?? null,
       createdAt: msg.createdAt,
     });
+    if (toolId) {
+      this.toolInputsById.set(toolId, { toolName, input: args });
+    }
 
     return descriptors;
   }
 
-  private parseToolResult(
+  private async parseToolResult(
     block: any,
     context: ParseContext,
-  ): CanonicalEventDescriptor | null {
+  ): Promise<CanonicalEventDescriptor[]> {
     const toolUseId = block.tool_use_id || block.id;
-    if (!toolUseId) return null;
+    if (!toolUseId) return [];
 
     // Check if this completes a subagent
     if (context.hasSubagent(toolUseId)) {
       const resultText = typeof block.content === 'string'
         ? block.content
         : JSON.stringify(block.content);
-      return {
+      return [{
         type: 'subagent_completed',
         subagentId: toolUseId,
         status: 'completed',
         resultSummary: resultText?.substring(0, 500),
-      };
+      }];
     }
 
     let resultText = '';
@@ -531,13 +558,66 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
       resultText = JSON.stringify(block.content);
     }
 
-    return {
+    // #1341: the harness parks a slow MCP call at 120s and puts an
+    // acknowledgement here. The call is still running and the user can still
+    // answer, so completing an interactive prompt on it retires the widget and
+    // leaves the question unanswerable. Drop the descriptor and let the prompt
+    // stay pending until it really settles. Non-interactive tools keep showing
+    // their acknowledgement -- for those it is the useful, honest status.
+    if (isBackgroundedToolAck(resultText)) {
+      const backgroundedToolName =
+        this.toolInputsById.get(toolUseId)?.toolName
+        ?? ((await context.findByProviderToolCallId(toolUseId))?.payload as Record<string, any> | undefined)?.toolName;
+      if (isInteractiveWidgetTool(backgroundedToolName)) {
+        return [];
+      }
+    }
+
+    const completed: CanonicalEventDescriptor = {
       type: 'tool_call_completed',
       providerToolCallId: toolUseId,
       status: block.is_error ? 'error' : 'completed',
       result: resultText,
       isError: block.is_error ?? false,
     };
+
+    if (!block.is_error || !resultText.includes(ATTACHMENT_DENY_MESSAGE)) {
+      return [completed];
+    }
+
+    const localTool = this.toolInputsById.get(toolUseId);
+    const existing = localTool ? null : await context.findByProviderToolCallId(toolUseId);
+    const existingPayload = existing?.payload as Record<string, any> | undefined;
+    const toolName = localTool?.toolName ?? existingPayload?.toolName;
+    const input = localTool?.input ?? existingPayload?.arguments;
+    if (!['Read', 'Edit', 'Write'].includes(toolName) || !input) {
+      return [completed];
+    }
+
+    const filePath = typeof input.file_path === 'string'
+      ? input.file_path
+      : typeof input.filePath === 'string'
+        ? input.filePath
+        : typeof input.path === 'string'
+          ? input.path
+          : undefined;
+    const staged = stagedAttachmentRegistry.find(context.sessionId, filePath);
+    if (!staged) return [completed];
+
+    return [completed, {
+      type: 'system_message',
+      text: `${toolName} could not access staged attachment ${staged.filename}.`,
+      systemType: 'permission_denied',
+      deniedToolName: toolName,
+      deniedReason: ATTACHMENT_DENY_MESSAGE,
+      deniedReasonType: 'rule',
+      deniedInput: input,
+      isAttachmentStagingDenied: true,
+      attachmentPath: staged.path,
+      attachmentFilename: staged.filename,
+      attachmentStagingMode: staged.mode,
+      attachmentDetection: 'reactive',
+    }];
   }
 
   private async parseNimbalystToolUse(

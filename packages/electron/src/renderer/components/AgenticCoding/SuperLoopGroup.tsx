@@ -10,7 +10,8 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef, memo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
-import { MaterialSymbol, ProviderIcon } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { ProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import {
   superRunnerStateAtom,
   superIterationsAtom,
@@ -27,6 +28,7 @@ import {
 } from '../../store';
 import type { SuperLoop, SuperLoopStatus, SuperIteration, SuperLearning } from '../../../shared/types/superLoop';
 import { getRelativeTimeString } from '../../utils/dateFormatting';
+import { sessionAgentWakePendingAtom } from '../../store/atoms/teamInbox';
 
 interface SuperLoopGroupProps {
   loopId: string;
@@ -125,6 +127,7 @@ const SuperGroupStatus: React.FC<{ sessionIds: string[]; loopStatus: SuperLoopSt
 const SuperIterationStatus: React.FC<{ sessionId: string }> = memo(({ sessionId }) => {
   const isProcessing = useAtomValue(sessionProcessingAtom(sessionId));
   const hasPendingPrompt = useAtomValue(sessionPendingPromptAtom(sessionId));
+  const hasAgentWakePending = useAtomValue(sessionAgentWakePendingAtom(sessionId));
   const hasUnread = useAtomValue(sessionUnreadAtom(sessionId));
 
   if (isProcessing) {
@@ -133,6 +136,9 @@ const SuperIterationStatus: React.FC<{ sessionId: string }> = memo(({ sessionId 
         <MaterialSymbol icon="progress_activity" size={12} />
       </div>
     );
+  }
+  if (hasAgentWakePending) {
+    return <MaterialSymbol icon="hourglass_top" size={12} />;
   }
   if (hasPendingPrompt) {
     return (
@@ -475,13 +481,13 @@ export const SuperLoopGroup: React.FC<SuperLoopGroupProps> = memo(({
 
   return (
     <div
-      className={`super-loop-group mb-1 ${loop.isArchived ? 'archived' : ''} ${isActive ? 'active' : ''} ${isSelected ? 'selected' : ''}`}
+      className={`super-loop-group pb-1 ${loop.isArchived ? 'archived' : ''} ${isActive ? 'active' : ''} ${isSelected ? 'selected' : ''}`}
       data-testid={`super-loop-group-${loopId}`}
       onMouseLeave={handleCloseContextMenu}
     >
       {/* Header - matches BlitzGroup/WorkstreamGroup header structure */}
       <div
-        className={`super-loop-group-header flex items-center gap-0 text-[0.8125rem] text-[var(--nim-text)] transition-colors duration-150 rounded-md mx-2 w-[calc(100%-1rem)] ${
+        className={`super-loop-group-header flex items-center gap-0 text-[0.8125rem] text-[var(--nim-text)] transition-colors duration-150 rounded-md mr-2 w-[calc(100%-0.5rem)] ${
           isSelected ? 'bg-[var(--nim-bg-selected)]' : isActive ? 'bg-[var(--nim-bg-selected)]' : 'hover:bg-[var(--nim-bg-hover)]'
         }`}
         onContextMenu={handleContextMenu}

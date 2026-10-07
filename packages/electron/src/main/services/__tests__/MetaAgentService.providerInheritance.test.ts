@@ -5,13 +5,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 //   1. AISessionsRepository.get  - the parent-session lookup the fix relies on.
 //   2. A working ModelIdentifier.tryParse / getDefaultModelId (the sibling test
 //      stubs ModelIdentifier as {}, which throws once tryParse is reached).
-vi.mock('@nimbalyst/runtime', () => ({
+vi.mock('@nimbalyst/runtime/storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: {
     create: vi.fn(),
     updateMetadata: vi.fn(),
     get: vi.fn(),
   },
+}));
+vi.mock('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository', () => ({
   AgentMessagesRepository: {},
+}));
+vi.mock('@nimbalyst/runtime/storage/repositories/SessionFilesRepository', () => ({
   SessionFilesRepository: {},
 }));
 
@@ -99,7 +103,7 @@ vi.mock('../ai/claudeCliLauncherSingleton', () => ({
   ClaudeCliLauncherConfig: { setMetaAgentServerPort: vi.fn() },
 }));
 
-import { AISessionsRepository } from '@nimbalyst/runtime';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { database as databaseWorker } from '../../database/PGLiteDatabaseWorker';
 import { MetaAgentService } from '../MetaAgentService';
 
@@ -190,6 +194,40 @@ describe('MetaAgentService child-spawn provider inheritance', () => {
     const created = vi.mocked(AISessionsRepository.create).mock.calls[0][0] as any;
     expect(created.provider).toBe('openai-codex');
     expect(created.model).toBe('openai-codex:gpt-5.4');
+  });
+
+  it('marks a child initial prompt as agent-authored by the spawning session', async () => {
+    const service = MetaAgentService.getInstance();
+    const queuePromptForSession = vi.fn().mockResolvedValue({ id: 'queued-1' });
+    const triggerQueuedPromptProcessingForSession = vi.fn().mockResolvedValue(true);
+    (service as any).aiService = {
+      queuePromptForSession,
+      triggerQueuedPromptProcessingForSession,
+    };
+    const originalShouldBypass = (service as any).shouldBypassChildAgentExecutionForTests;
+    (service as any).shouldBypassChildAgentExecutionForTests = () => false;
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    try {
+      await (service as any).createChildSessionInternal('parent-claude-session', '/workspace/path', {
+        prompt: 'Implement the delegated slice',
+      });
+    } finally {
+      (service as any).shouldBypassChildAgentExecutionForTests = originalShouldBypass;
+    }
+
+    expect(queuePromptForSession).toHaveBeenCalledWith(
+      expect.any(String),
+      'Implement the delegated slice',
+      undefined,
+      {
+        promptProvenance: {
+          actor: 'agent',
+          origin: 'session-orchestration',
+          originSessionId: 'parent-claude-session',
+        },
+      },
+    );
   });
 
   it('still lets an explicit model arg win over the inherited parent', async () => {
@@ -298,6 +336,80 @@ describe('MetaAgentService child-spawn provider inheritance', () => {
     const created = vi.mocked(AISessionsRepository.create).mock.calls[0][0] as any;
     expect(created.provider).toBe('antigravity-gemini-agent');
     expect(created.provider).not.toBe('claude-code');
+  });
+});
+
+describe('MetaAgentService child-spawn effort level', () => {
+  beforeEach(() => {
+    vi.mocked(AISessionsRepository.create).mockReset();
+    vi.mocked(AISessionsRepository.get).mockReset();
+    vi.mocked(AISessionsRepository.updateMetadata).mockReset();
+    vi.mocked(databaseWorker.query).mockResolvedValue({ rows: [{ in_flight: '0', total: '0' }] } as any);
+  });
+
+  // Effort is written with the row (create) so the first turn can never read it
+  // missing; count follow-up writes too so a regression to either shows up.
+  const effortWrites = () =>
+    [
+      ...vi.mocked(AISessionsRepository.create).mock.calls.map((call) => (call[0] as any)?.metadata?.effortLevel),
+      ...vi.mocked(AISessionsRepository.updateMetadata).mock.calls.map((call) => (call[1] as any)?.metadata?.effortLevel),
+    ].filter((level) => level !== undefined);
+
+  it('persists a requested effort level so the child runs at it instead of the app default', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    // The motivating case: spawn astra at medium. Every turn reads effort back
+    // out of session metadata, so the metadata write IS the feature.
+    await (service as any).createChildSessionInternal('parent-claude-session', '/workspace/path', {
+      model: 'openai-codex:gpt-6-astra',
+      effortLevel: 'medium',
+    });
+
+    expect(effortWrites()).toEqual(['medium']);
+  });
+
+  it('clamps a requested level down to the model ceiling rather than storing one the transport would lower', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    // ultra is Codex-only; a claude-code child tops out at max. Storing the raw
+    // 'ultra' would leave the child's effort selector showing a level the
+    // provider never runs at.
+    await (service as any).createChildSessionInternal('parent-claude-session', '/workspace/path', {
+      model: 'claude-code:opus',
+      effortLevel: 'ultra',
+    });
+
+    expect(effortWrites()).toEqual(['max']);
+  });
+
+  it('writes no effort level when none is requested, leaving the child on the app default', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    // Omitted means app default, NOT inherited from the caller — so nothing may
+    // be written, or resolveEffortLevel would stop consulting the default.
+    await (service as any).createChildSessionInternal('parent-claude-session', '/workspace/path', {});
+
+    expect(effortWrites()).toEqual([]);
+  });
+
+  it('rejects an unrecognized effort level before creating the session instead of silently using the default', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    await expect(
+      (service as any).createChildSessionInternal('parent-claude-session', '/workspace/path', {
+        effortLevel: 'mid',
+      })
+    ).rejects.toThrow(/Invalid effortLevel "mid"/);
+
+    expect(AISessionsRepository.create).not.toHaveBeenCalled();
   });
 });
 

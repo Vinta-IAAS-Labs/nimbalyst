@@ -1,3 +1,4 @@
+import { handleConsumeSessionInbox } from './tools/consumeSessionInbox';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -27,7 +28,7 @@ import {
   registerWorkspaceMappingForConnection,
   ExtensionToolDefinition,
 } from "./mcpWorkspaceResolver";
-import { handleBackendTool, isBackendTool } from "./tools/backendToolHandler";
+import { filterBackendToolsForSession, handleBackendTool, isBackendTool } from "./tools/backendToolHandler";
 import { setBackendToolsChangeNotifier } from "./backendToolRegistry";
 
 // Tool handlers + schemas
@@ -46,15 +47,36 @@ import {
   getEditorToolSchemas,
 } from "./tools/editorToolHandlers";
 import {
+  CANVAS_WORKING_SET_TOOL_SCHEMAS,
+  handleDeclareCanvasWorkingSet,
+  handleReleaseCanvasWorkingSet,
+} from "./tools/canvasWorkingSetToolHandlers";
+import {
   handleCreateSharedDoc,
+  handleImportFileToPages,
   handleCreateSharedFolder,
   handleMoveSharedItem,
   handleRenameSharedItem,
   handleDeleteSharedItem,
+  handleListPages,
+  handleSearchPages,
+  handleSetPageType,
+  handleSetPageFields,
   getCollabIndexToolSchemas,
 } from "./tools/collabIndexToolHandlers";
 import {
+  getCollabReadToolSchemas,
+  handleFindOrgMembers,
+  handleGetResourceSharingStatus,
+} from "./tools/collabReadToolHandlers";
+import {
+  getRequestFeedbackToolSchemas,
+  handleRequestFeedback,
+} from "./tools/requestFeedbackToolHandler";
+import {
   handleTrackerList,
+  handleTrackerReady,
+  handleWorkRadar,
   handleTrackerGet,
   handleTrackerListTypes,
   handleTrackerDefineType,
@@ -416,9 +438,11 @@ function createSharedMcpServer(
       );
       // Backend-module-registered tools (executed by the module, not the
       // renderer) live in a parallel registry; merge them in for this endpoint.
-      const backendTools = await getAvailableBackendTools(
-        workspacePath,
-        currentFilePath
+      // This server serves one Nimbalyst session, so owned-sessions tools are
+      // filtered for that session here (the registry itself is per workspace).
+      const backendTools = await filterBackendToolsForSession(
+        await getAvailableBackendTools(workspacePath, currentFilePath),
+        sessionId
       );
       allTools = [
         ...selectExtensionToolsForEndpoint(extensionTools, endpoint.extensionShortName),
@@ -437,7 +461,10 @@ function createSharedMcpServer(
 
     const builtInTools: Array<{ name: string; description: string; inputSchema: any }> = [
       ...getEditorToolSchemas(sessionId),
+      ...CANVAS_WORKING_SET_TOOL_SCHEMAS.map((tool) => ({ ...tool })),
       ...getCollabIndexToolSchemas(),
+      ...getCollabReadToolSchemas(),
+      ...getRequestFeedbackToolSchemas(),
       ...displayToolSchemas,
       ...voiceToolSchemas,
       ...getInteractiveToolSchemas(sessionId),
@@ -480,7 +507,11 @@ function createSharedMcpServer(
   // and keyed by type name, so a tool call must resolve schemas against ITS OWN
   // workspace -- otherwise a call for one project reads (and used to overwrite)
   // another open project's identically-named tracker types (#1035).
-  server.setRequestHandler(CallToolRequestSchema, withTrackerSchemaWorkspace(workspacePath, async (request: any) => {
+  // `extra` carries the SDK's per-request `sendNotification` and `signal`. The
+  // interactive prompts need both: progress keepalives so the client's idle
+  // watchdog never aborts a question the user is still looking at, and the
+  // abort signal so a cancelled call tears its waiter down (#1341).
+  server.setRequestHandler(CallToolRequestSchema, withTrackerSchemaWorkspace(workspacePath, async (request: any, extra: any) => {
     const { name, arguments: args } = request.params;
     if (request.params._meta) {
       console.log(
@@ -494,14 +525,17 @@ function createSharedMcpServer(
 
     try {
       switch (toolName) {
+        case 'consume_session_inbox':
+          if (extra.requestId === undefined) throw new Error('Inbox request identity is required');
+          return handleConsumeSessionInbox(sessionId, request);
         case "applyDiff":
-          return handleApplyDiff(args);
+          return handleApplyDiff(args, sessionId, workspacePath);
 
         case "applyCollabDocEdit":
-          return handleApplyCollabDocEdit(args);
+          return handleApplyCollabDocEdit(args, sessionId, workspacePath);
 
         case "readCollabDoc":
-          return handleReadCollabDoc(args);
+          return handleReadCollabDoc(args, workspacePath);
 
         case "readCollabDocComments":
           return handleReadCollabDocComments(args, workspacePath);
@@ -520,11 +554,20 @@ function createSharedMcpServer(
             workspacePath,
           );
 
+        case "declareCanvasWorkingSet":
+          return handleDeclareCanvasWorkingSet(args, sessionId, workspacePath);
+
+        case "releaseCanvasWorkingSet":
+          return handleReleaseCanvasWorkingSet(args, sessionId, workspacePath);
+
         case "createSharedDoc":
           return handleCreateSharedDoc(args, workspacePath);
 
         case "createSharedFolder":
           return handleCreateSharedFolder(args, workspacePath);
+
+        case "importFileToPages":
+          return handleImportFileToPages(args, workspacePath);
 
         case "moveSharedItem":
           return handleMoveSharedItem(args, workspacePath);
@@ -534,6 +577,27 @@ function createSharedMcpServer(
 
         case "deleteSharedItem":
           return handleDeleteSharedItem(args, workspacePath);
+
+        case "listPages":
+          return handleListPages(args, workspacePath);
+
+        case "searchPages":
+          return handleSearchPages(args, workspacePath);
+
+        case "setPageType":
+          return handleSetPageType(args, workspacePath);
+
+        case "setPageFields":
+          return handleSetPageFields(args, workspacePath);
+
+        case "findOrgMembers":
+          return handleFindOrgMembers(args, workspacePath);
+
+        case "getResourceSharingStatus":
+          return handleGetResourceSharingStatus(args, workspacePath);
+
+        case "RequestFeedback":
+          return handleRequestFeedback(args, workspacePath);
 
         case "streamContent":
           return handleStreamContent(args);
@@ -551,20 +615,26 @@ function createSharedMcpServer(
           return handleVoiceAgentStop();
 
         case "AskUserQuestion":
-          return handleAskUserQuestion(args, sessionId, request);
+          return handleAskUserQuestion(args, sessionId, request, extra);
 
         case "PromptForUserInput":
-          return handleRequestUserInput(args, sessionId, workspacePath, request);
+          return handleRequestUserInput(args, sessionId, workspacePath, request, extra);
 
         case "get_session_edited_files":
           return handleGetSessionEditedFiles(sessionId);
 
         case "developer_git_commit_proposal":
         case "developer.git_commit_proposal":
-          return handleGitCommitProposal(args, sessionId, workspacePath, request);
+          return handleGitCommitProposal(args, sessionId, workspacePath, request, extra);
 
         case "tracker_list":
           return handleTrackerList(args, workspacePath);
+
+        case "tracker_ready":
+          return handleTrackerReady(args, workspacePath);
+
+        case "work_radar":
+          return handleWorkRadar(args, workspacePath);
 
         case "tracker_get":
           return handleTrackerGet(args, workspacePath);
@@ -659,7 +729,10 @@ function createSharedMcpServer(
           if (workspacePath) {
             const resolvedBackendWs = await resolveBackendWorkspacePath(workspacePath);
             if (isBackendTool(toolName, resolvedBackendWs)) {
-              return handleBackendTool(toolName, name, args, resolvedBackendWs);
+              return handleBackendTool(toolName, name, args, resolvedBackendWs, {
+                sessionId: sessionId ?? null,
+                caller: "agent",
+              });
             }
           }
           return handleExtensionTool(toolName, name, args, sessionId, workspacePath);
@@ -675,6 +748,28 @@ function createSharedMcpServer(
 }
 
 // ---- HTTP Transport Helpers ----
+
+/**
+ * The MCP Streamable HTTP spec requires an Accept header naming both
+ * `application/json` and `text/event-stream`; the SDK's transport 406s any
+ * request missing either ("Not Acceptable: Client must accept both...").
+ *
+ * Not every MCP client sends one. Antigravity's `call_mcp_tool` bridge does
+ * not, and every tool call it makes is rejected before reaching a handler --
+ * observed live, logged only as `[MCP:nimbalyst] Server error`, which gives a
+ * user nothing to act on. This is a loopback server that can always answer
+ * with either content type, so correcting a noncompliant header costs nothing
+ * and beats failing a client whose request shape we do not control.
+ *
+ * Groundwork for connecting Antigravity to these endpoints, but the leniency
+ * stands on its own for any client with the same gap.
+ */
+export function ensureMcpAcceptHeader(accept: string | undefined): string {
+  if (accept?.includes("application/json") && accept.includes("text/event-stream")) {
+    return accept;
+  }
+  return "application/json, text/event-stream";
+}
 
 function getMcpSessionIdHeader(req: IncomingMessage): string | undefined {
   const headerValue = req.headers["mcp-session-id"];
@@ -784,6 +879,15 @@ async function tryCreateServer(port: number): Promise<any> {
             res.end(JSON.stringify({ decision: "ask", reason: "missing sessionId or toolName" }));
             return;
           }
+          // NIM-2607: if the CLI that asked dies, this socket closes. Give the
+          // waiter a signal for it so the approval surface comes down instead of
+          // waiting out its ~10m timeout with nobody left to answer. The
+          // response is only written after the await, so a 'close' before then
+          // always means the caller went away.
+          const permissionAbort = new AbortController();
+          const abortPermission = () => permissionAbort.abort();
+          req.once("aborted", abortPermission);
+          res.once("close", abortPermission);
           try {
             // The handler blocks until the user answers the widget (up to ~10m).
             const result = await handleToolPermission(
@@ -791,6 +895,7 @@ async function tryCreateServer(port: number): Promise<any> {
               permSessionId,
               body?.cwd,
               {},
+              { signal: permissionAbort.signal },
             );
             let decision: "allow" | "deny" = "deny";
             try {
@@ -806,6 +911,9 @@ async function tryCreateServer(port: number): Promise<any> {
             // True error (not a deny) → let the CLI fall back to its native prompt.
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ decision: "ask", reason: "permission handler error" }));
+          } finally {
+            req.off("aborted", abortPermission);
+            res.off("close", abortPermission);
           }
           return;
         }
@@ -822,6 +930,12 @@ async function tryCreateServer(port: number): Promise<any> {
         // Endpoint-path routing: which split server (or legacy full surface)
         // this connection serves. null for non-/mcp paths (handled below).
         const mcpEndpoint = resolveMcpEndpoint(pathname);
+
+        // See ensureMcpAcceptHeader: not every MCP client sends an Accept
+        // header the SDK's transport will take.
+        if (isMcpEndpoint(pathname)) {
+          req.headers.accept = ensureMcpAcceptHeader(req.headers.accept);
+        }
 
         // Handle SSE GET request to establish connection
         if (isMcpEndpoint(pathname) && req.method === "GET") {

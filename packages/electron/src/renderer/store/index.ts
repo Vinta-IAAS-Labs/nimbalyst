@@ -68,6 +68,7 @@ export {
 // Session atoms (Electron IPC)
 export {
   sessionListAtom,
+  sessionRemoteHostAtom,
   activeSessionIdAtom,
   sessionProcessingAtom,
   sessionUnreadAtom,
@@ -97,6 +98,7 @@ export {
   anySessionProcessingAtom,
   anyPendingInteractivePromptAtom,
   markSessionReadAtom,
+  markSessionsReadAtom,
   setActiveSessionAtom,
   // Session list loading
   sessionListLoadingAtom,
@@ -105,6 +107,9 @@ export {
   sessionListChatAtom,
   showArchivedSessionsAtom,
   refreshSessionListAtom,
+  // Pin toggles published across surfaces (Agent mode header -> session sidebar)
+  sessionPinnedUpdateAtom,
+  publishSessionPinnedUpdateAtom,
   initSessionList,
   addSessionFullAtom,
   updateSessionFullAtom,
@@ -128,12 +133,14 @@ export {
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
   sessionThinkingModeRawAtom,
+  sessionOpenCodeRoleAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
   sessionArchivedAtom,
   sessionActiveAtom,
   sessionTitleAtom,
+  sessionListTitleAtom,
   sessionProviderAtom,
   sessionAgentRoleAtom,
   sessionPhaseAtom,
@@ -199,6 +206,10 @@ export {
   fileTreeAtom,
   rawFileTreeAtom,
   fileTreeLoadedAtom,
+  workspaceRootPathsAtom,
+  buildFileTreeForest,
+  normalizeTreePath,
+  replaceFolderChildren,
   gitStatusMapAtom,
   fileGitStatusAtom,
   expandedDirsAtom,
@@ -382,7 +393,7 @@ export {
   isTrackerResourceId,
   fileResource,
   trackerResource,
-  convertToWorkstreamAtom,
+  transferSessionStateToWrapperAtom,
   cleanupWorkstreamAtom,
   initWorkstreamState,
   loadWorkstreamStates,
@@ -486,3 +497,14 @@ export {
   clearVoiceActiveSession,
   persistAndClearVoiceSession,
 } from './listeners/voiceModeListeners';
+
+export {
+  feedbackRequestAtomKey,
+  feedbackRequestTargetKey,
+  feedbackRequestActiveViewerAtomFamily,
+  feedbackRequestAtomFamily,
+  feedbackRequestProgressAtomFamily,
+  feedbackRequestResponsesForViewerAtomFamily,
+  feedbackRequestStateAtomFamily,
+  feedbackRequestStateForTargetAtomFamily,
+} from './atoms/feedbackRequests';

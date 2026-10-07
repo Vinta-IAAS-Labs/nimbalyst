@@ -2,9 +2,23 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { watch, FSWatcher } from 'fs';
-import { MCPConfig, MCPServerConfig, MCPServerEnv } from '@nimbalyst/runtime/types/MCPServerConfig';
+import {
+  MCPConfig,
+  MCPServerConfig,
+  MCPServerEnv,
+  isMCPServerEnabledForProvider,
+  type MCPProviderId,
+} from '@nimbalyst/runtime/types/MCPServerConfig';
 import { logger } from '../utils/logger';
-import { getEnhancedPath } from './CLIManager';
+import { getEnhancedPath } from './shellEnvironment';
+import {
+  applyDisabledMcpjsonServersToSettings,
+  applyDisabledServersToClaudeConfig,
+  claudeDisabledServersInput,
+  type ClaudeConfigShape,
+  type ClaudeDisabledServersInput,
+  type ClaudeSettingsShape,
+} from './mcp/claudeCodeDisabledServers';
 import {
   buildMcpRemoteArgs,
   checkMcpRemoteAuthStatus,
@@ -12,6 +26,12 @@ import {
   extractMcpRemoteConfig,
   usesNativeRemoteOAuth,
 } from './MCPRemoteOAuth';
+import {
+  requiresMcpRemote,
+  resolveMcpRemoteRequirementOptions,
+  type McpRemoteRequirementOptions,
+} from './mcpRemoteRequirement';
+import { normalizeProjectPathKey, resolveProjectConfigKey } from './mcpProjectKey';
 
 /**
  * Service for managing MCP server configurations.
@@ -34,6 +54,94 @@ export interface TestProgressCallback {
 interface ClaudeConfig {
   mcpServers?: Record<string, MCPServerConfig>;
   [key: string]: any; // Other Claude Code settings
+}
+
+/** What `loadTrustGatedMcpServers` needs from its caller. */
+export interface TrustGatedMcpLoaderOptions {
+  service: Pick<
+    MCPConfigService,
+    'getMergedConfigWithOrigins' | 'isOAuthAuthorized' | 'processServerConfigForRuntime'
+  >;
+  providerId: MCPProviderId;
+  /** Used only in log lines. */
+  displayName: string;
+  workspacePath?: string;
+  /**
+   * Read the workspace's stored trust mode.
+   *
+   * A thunk rather than a value so the read happens *inside* this function's
+   * fail-closed catch. Evaluating it at the call site put the permission-store
+   * read outside the catch, and a throw from there reached the runtime's
+   * ungated fallback loader — the exact bypass the catch exists to prevent.
+   */
+  getTrustMode: () => 'ask' | 'allow-all' | 'bypass-all' | null | undefined;
+  log?: { info: (message: string) => void; warn: (message: string, error?: unknown) => void };
+}
+
+/**
+ * The servers a headless CLI agent may be given, with the repository's own
+ * servers withheld unless the user already trusted this workspace to run things
+ * without asking.
+ *
+ * Grok and Cursor are handed their servers at session start and spawn each
+ * `command` themselves — Grok's arrive inline on ACP `session/new`, which
+ * happens before the first permission prompt can be shown. So a `.mcp.json`
+ * committed to a repository executes on the first turn after a clone, in a
+ * workspace the user only ever set to `ask`. Gating on the same trust mode the
+ * turn gate consults keeps that from being a way around it. A server the user
+ * configured globally is never withheld: they chose it, and cloning a
+ * repository cannot change that.
+ *
+ * Two failure modes matter as much as the gate itself, because the runtime's
+ * MCP config service catches anything thrown by a config loader and falls back
+ * to reading `<workspace>/.mcp.json` *directly*, with no gate at all:
+ *
+ * - A malformed entry (`{"mcpServers": {"bad": null}}`) is skipped, not thrown
+ *   on. A repository could otherwise pair one null entry with one real command
+ *   and reach the ungated fallback on purpose.
+ * - Anything else that goes wrong returns an empty map. Losing MCP for a turn
+ *   is recoverable; handing a repository's commands to a CLI is not.
+ */
+export async function loadTrustGatedMcpServers({
+  service,
+  providerId,
+  displayName,
+  workspacePath,
+  getTrustMode,
+  log = logger.mcp,
+}: TrustGatedMcpLoaderOptions): Promise<Record<string, MCPServerConfig>> {
+  try {
+    const { mcpServers, repositoryProvided } = await service.getMergedConfigWithOrigins(workspacePath);
+    const trustMode = getTrustMode();
+    const repositoryAllowed = trustMode === 'allow-all' || trustMode === 'bypass-all';
+
+    const enabledServers: Record<string, MCPServerConfig> = {};
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        log.info(`[MCP] Ignoring malformed MCP server entry for ${displayName}: ${name}`);
+        continue;
+      }
+      if (!repositoryAllowed && repositoryProvided.has(name)) {
+        log.info(
+          `[MCP] Withholding repository-provided server from ${displayName} until this workspace is trusted to run without asking: ${name}`,
+        );
+        continue;
+      }
+      if (!isMCPServerEnabledForProvider(config, providerId)) continue;
+      const isAuthorized = await service.isOAuthAuthorized(config, {
+        useMcpRemoteForNativeOAuth: true,
+      });
+      if (!isAuthorized) {
+        log.info(`[MCP] Skipping unauthorized OAuth server for ${displayName}: ${name}`);
+        continue;
+      }
+      enabledServers[name] = service.processServerConfigForRuntime(config);
+    }
+    return enabledServers;
+  } catch (error) {
+    log.warn(`[MCP] Could not load MCP servers for ${displayName}; continuing with none:`, error);
+    return {};
+  }
 }
 
 /**
@@ -299,19 +407,24 @@ export class MCPConfigService {
   }
 
   /**
-   * Read workspace-scope MCP configuration (.mcp.json in project root).
+   * Read the two workspace-scope sources separately, so a caller that needs to
+   * know which of them a server came from can find out from the same read that
+   * produced it.
+   *
+   * Splitting this out of `readWorkspaceMCPConfig` is a security requirement,
+   * not tidiness: classifying origin from a second read of `.mcp.json` means the
+   * file can change between the two, and a config that has since been deleted
+   * reads back as "no repository servers" while its commands are already loaded.
    */
-  async readWorkspaceMCPConfig(workspacePath: string): Promise<MCPConfig> {
-    if (!workspacePath) {
-      throw new Error('workspacePath is required');
-    }
-
-    // Try reading from two locations and merge them:
-    // 1. ~/.claude.json projects section (Claude CLI standard)
-    // 2. .mcp.json in workspace root (legacy/alternative location)
-
+  private async readWorkspaceMcpLayers(workspacePath: string): Promise<{
+    claudeJsonServers: Record<string, MCPServerConfig>;
+    mcpJsonServers: Record<string, MCPServerConfig>;
+    /** True when `.mcp.json` existed but could not be read or parsed. */
+    mcpJsonUnreadable: boolean;
+  }> {
     let claudeJsonServers: Record<string, MCPServerConfig> = {};
     let mcpJsonServers: Record<string, MCPServerConfig> = {};
+    let mcpJsonUnreadable = false;
 
     // 1. Read from ~/.claude.json projects section
     try {
@@ -320,8 +433,12 @@ export class MCPConfigService {
         projects?: Record<string, { mcpServers?: Record<string, MCPServerConfig> }>;
       };
 
-      if (claudeConfig.projects && claudeConfig.projects[workspacePath]) {
-        claudeJsonServers = claudeConfig.projects[workspacePath].mcpServers || {};
+      // Match on the normalized path: Claude Code writes forward-slash keys,
+      // Nimbalyst passes native Windows paths, and an exact comparison never
+      // matched the two.
+      const projectKey = resolveProjectConfigKey(claudeConfig.projects, workspacePath);
+      if (projectKey && claudeConfig.projects) {
+        claudeJsonServers = claudeConfig.projects[projectKey].mcpServers || {};
       }
     } catch (error: any) {
       if (error.code !== 'ENOENT') {
@@ -338,8 +455,22 @@ export class MCPConfigService {
     } catch (error: any) {
       if (error.code !== 'ENOENT') {
         logger.mcp.warn('Failed to read .mcp.json:', error);
+        mcpJsonUnreadable = true;
       }
     }
+
+    return { claudeJsonServers, mcpJsonServers, mcpJsonUnreadable };
+  }
+
+  /**
+   * Read workspace-scope MCP configuration (.mcp.json in project root).
+   */
+  async readWorkspaceMCPConfig(workspacePath: string): Promise<MCPConfig> {
+    if (!workspacePath) {
+      throw new Error('workspacePath is required');
+    }
+
+    const { claudeJsonServers, mcpJsonServers } = await this.readWorkspaceMcpLayers(workspacePath);
 
     // Merge both sources: .mcp.json overrides ~/.claude.json projects
     return {
@@ -347,6 +478,53 @@ export class MCPConfigService {
         ...claudeJsonServers,
         ...mcpJsonServers
       })
+    };
+  }
+
+  /**
+   * The merged server map, plus which of those servers the *repository author*
+   * controls rather than the user.
+   *
+   * `getMergedConfig` flattens the sources into one map and loses that, but only
+   * `<workspace>/.mcp.json` is content that arrives with a `git clone`;
+   * `~/.claude.json` (global and per-project alike) is the user's own file.
+   * Callers that hand servers to a CLI which spawns `command` without asking
+   * need the distinction to gate on workspace trust.
+   *
+   * Both answers come from one read, so nothing can change on disk between
+   * "what are the servers" and "where did they come from".
+   *
+   * Fails closed. `.mcp.json` wins the merge, so a name in both sources is
+   * repository-provided in the config that is actually used; and if `.mcp.json`
+   * existed but could not be read, every workspace-scope server is treated as
+   * repository-provided rather than assumed safe.
+   */
+  async getMergedConfigWithOrigins(workspacePath?: string): Promise<{
+    mcpServers: Record<string, MCPServerConfig>;
+    repositoryProvided: Set<string>;
+  }> {
+    const userConfig = await this.readUserMCPConfig();
+    if (!workspacePath) {
+      return { mcpServers: userConfig.mcpServers ?? {}, repositoryProvided: new Set() };
+    }
+
+    const { claudeJsonServers, mcpJsonServers, mcpJsonUnreadable } =
+      await this.readWorkspaceMcpLayers(workspacePath);
+
+    const repositoryProvided = new Set(Object.keys(mcpJsonServers));
+    if (mcpJsonUnreadable) {
+      for (const name of Object.keys(claudeJsonServers)) {
+        repositoryProvided.add(name);
+      }
+    }
+
+    return {
+      mcpServers: this.normalizeServers({
+        ...userConfig.mcpServers,
+        ...claudeJsonServers,
+        ...mcpJsonServers,
+      }),
+      repositoryProvided,
     };
   }
 
@@ -398,13 +576,19 @@ export class MCPConfigService {
           claudeConfig.projects = {};
         }
 
-        // Initialize this project's entry if it doesn't exist
-        if (!claudeConfig.projects[workspacePath]) {
-          claudeConfig.projects[workspacePath] = {};
+        // Write into the entry Claude Code already owns when there is one, and
+        // otherwise create it in the forward-slash form Claude Code reads.
+        // Writing the native Windows path here forked a second entry that
+        // Claude Code could never see.
+        const existingKey = resolveProjectConfigKey(claudeConfig.projects, workspacePath);
+        const projectKey = existingKey ?? normalizeProjectPathKey(workspacePath);
+
+        if (!claudeConfig.projects[projectKey]) {
+          claudeConfig.projects[projectKey] = {};
         }
 
         // Update the mcpServers for this project
-        claudeConfig.projects[workspacePath].mcpServers = config.mcpServers;
+        claudeConfig.projects[projectKey].mcpServers = config.mcpServers;
 
         // Write back to ~/.claude.json
         const claudeContent = JSON.stringify(claudeConfig, null, 2);
@@ -419,6 +603,97 @@ export class MCPConfigService {
     } catch (error) {
       logger.mcp.error('Failed to write workspace MCP config:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Project Nimbalyst's on/off state into Claude Code's own disable fields
+   * (NIM-2372) so the CLI honors the toggle without Nimbalyst having to override
+   * its whole config with `--strict-mcp-config`. See claudeCodeDisabledServers.ts
+   * for the field mapping and the read-modify-write contract.
+   *
+   * Both files are co-owned with the CLI and the user, so this only ever touches
+   * names Nimbalyst manages, and skips the write entirely when nothing changed.
+   * Never throws: a session start must not fail over a config projection.
+   *
+   * Scope note: the CLI keys `disabledMcpServers` off the session's cwd. Worktree
+   * sessions run from the worktree path, not `workspacePath`, so their toggles are
+   * not projected — they fall back to whatever the ecosystem already says.
+   */
+  /**
+   * Project the current on/off state for a workspace, computing the input from
+   * the merged config so callers don't each decide what "off" means.
+   *
+   * Session start passes the map it has already read. The Settings write path
+   * passes nothing and pays for a re-read, so flipping a toggle lands in
+   * `~/.claude.json` right away — otherwise a terminal `claude` in that project
+   * keeps loading the server until the next Nimbalyst session happens to start.
+   */
+  async projectClaudeCodeDisabledServers(
+    workspacePath: string | undefined,
+    allServers?: Record<string, MCPServerConfig>
+  ): Promise<void> {
+    if (!workspacePath) return;
+    const servers = allServers ?? (await this.getMergedConfig(workspacePath)).mcpServers ?? {};
+    await this.syncClaudeCodeDisabledServers(workspacePath, claudeDisabledServersInput(servers));
+  }
+
+  async syncClaudeCodeDisabledServers(
+    workspacePath: string,
+    input: ClaudeDisabledServersInput
+  ): Promise<void> {
+    if (!workspacePath) return;
+
+    try {
+      const claudeConfigRaw = await this.readJsonFile<ClaudeConfigShape>(this.userConfigPath);
+      const { config, changed } = applyDisabledServersToClaudeConfig(
+        claudeConfigRaw ?? {},
+        workspacePath,
+        input
+      );
+      if (changed) {
+        this.markRecentWrite(this.userConfigPath);
+        await fs.writeFile(this.userConfigPath, JSON.stringify(config, null, 2), 'utf8');
+        logger.mcp.info(
+          `[MCP] Synced disabledMcpServers for ${workspacePath}: ` +
+            `${config.projects?.[workspacePath]?.disabledMcpServers?.join(', ') || '(none)'}`
+        );
+      }
+    } catch (error) {
+      logger.mcp.warn('Failed to sync disabledMcpServers into ~/.claude.json:', error);
+    }
+
+    try {
+      const mcpJson = await this.readJsonFile<MCPConfig>(path.join(workspacePath, '.mcp.json'));
+      const mcpJsonNames = Object.keys(mcpJson?.mcpServers ?? {});
+      if (mcpJsonNames.length === 0) return;
+
+      const settingsPath = path.join(workspacePath, '.claude', 'settings.local.json');
+      const existing = await this.readJsonFile<ClaudeSettingsShape>(settingsPath);
+      const { settings, changed } = applyDisabledMcpjsonServersToSettings(
+        existing ?? {},
+        input,
+        mcpJsonNames
+      );
+      if (changed) {
+        await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+        this.markRecentWrite(settingsPath);
+        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      }
+    } catch (error) {
+      logger.mcp.warn('Failed to sync disabledMcpjsonServers into .claude/settings.local.json:', error);
+    }
+  }
+
+  /** Read + parse a JSON file, or null when it is missing/unreadable/malformed. */
+  private async readJsonFile<T>(filePath: string): Promise<T | null> {
+    try {
+      return JSON.parse(await fs.readFile(filePath, 'utf8')) as T;
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        logger.mcp.warn(`Failed to read ${filePath}:`, error);
+      }
+      return null;
     }
   }
 
@@ -715,7 +990,17 @@ export class MCPConfigService {
    *
    * Headers are passed as --header arguments to mcp-remote.
    */
-  private convertHttpToStdio(serverConfig: MCPServerConfig): MCPServerConfig {
+  private convertHttpToStdio(
+    serverConfig: MCPServerConfig,
+    options: McpRemoteRequirementOptions = {},
+  ): MCPServerConfig {
+    // A CLI that speaks HTTP natively does not need the wrapper for a server
+    // that uses no OAuth. Wrapping it costs a process tree and puts the token
+    // on the command line.
+    if (!requiresMcpRemote(serverConfig, options)) {
+      return serverConfig;
+    }
+
     const remoteConfig = extractMcpRemoteConfig(serverConfig);
     if (serverConfig.type !== 'http' || !remoteConfig) {
       return serverConfig;
@@ -734,6 +1019,20 @@ export class MCPConfigService {
     };
   }
 
+  /**
+   * Resolve the wrapper decision for one server before it is used.
+   *
+   * Callers that pass `nativeHttpSupported` must run this first and hand the
+   * result to BOTH `isOAuthAuthorized` and `processServerConfigForRuntime`, so
+   * the two answers are derived from the same reading of ~/.mcp-auth (NIM-2433).
+   */
+  async resolveMcpRemoteOptions(
+    serverConfig: MCPServerConfig,
+    options: McpRemoteRequirementOptions,
+  ): Promise<McpRemoteRequirementOptions> {
+    return resolveMcpRemoteRequirementOptions(serverConfig, options);
+  }
+
   isOAuthServer(serverConfig: MCPServerConfig): boolean {
     if (usesNativeRemoteOAuth(serverConfig)) {
       return true;
@@ -744,9 +1043,39 @@ export class MCPConfigService {
 
   async isOAuthAuthorized(
     serverConfig: MCPServerConfig,
-    options: { useMcpRemoteForNativeOAuth?: boolean } = {}
+    options: { useMcpRemoteForNativeOAuth?: boolean } & McpRemoteRequirementOptions = {}
   ): Promise<boolean> {
     if (usesNativeRemoteOAuth(serverConfig) && !options.useMcpRemoteForNativeOAuth) {
+      return true;
+    }
+    // The token this would go on to look for has already been found by
+    // `resolveMcpRemoteOptions`; re-probing the server over the network to
+    // rediscover that it wants OAuth buys nothing.
+    if (options.hasCachedMcpRemoteToken) {
+      return true;
+    }
+    // A remote server we are not going to wrap must not be OAuth-probed through
+    // mcp-remote either: a static-key server answering 401 to that probe was
+    // being classified as an unauthorized OAuth server and silently dropped.
+    //
+    // This covers `sse` as well as `http` (nimbalyst#1057). `requiresMcpRemote`
+    // refuses to wrap anything that is not `http`, so an sse server always goes
+    // to the CLI directly and no token is ever written to ~/.mcp-auth -- gating
+    // it on that token dropped every sse OAuth server from the session while the
+    // same config worked in the Claude CLI on its own keychain token. stdio
+    // servers that are themselves `npx mcp-remote` invocations are excluded, and
+    // still go through the real check.
+    //
+    // `useMcpRemoteForNativeOAuth` opts a caller INTO the wrapper for native-OAuth
+    // servers (Codex, Codex ACP, Copilot), so it must not be short-circuited here:
+    // `requiresMcpRemote` says "no wrapper" for anything with OAuth credentials,
+    // which would report every such server authorized and stop those providers
+    // dropping the ones that are not.
+    if (
+      (serverConfig.type === 'http' || serverConfig.type === 'sse') &&
+      !options.useMcpRemoteForNativeOAuth &&
+      !requiresMcpRemote(serverConfig, options)
+    ) {
       return true;
     }
     const remoteConfig = extractMcpRemoteConfig(serverConfig, options);
@@ -825,9 +1154,13 @@ export class MCPConfigService {
    * Routes bare `node` commands through Electron's bundled Node runtime so
    * MCP servers do not require a system-wide Node install (see #197).
    */
-  processServerConfigForRuntime(serverConfig: MCPServerConfig): MCPServerConfig {
-    // First, convert HTTP to stdio with mcp-remote wrapper
-    let config = this.normalizeTransportFields(this.convertHttpToStdio(serverConfig));
+  processServerConfigForRuntime(
+    serverConfig: MCPServerConfig,
+    options: McpRemoteRequirementOptions = {},
+  ): MCPServerConfig {
+    // First, convert HTTP to stdio with mcp-remote wrapper (unless the target
+    // CLI speaks HTTP natively and the server needs no OAuth)
+    let config = this.normalizeTransportFields(this.convertHttpToStdio(serverConfig, options));
 
     // Only process stdio servers with a command
     if (config.type === 'sse' || !config.command) {

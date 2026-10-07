@@ -1,18 +1,33 @@
 import { BrowserWindow, shell, nativeImage, app, powerMonitor } from 'electron';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import { windowStates, windows, getWindowId } from '../window/WindowManager';
+import { syncRepresentedFilename } from '../window/windowState';
 import { basename, join } from 'path';
-import { writeFileSync, existsSync } from 'fs';
+import { writeFileSync, existsSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { reportDesktopActivity, setWindowFocused, setScreenLocked, setIdleThresholdMs, attemptReconnect } from '../services/SyncManager';
 import { startNetworkAvailability, onNetworkAvailable, notifyNetworkAvailable } from '../services/NetworkAvailability';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
+import { hasFocusedWindow } from '../services/analytics/dailyActiveHeartbeat';
 import { getPackageRoot } from '../utils/appPaths';
 import { resolveImageExtension } from '../utils/imageFormat';
+import { resolveWorkspaceAttachmentStagingDirectory } from '../services/attachments/attachmentStagingRoot';
+import { registerConsoleLinkHandlers, routeConsoleLink } from '../services/consoleLinks/consoleLinkHandlers';
 
 /** Timestamp of last app_foregrounded event, used to throttle to once per 30 minutes */
 let lastForegroundedEventAt = 0;
 const FOREGROUND_THROTTLE_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * How often to re-check whether the daily-active heartbeat is due while the app
+ * simply stays focused. Focus alone is not enough: someone who leaves Nimbalyst
+ * open across local midnight never fires another focus event, and would go
+ * missing from DAU for the whole of the new day.
+ *
+ * The tick itself emits nothing — it is a date comparison — so the interval is
+ * about how fast a rolled-over day is noticed, not about volume.
+ */
+const DAILY_ACTIVE_CHECK_MS = 10 * 60 * 1000; // 10 minutes
 
 export function registerWindowHandlers() {
     // Get initial window state
@@ -47,9 +62,14 @@ export function registerWindowHandlers() {
         };
     });
 
-    // Open external URL in default browser
+    registerConsoleLinkHandlers();
+
+    // Open external URL in default browser. A console link to a page, typed
+    // page, type, view or citation goes to the window first, which opens it
+    // in the app when it can.
     safeHandle('open-external', async (event, url: string) => {
         if (url && typeof url === 'string') {
+            if (routeConsoleLink(url, event.sender)) return;
             await shell.openExternal(url);
         }
     });
@@ -103,13 +123,23 @@ export function registerWindowHandlers() {
         }
     });
 
+    // Keep the window's represented file (AXDocument) on the visible document.
+    // The renderer sends null when none is visible, which clears it instead of
+    // leaving a stale path behind.
+    safeOn('set-represented-file', (event, filePath: string | null) => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        if (!window) return;
+
+        syncRepresentedFilename(window, filePath);
+    });
+
 
     // Open image in default application
     safeHandle('image:open-in-default-app', async (event, imagePath: string) => {
         try {
             // Handle data URLs by creating a temp file
             if (imagePath.startsWith('data:')) {
-                const tempPath = await createTempFileFromDataURL(imagePath);
+                const tempPath = await createTempFileFromDataURL(imagePath, workspacePathForEvent(event));
                 if (tempPath) {
                     await shell.openPath(tempPath);
                     return { success: true };
@@ -152,7 +182,7 @@ export function registerWindowHandlers() {
 
             // Handle data URLs by creating a temp file
             if (imagePath.startsWith('data:')) {
-                const tempPath = await createTempFileFromDataURL(imagePath);
+                const tempPath = await createTempFileFromDataURL(imagePath, workspacePathForEvent(event));
                 if (!tempPath) {
                     return { success: false, error: 'Failed to create temp file from data URL' };
                 }
@@ -214,6 +244,10 @@ export function registerWindowHandlers() {
             win.webContents.send('window:focus-changed', true);
         }
 
+        // Focus is our cleanest "a human is here" signal, so it drives the
+        // daily-active heartbeat. At most one event per install per local day.
+        AnalyticsService.getInstance().maybeEmitDailyActive();
+
         // Emit app_foregrounded for DAU tracking when a window gains focus,
         // throttled to once per 30 minutes to keep event volume low
         const now = Date.now();
@@ -222,6 +256,15 @@ export function registerWindowHandlers() {
             AnalyticsService.getInstance().sendEvent('app_foregrounded');
         }
     });
+
+    // Catch the day rolling over under an app that is focused but idle. Gated on
+    // a window actually being focused so an install nobody has touched stays out
+    // of DAU -- background-only installs were a third of the old inflated number.
+    setInterval(() => {
+        if (hasFocusedWindow(BrowserWindow.getAllWindows())) {
+            AnalyticsService.getInstance().maybeEmitDailyActive();
+        }
+    }, DAILY_ACTIVE_CHECK_MS).unref();
 
     app.on('browser-window-blur', (_event, win) => {
         // Check if any window is still focused
@@ -272,7 +315,15 @@ export function registerWindowHandlers() {
 }
 
 // Helper function to create a temp file from a data URL
-async function createTempFileFromDataURL(dataURL: string): Promise<string | null> {
+function workspacePathForEvent(event: Electron.IpcMainInvokeEvent): string | undefined {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window) return undefined;
+    const windowId = getWindowId(window);
+    if (windowId === null) return undefined;
+    return windowStates.get(windowId)?.workspacePath ?? undefined;
+}
+
+async function createTempFileFromDataURL(dataURL: string, workspacePath?: string): Promise<string | null> {
     try {
         // Parse data URL: data:image/png;base64,iVBORw0KGgo...
         const matches = dataURL.match(/^data:([^;]+);base64,(.+)$/);
@@ -290,7 +341,11 @@ async function createTempFileFromDataURL(dataURL: string): Promise<string | null
         const extension = resolveImageExtension(mimeType, buffer);
 
         // Create temp file
-        const tempPath = join(tmpdir(), `image-${Date.now()}.${extension}`);
+        const root = workspacePath
+            ? join(resolveWorkspaceAttachmentStagingDirectory(workspacePath), 'images')
+            : tmpdir();
+        mkdirSync(root, { recursive: true });
+        const tempPath = join(root, `image-${Date.now()}.${extension}`);
         writeFileSync(tempPath, buffer);
 
         return tempPath;

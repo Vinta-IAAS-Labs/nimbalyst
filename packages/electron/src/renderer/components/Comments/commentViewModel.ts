@@ -60,6 +60,7 @@ const KIND_ICON: Record<ResourceKind, string> = {
   commit: 'commit',
   pullRequest: 'call_merge',
   conversation: 'forum',
+  feedbackRequest: 'ballot',
 };
 
 const KIND_LABEL: Record<ResourceKind, string> = {
@@ -70,6 +71,7 @@ const KIND_LABEL: Record<ResourceKind, string> = {
   commit: 'Commit',
   pullRequest: 'Pull request',
   conversation: 'Conversation',
+  feedbackRequest: 'Feedback request',
 };
 
 /** Kinds that can degrade to "Not in your workspace" rather than "Unavailable". */
@@ -85,7 +87,7 @@ const WORKSPACE_SCOPED: ReadonlySet<ResourceKind> = new Set<ResourceKind>(['file
  * unavailable arm cannot: the type has no such field.
  */
 export function toPillView(ref: ResourceRef, state: ResourcePreviewState | undefined): ResourcePillView {
-  const kind = ref.kind as ResourceKind;
+  const kind = ref.kind;
   const urn = resourceRefToUrn(ref);
   const availability = state?.availability ?? 'loading';
 
@@ -305,6 +307,7 @@ export interface BuildCommentViewContext {
   pending?: boolean;
   pendingLabel?: string;
   failed?: boolean;
+  pendingAgentSessionIds?: readonly string[];
 }
 
 export function buildCommentView(comment: Comment, ctx: BuildCommentViewContext): CommentView {
@@ -320,7 +323,11 @@ export function buildCommentView(comment: Comment, ctx: BuildCommentViewContext)
         mentionedAgentSessionIds: comment.deliveryHints?.mentionedAgentSessionIds ?? [],
         directory,
         viewerUserId: ctx.viewerUserId,
+        pendingAgentSessionIds: ctx.pendingAgentSessionIds,
         pills,
+        // A message's attachments live in the conversation's asset namespace,
+        // which is what `sourceId` names for every conversation-backed source.
+        assetDocumentId: comment.ref.sourceId,
       });
 
   const actor = buildActorView(comment, directory, ctx.viewerUserId);
@@ -429,6 +436,7 @@ function buildReplyParent(
       directory,
       viewerUserId: ctx.viewerUserId,
       pills: parentPills,
+      assetDocumentId: parent.ref.sourceId,
     }),
   );
 
@@ -527,7 +535,12 @@ export function validateDraft(draft: DraftState): DraftValidation {
     ...validateMentionLimits(draft.mentionedUserIds, draft.mentionedAgentSessionIds).errors,
   ];
 
-  const isEmpty = draft.body.text.trim().length === 0 && draft.resourceRefs.length === 0;
+  // A screenshot with no caption is a message. Emptiness is "nothing to
+  // deliver", not "no text".
+  const isEmpty =
+    draft.body.text.trim().length === 0
+    && draft.resourceRefs.length === 0
+    && (draft.body.attachments?.length ?? 0) === 0;
 
   return {
     errors,

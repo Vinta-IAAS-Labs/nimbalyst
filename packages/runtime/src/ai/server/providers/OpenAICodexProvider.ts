@@ -1,9 +1,10 @@
+import { codexSessionConfigurationKey } from '../protocols/codexAppServer/windowsSandbox';
 import path from 'path';
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { BaseAgentProvider } from './BaseAgentProvider';
 import { buildUserMessageAddition } from './documentContextUtils';
-import { buildClaudeCodeSystemPrompt, buildMetaAgentSystemPrompt, type MetaAgentWorkflowPreset } from '../../prompt';
+import { describeUnusableWorkspacePath } from './workspacePreconditions';
 import { DEFAULT_MODELS } from '../../modelConstants';
 import { AIToolCall, AIToolResult } from '../../types';
 import {
@@ -16,15 +17,21 @@ import {
   ModelIdentifier,
   ChatAttachment,
 } from '../types';
+import { AgentCapabilities, BUILTIN_AGENT_CAPABILITIES } from '../agentCapabilities';
+import type { FileChangeFidelity } from '../providerFileTracking';
 import { CodexSDKProtocol } from '../protocols/CodexSDKProtocol';
 import { CodexAppServerProtocol, type CodexAppServerHostBindings } from '../protocols/CodexAppServerProtocol';
+import {setCodexShellTrackingHost} from '../protocols/codexAppServer/shellTracking';
 import { AgentProtocol, ProtocolEvent, ProtocolSession } from '../protocols/ProtocolInterface';
+import { isNonRenderingAppServerItemStarted } from '../transcript/parsers/CodexAppServerRawParser';
+import { capAppServerItemParamsForStorage } from '../../../storage/toolOutputBudget';
 import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
+import { buildCodexSystemPrompt } from './codex/codexSystemPrompt';
 import { McpConfigService } from '../services/McpConfigService';
-import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
+import { getMcpConfigService } from '../services/mcpServerConfig';
 import { MCPServerConfig } from '../../../types/MCPServerConfig';
 import { safeJSONSerialize } from '../../../utils/serialization';
 import { AskUserQuestionPrompt, AskUserQuestionPromptOption } from './shared/askUserQuestionTypes';
@@ -114,6 +121,13 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     contextWindow: number;
     maxTokens: number;
   }> = [
+    // GPT-6 catalog entries require codex >= 0.153.0 (Astra), >= 0.155.0
+    // (Sol, Luna), and >= 0.159.1 (6.1 Sol); the catalog lists a 272k default
+    // context window for all of them.
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-sol', name: 'GPT-6 Sol', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 272000, maxTokens: 128000 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 372000, maxTokens: 128000 },
     { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: 372000, maxTokens: 128000 },
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 372000, maxTokens: 128000 },
@@ -122,6 +136,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
   ];
   private static readonly MODEL_FALLBACK_PRIORITY: ReadonlyArray<string> = [
+    'gpt-6.1-sol',
+    'gpt-6-sol',
+    'gpt-6-luna',
     'gpt-5.6-sol',
     'gpt-5.6-terra',
     'gpt-5.6-luna',
@@ -138,20 +155,32 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   private static readonly MODEL_ID_CACHE_DURATION_MS = 5 * 60 * 1000;
   private static readonly MODEL_ID_CACHE_MAX_SIZE = 100;
   private static readonly MODEL_ID_CACHE = new Map<string, { fetchedAt: number; ids: Set<string> }>();
-  private static readonly KNOWN_SLASH_COMMANDS: ReadonlyArray<string> = [
-    'compact',
-    'diff',
-    'init',
-    'mcp',
-    'review',
-    'status',
-  ];
+  /**
+   * Slash commands this integration can actually service.
+   *
+   * Deliberately empty (#1252). This used to list Codex's *TUI* command names
+   * -- compact, diff, init, mcp, review, status -- which were never the right
+   * source for a protocol integration: none of them are interpreted by the
+   * app-server, so every one reached the model as literal prompt text and did
+   * nothing. Advertising a command that silently no-ops is worse than
+   * advertising none, because the user cannot tell the difference between
+   * "ignored" and "ran and did nothing".
+   *
+   * Compaction is now a real action wired to `thread/compact/start` via
+   * `compactSession()`, exposed through the Compact button rather than through
+   * a typed command. `review/start` is the obvious next candidate to wire the
+   * same way; add entries here only once the command is genuinely serviced.
+   */
+  private static readonly KNOWN_SLASH_COMMANDS: ReadonlyArray<string> = [];
 
   private readonly protocol: CodexProtocol;
   private readonly transport: CodexTransport;
   private readonly permissionService: ToolPermissionService;
   private readonly mcpConfigService: McpConfigService;
   private readonly pendingAskUserQuestions = new Map<string, PendingAskUserQuestionEntry>();
+  /** Latest MCP startup status per server name, for the session MCP chip (NIM-2962). */
+  private readonly appServerMcpStatuses = new Map<string, { name: string; status: string; error?: string }>();
+  private appServerMcpSessionId: string | undefined;
 
   /**
    * Per-session map of `rawItemId -> synthetic edit-group ID`. Used to
@@ -296,6 +325,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     OpenAICodexProvider.appServerHostBindings = bindings;
   }
 
+  public static setShellTrackingHost(host: Parameters<typeof setCodexShellTrackingHost>[0]): void {
+    setCodexShellTrackingHost(host);
+  }
+
   // Host-supplied auth gate. Returns whether OpenAI auth is currently required
   // (i.e. the user is signed out). Only consulted for the `app-server`
   // transport, before createSession/resumeSession. Lets the provider emit a
@@ -385,12 +418,21 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     });
   }
 
-  getProviderName(): string {
+  getProviderName(): AIProviderType {
     return 'openai-codex';
   }
 
   getTransport(): CodexTransport {
     return this.transport;
+  }
+
+  /**
+   * The app-server emits `fileChange` items carrying path, kind and a unified
+   * diff per change. The legacy SDK transport emits none, so it can only offer
+   * the paths named in tool arguments.
+   */
+  getFileChangeFidelity(): FileChangeFidelity {
+    return this.transport === 'sdk' ? 'tool-args' : 'structured';
   }
 
   public static setTrustChecker(checker: TrustChecker | null): void {
@@ -484,7 +526,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   static normalizeModelSelection(modelId: string): string {
     const normalized = modelId.trim().toLowerCase();
     if (OpenAICodexProvider.LEGACY_MODEL_ALIASES.has(normalized)) {
-      return 'openai-codex:gpt-5.6-sol';
+      return OpenAICodexProvider.DEFAULT_MODEL;
     }
 
     const parsed = ModelIdentifier.tryParse(modelId);
@@ -855,6 +897,19 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     return OpenAICodexProvider.getKnownSlashCommands();
   }
 
+  /**
+   * Skills codex can actually resolve for this workspace (#1253).
+   *
+   * Sourced from the transport's `skills/list`, which now includes Nimbalyst's
+   * exported skills because `registerSkillRoots` adds them as an extra root.
+   * Empty until the first session has started -- the `/` typeahead is
+   * synchronous, so it renders "no skills" rather than blocking on an RPC.
+   */
+  getSkills(): string[] {
+    const skillSource = this.protocol as unknown as { getSkillNames?: () => string[] };
+    return typeof skillSource.getSkillNames === 'function' ? skillSource.getSkillNames() : [];
+  }
+
   getProviderSessionData(sessionId: string): any {
     const { providerSessionId } = this.sessions.getProviderSessionData(sessionId);
     return {
@@ -918,15 +973,20 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     workspacePath?: string,
     attachments?: ChatAttachment[]
   ): AsyncIterableIterator<StreamChunk> {
-    if (!workspacePath) {
-      yield { type: 'error', error: '[OpenAICodexProvider] workspacePath is required but was not provided' };
+    const unusableWorkspace = describeUnusableWorkspacePath(workspacePath);
+    if (unusableWorkspace || !workspacePath) {
+      yield { type: 'error', error: unusableWorkspace ?? 'No project folder is set for this session.' };
       return;
     }
 
     const agentRole = await this.getAgentRole(sessionId);
     const isMetaAgent = agentRole === 'meta-agent';
     const workflowPreset = isMetaAgent ? await this.getWorkflowPreset(sessionId) : 'default';
-    const systemPrompt = this.buildSystemPrompt(documentContext, isMetaAgent, workflowPreset);
+    const systemPrompt = buildCodexSystemPrompt({
+      documentContext, isMetaAgent, workflowPreset, model: this.config?.model ?? undefined,
+      sessionDirective: await this.getSessionDirective(sessionId),
+      hasOutOfBandNaming: this.isNamedOutOfBand(sessionId, documentContext),
+    });
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
     const unsupportedAttachmentHints = attachments?.filter(
       (attachment) => attachment.type !== 'image' && attachment.type !== 'document'
@@ -961,7 +1021,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     });
 
     if (sessionId) {
-      const metadataToLog: Record<string, unknown> = {};
+      const metadataToLog: Record<string, unknown> = this.withPromptProvenanceMetadata(documentContext);
       if (attachments && attachments.length > 0) {
         metadataToLog.attachments = attachments;
       }
@@ -1017,7 +1077,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       //   2. A persisted thread id (`this.sessions.getSessionId`) from a prior
       //      Nimbalyst process. Call `resumeSession` to attach to it.
       //   3. Otherwise, `createSession`.
-      const permissionKey = `${permissionDecision.permissionMode ?? 'none'}:${permissionDecision.agentVerified === true}`;
+      // Include authorized sibling roots in the cache key so new worktrees take effect next turn.
+      const additionalDirectories = OpenAICodexProvider.additionalDirectoriesLoader
+        ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
+        : [];
+
+      const permissionKey = codexSessionConfigurationKey(permissionDecision.permissionMode, permissionDecision.agentVerified === true, workspacePath, additionalDirectories);
       let cachedLiveSession = sessionId ? this.liveProtocolSessions.get(sessionId) : undefined;
       if (
         sessionId &&
@@ -1056,12 +1121,8 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       // Merge in shell env vars and the enhanced PATH so the Codex agent can see system tools.
       let codexEnv = OpenAICodexProvider.buildCodexEnvironment();
 
-      // Layer session-specific env vars for the PreToolUse hook. The hook
-      // script reads NIMBALYST_PRE_EDIT_DIR to know where to write per-path
-      // pre-edit snapshots, and ELECTRON_RUN_AS_NODE makes process.execPath
-      // (an Electron binary) run as plain Node so we don't have to ship a
-      // separate Node runtime. When the resolver isn't wired up (tests, older
-      // electron builds) the hook is simply not configured.
+      // The SDK pre-edit hook uses Electron as Node and writes snapshots to
+      // this session's sidecar directory. App-server observation is host-owned.
       const sidecarDir = this.transport === 'sdk' && sessionId
         ? OpenAICodexProvider.preEditSidecarDirResolver?.(sessionId)
         : undefined;
@@ -1079,20 +1140,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         baseEnv.ELECTRON_RUN_AS_NODE = '1';
         codexEnv = baseEnv;
         // console.log('[CODEX] Pre-edit hook env configured:', { sessionId, sidecarDir });
-      } else if (sessionId) {
-        // console.log('[CODEX] Pre-edit hook sidecar dir resolver returned undefined', { sessionId });
       }
 
       const resolvedModel = await this.getConfiguredModel();
-
-      // Sibling worktrees and the parent project root the agent is allowed to
-      // write to, in addition to its workingDirectory. Without this, Codex's
-      // workspace-write sandbox blocks orchestrator edits across worktrees and
-      // `git rebase --continue` from inside a worktree (the .git common dir
-      // sits outside the worktree). Issue #37 problem 1.
-      const additionalDirectories = OpenAICodexProvider.additionalDirectoriesLoader
-        ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
-        : [];
 
       const sessionOptions = {
         workspacePath,
@@ -1104,6 +1154,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           disallowedTools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'LS', 'Bash', 'WebFetch', 'WebSearch', 'Task', 'Agent'].filter(t => !BaseAgentProvider.META_AGENT_ALLOWED_TOOLS.includes(t)),
         } : {}),
         raw: {
+          nimbalystSessionId: sessionId,
           systemPrompt,
           abortSignal: abortController.signal,
           agentVerified: permissionDecision.agentVerified === true,
@@ -1258,7 +1309,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         // Route by `metadata.transport` set by `CodexAppServerProtocol`.
         const isAppServerEvent = event.type === 'raw_event'
           && (event as { metadata?: { transport?: string } }).metadata?.transport === 'app-server';
+
         if (isAppServerEvent) {
+          // NIM-2962: surface MCP server health instead of discarding it.
+          this.handleAppServerMcpStatus(event, sessionId);
           try {
             const { preEdit, postEdit } = await this.maybeBuildAppServerFileChangeSnapshots(event, sessionId);
             if (preEdit) yield preEdit;
@@ -1840,44 +1894,13 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     super.destroy();
   }
 
-  /**
-   * Build system prompt for Codex using the same addendum as Claude Code.
-   * Uses buildClaudeCodeSystemPrompt to include Nimbalyst-specific instructions
-   * for visual tools, worktrees, session naming, etc.
-   */
-  protected buildSystemPrompt(documentContext?: DocumentContext, isMetaAgent: boolean = false, workflowPreset: MetaAgentWorkflowPreset = 'default'): string {
-    if (isMetaAgent) {
-      return buildMetaAgentSystemPrompt('codex', workflowPreset, {
-        provider: 'openai-codex',
-        model: this.config?.model ?? undefined,
-      });
-    }
-
-    const hasSessionNaming = isInternalMcpServerEnabled();
-    const worktreePath = documentContext?.worktreePath;
-    const isVoiceMode = (documentContext as any)?.isVoiceMode;
-    const voiceModeCodingAgentPrompt = (documentContext as any)?.voiceModeCodingAgentPrompt;
-    // Note: Agent teams are not currently supported for Codex
-    const enableAgentTeams = false;
-
-    return buildClaudeCodeSystemPrompt({
-      hasSessionNaming,
-      toolReferenceStyle: 'codex',
-      worktreePath,
-      isVoiceMode,
-      voiceModeCodingAgentPrompt,
-      enableAgentTeams,
-      trackersEnabled: areTrackerToolsEnabled(resolveTrackersWorkspacePath(documentContext)),
-    });
-  }
-
   private async getConfiguredModel(): Promise<string> {
     const configured = this.config?.model || OpenAICodexProvider.DEFAULT_MODEL;
     const parsed = ModelIdentifier.tryParse(configured);
     const resolved = parsed ? parsed.model : configured.replace(/^openai-codex:/, '');
     const normalized = resolved.toLowerCase();
     if (normalized === 'openai-codex-cli' || normalized === 'default' || normalized === 'cli') {
-      return 'gpt-5.6-sol';
+      return 'gpt-6.1-sol';
     }
 
     // Pass the model directly to the Codex SDK without pre-validation.
@@ -2288,7 +2311,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       if (!this.shouldPersistAppServerNotification(sessionId, method, params)) {
         return;
       }
-      const synthesizedRaw = { method, params };
+      const synthesizedRaw = { method, params: capAppServerItemParamsForStorage(params) };
       const content = JSON.stringify(synthesizedRaw);
       const rawItemId = this.extractAppServerItemId(params);
       const editGroupId = rawItemId
@@ -2383,6 +2406,18 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   ): boolean {
     if (!PERSISTED_APP_SERVER_NOTIFICATION_METHODS.has(method)) {
       return false;
+    }
+
+    // An `item/started` for most item types produces no canonical descriptor --
+    // the matching `item/completed` carries the same item id plus the actual
+    // content. Skipping them removes roughly half of all persisted codex rows.
+    // The predicate lives with the parser so the two cannot drift; tool items
+    // that render a widget at start time (MCP prompts) are excluded there.
+    if (method === 'item/started') {
+      const itemType = (params as { item?: { type?: unknown } } | undefined)?.item?.type;
+      if (isNonRenderingAppServerItemStarted(itemType)) {
+        return false;
+      }
     }
 
     const notificationKey = this.buildAppServerNotificationKey(method, params);
@@ -2726,6 +2761,103 @@ export class OpenAICodexProvider extends BaseAgentProvider {
    *     so the host's existing `MessageStreamingHandler` plumbing fires
    *     unchanged
    */
+  /**
+   * Translate a codex `mcpServer/startupStatus/updated` notification into the
+   * `mcpServerStatus:changed` event the host already listens for.
+   *
+   * NIM-2962: the protocol layer used to drop this notification as
+   * "informational", so a server that failed to start took its tools away
+   * with nothing shown anywhere. ClaudeCodeProvider already emits this exact
+   * event into a pipeline that ends at the session's MCP chip, so Codex feeds
+   * that pipeline rather than growing a parallel one.
+   *
+   * Note this is NOT the fatal-worker bug the original report suspected:
+   * against a live app-server the other servers still reached `ready` and the
+   * turn ran normally. One bad server is survivable; an invisible one is not.
+   */
+  /**
+   * Compact the live thread's context (#1252).
+   *
+   * Requires a live protocol session: compaction acts on the running codex
+   * child, so there is nothing to compact before the first turn. Callers should
+   * gate the UI on `supportsCompaction()` and handle the throw for the
+   * not-yet-started case rather than silently no-op'ing, which is the bug this
+   * replaces.
+   */
+  async compactSession(sessionId: string): Promise<void> {
+    const session = this.liveProtocolSessions.get(sessionId);
+    if (!session) {
+      throw new Error('Cannot compact: this Codex session has no active thread yet.');
+    }
+    if (typeof this.protocol.compactSession !== 'function') {
+      throw new Error(`Cannot compact: the ${this.protocol.platform} transport does not support compaction.`);
+    }
+    await this.protocol.compactSession(session);
+  }
+
+  /** Whether this provider's active transport can compact in-place. */
+  supportsCompaction(): boolean {
+    return typeof this.protocol.compactSession === 'function';
+  }
+
+  /**
+   * Narrows the provider-type declaration to the transport actually running:
+   * `thread/compact/start` exists on the app-server, not on the legacy SDK
+   * path, and this provider can be constructed with either.
+   */
+  getAgentCapabilities(): AgentCapabilities {
+    return {
+      ...BUILTIN_AGENT_CAPABILITIES['openai-codex'],
+      compaction: this.supportsCompaction() ? 'rpc' : 'unsupported',
+    };
+  }
+
+  handleAppServerMcpStatus(event: ProtocolEvent, sessionId: string | undefined): void {
+    const metadata = (event as { metadata?: { transport?: string; method?: string; params?: unknown } }).metadata;
+    if (event.type !== 'raw_event') return;
+    if (metadata?.transport !== 'app-server') return;
+    if (metadata?.method !== 'mcpServer/startupStatus/updated') return;
+
+    const params = metadata.params as {
+      name?: unknown;
+      status?: unknown;
+      error?: unknown;
+      failureReason?: unknown;
+    } | undefined;
+    const name = typeof params?.name === 'string' ? params.name : '';
+    if (!name) return;
+
+    // Codex states are starting | ready | failed; the host vocabulary is the
+    // one in MCPServerConfig's KNOWN_STATES.
+    const codexStatus = typeof params?.status === 'string' ? params.status : '';
+    const status = codexStatus === 'ready'
+      ? 'connected'
+      : codexStatus === 'starting'
+        ? 'pending'
+        : codexStatus === 'failed'
+          ? 'failed'
+          : codexStatus;
+    if (!status) return;
+
+    const error = typeof params?.error === 'string' && params.error
+      ? params.error
+      : typeof params?.failureReason === 'string' && params.failureReason
+        ? params.failureReason
+        : undefined;
+
+    const previous = this.appServerMcpStatuses.get(name);
+    if (previous && previous.status === status && previous.error === error) return;
+
+    this.appServerMcpStatuses.set(name, { name, status, ...(error ? { error } : {}) });
+    this.emit('mcpServerStatus:changed', {
+      sessionId: sessionId ?? this.appServerMcpSessionId,
+      servers: Array.from(this.appServerMcpStatuses.values()),
+      lastCheckedAt: Date.now(),
+      configuredNames: Array.from(this.appServerMcpStatuses.keys()),
+      withheldNames: null,
+    });
+  }
+
   private async maybeBuildAppServerFileChangeSnapshots(
     event: ProtocolEvent,
     sessionId: string | undefined,

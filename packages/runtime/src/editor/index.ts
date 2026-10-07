@@ -34,6 +34,19 @@ export type {
   CommentMentionPayload,
   CommentReplyPayload,
 } from './commenting/types';
+
+// In-document decisions
+export type { DecisionsConfig, DecisionMember } from './decisions/types';
+export {
+  DecisionsProvider,
+  useDecisionVotes,
+  YDocDecisionRepository,
+  DECISION_VOTES_KEY,
+  DECISION_RECOMMENDATIONS_KEY,
+  type DecisionVotingState,
+  type DecisionRepositorySnapshot,
+} from './decisions';
+
 export type {
   AgentCommentActor,
   Comment,
@@ -49,12 +62,15 @@ export {
 } from './commenting';
 export { CommentCollabProvider } from './commenting/CommentCollabProvider';
 export {
+  classifyCommentAnchorInput,
+  collabCommentAnchorAdapterRegistry,
   collabCommentControllerRegistry,
   CollabCommentControllerError,
   createCollabCommentController,
 } from './commenting/CollabCommentControllerRegistry';
 export type {
   CollabCommentController,
+  CommentAnchorInput,
   CommentAnchorSelector,
   CommentControllerErrorCode,
   CommentControllerListResult,
@@ -152,9 +168,9 @@ export {
   getAllExtensionTransformers,
   getAllExtensionDynamicOptions,
   subscribeToExtensionContributions,
-  useExtensionUserCommands,
   type EditorExtensionContributions,
 } from './extensions/extensionContributionsStore';
+export { useExtensionUserCommands } from './extensions/useExtensionUserCommands';
 
 // Lexical-extension contributions from Nimbalyst extensions. The
 // electron-side bridge writes here; `NimbalystEditor` reads from here
@@ -190,6 +206,15 @@ export {
   $convertNodeToEnhancedMarkdownString,
   $convertSelectionToEnhancedMarkdownString
 } from './markdown';
+
+// In-place external content replacement (collaborator edit, file watcher,
+// agent write) that preserves the caret instead of remounting the editor.
+export {
+  applyExternalMarkdown,
+  externalContentUpdateTags,
+  mapOffsetAcrossChange,
+  EXTERNAL_CONTENT_UPDATE_TAG,
+} from './applyExternalMarkdown';
 
 // Markdown normalization utilities
 export {
@@ -238,6 +263,7 @@ export { useDiffCommands, APPLY_MARKDOWN_REPLACE_COMMAND, LiveNodeKeyState } fro
 // Diff utilities (now from local plugin)
 export {
   applyMarkdownReplace,
+  applyTextReplacementsToString,
   $approveDiffs,
   $rejectDiffs,
   $hasDiffNodes,
@@ -246,6 +272,7 @@ export {
   scrollToChangeGroup,
   $approveChangeGroup,
   $rejectChangeGroup,
+  $clearResidualDiffMarkers,
   $getDiffState,
   APPROVE_DIFF_COMMAND,
   REJECT_DIFF_COMMAND,
@@ -291,3 +318,21 @@ export type {
   EmbedFrameProps,
   EmbedPluginCallbacks,
 } from './plugins/EmbedPlugin';
+
+// Decision and open-question marks on a sentence; inline citations.
+export {
+  $createPageMarkNode,
+  $isPageMarkNode,
+  PageMarkNode,
+} from './plugins/PageMarkPlugin/PageMarkNode';
+export type { SerializedPageMarkNode } from './plugins/PageMarkPlugin/PageMarkNode';
+export { PAGE_MARK_TRANSFORMER } from './plugins/PageMarkPlugin/PageMarkTransformer';
+export { OPEN_PAGE_MARK_EDITOR_COMMAND } from './plugins/PageMarkPlugin/pageMarkEvents';
+export { setPageMarkAuthorProvider } from './plugins/PageMarkPlugin/pageMarkHost';
+export * from '../core/pageMarkSyntax';
+export { $createCitationNode, $isCitationNode, CitationNode } from './plugins/CitationPlugin/CitationNode';
+export type { SerializedCitationNode } from './plugins/CitationPlugin/CitationNodeCore';
+export { CITATION_TRANSFORMER } from './plugins/CitationPlugin/CitationTransformer';
+export { setCitationHost } from './plugins/CitationPlugin/citationHost';
+export type { CitationHost } from './plugins/CitationPlugin/citationHost';
+export * from '../core/citationSyntax';

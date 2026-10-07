@@ -22,14 +22,16 @@
  * - Message reloads (ai:message-logged) for sessions not currently mounted
  */
 
+import { canvasWorkingSetRegistry } from '@nimbalyst/runtime/canvas/canvasPresence';
 import { store } from '@nimbalyst/runtime/store';
 import {
   sessionProcessingAtom,
+  pruneClosedSessionDataAtom,
+  sessionDataReleaseListenersAtom,
   reloadSessionDataAtom,
   sessionListWorkspaceAtom,
   updateSessionStoreAtom,
   selectedWorkstreamAtom,
-  setSelectedWorkstreamAtom,
   sessionUnreadAtom,
   sessionLastActivityAtom,
   sessionLastReadAtom,
@@ -44,9 +46,8 @@ import {
   type PendingPrompt,
 } from './atoms/sessions';
 import { workstreamActiveChildAtom, workstreamStateAtom } from './atoms/workstreamState';
-import { setWindowModeAtom } from './atoms/windowMode';
 import { triggerWorktreeRefreshAtom } from './atoms/gitOperations';
-import { multiProjectModeAtom, openProjectsAtom } from './atoms/openProjects';
+import { activeWorkspacePathAtom, multiProjectModeAtom, openProjectsAtom } from './atoms/openProjects';
 import {
   markSessionStreamingAtom,
   clearSessionStreamingAtom,
@@ -57,6 +58,8 @@ import {
 import type { TranscriptEvent } from '@nimbalyst/runtime/ai/server/transcript/types';
 import { TranscriptStreamAccumulator } from './transcriptStreamAccumulator';
 import { resolveOwnedWorkspacePath } from '../../shared/sessionWorkspaceRouting';
+import type { SessionNotificationNavigationTarget } from '../../shared/sessionNotificationNavigation';
+import { navigateToNotificationSession } from './actions/sessionNotificationNavigation';
 
 /**
  * Per-session accumulator of canonical events received via IPC.
@@ -196,6 +199,9 @@ export function initSessionStateListeners(): () => void {
     return () => {};
   }
 
+  const releaseTranscript = (sessionId: string) => transcriptAccumulator.unload(sessionId);
+  store.set(sessionDataReleaseListenersAtom, listeners => new Set([...listeners, releaseTranscript]));
+
   // Debounced trigger for the processing-state reconcile (assigned once the
   // reconcile function is defined below). Fired on terminal session events so a
   // stuck spinner clears within ~1s instead of waiting for the slow interval.
@@ -221,14 +227,14 @@ export function initSessionStateListeners(): () => void {
     workspacePath: string,
     timestamp: number,
   ) => {
-    const meta = store.get(sessionRegistryAtom).get(sessionId);
-    const parentId = meta?.parentSessionId;
-    if (!parentId) return;
-    store.set(markSessionTurnActivityAtom, {
-      sessionId: parentId,
-      workspacePath,
-      timestamp,
-    });
+    const registry = store.get(sessionRegistryAtom);
+    const seen = new Set([sessionId]);
+    let parentId = registry.get(sessionId)?.parentSessionId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      store.set(markSessionTurnActivityAtom, { sessionId: parentId, workspacePath, timestamp });
+      parentId = registry.get(parentId)?.parentSessionId;
+    }
   };
 
   /**
@@ -285,6 +291,13 @@ export function initSessionStateListeners(): () => void {
       type === 'session:error' ||
       type === 'session:interrupted';
     if (isTerminalEvent) {
+      // A session that has stopped is not editing anything, whether it stopped
+      // by finishing, by erroring, or by being interrupted. This is the local
+      // half of working-set expiry: a session that dies mid-edit without
+      // calling release must not leave a canvas card haloed. The other half is
+      // structural -- awareness drops the whole entry when this client goes
+      // away, taking every claim it carried with it.
+      canvasWorkingSetRegistry.apply({ type: 'disconnect', sessionId });
       store.set(sessionProcessingAtom(sessionId), false);
       store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
       // Also clear the workspace-scoped streaming flag. The atom looks up
@@ -302,6 +315,7 @@ export function initSessionStateListeners(): () => void {
       // child finishes this clears the parent's spinner within ~1s rather than
       // leaving it stuck until the user clicks the child.
       scheduleProcessingReconcile?.();
+      store.set(pruneClosedSessionDataAtom);
     }
 
     if (!ownedWorkspacePath) {
@@ -745,13 +759,21 @@ export function initSessionStateListeners(): () => void {
   const handleAskUserQuestionResolved = (data: { sessionId: string; questionId?: string }) => {
     const { sessionId } = data;
     if (!sessionId) return;
-    store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
-    // Remove the resolved prompt from the array
+    // Remove the resolved prompt, then derive the aggregate flag from what is
+    // left. Hard-clearing it here took the "waiting for your response"
+    // indicator down whenever ANY prompt settled -- answering or cancelling Q1
+    // stopped the sidebar advertising Q2, or a tool permission the user had not
+    // answered yet. The array holds every interactive prompt kind, so it is the
+    // right thing to count. Refs #1549.
     if (data.questionId) {
       const current = store.get(sessionPendingPromptsAtom(sessionId));
-      store.set(sessionPendingPromptsAtom(sessionId), current.filter(p => p.promptId !== data.questionId));
+      const remaining = current.filter(p => p.promptId !== data.questionId);
+      store.set(sessionPendingPromptsAtom(sessionId), remaining);
+      store.set(sessionHasPendingInteractivePromptAtom(sessionId), remaining.length > 0);
     } else {
+      // No id: a session-wide cancel, which settles everything at once.
       store.set(sessionPendingPromptsAtom(sessionId), []);
+      store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
     }
   };
 
@@ -841,9 +863,10 @@ export function initSessionStateListeners(): () => void {
     commitMessage?: string;
     filesToStage?: Array<string | { path: string; status?: string }>;
     workspacePath?: string;
+    autoApproved?: boolean;
   }) => {
     const { sessionId, proposalId } = data;
-    if (!sessionId) return;
+    if (!sessionId || data.autoApproved) return;
     store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
     const prompt: PendingPrompt = {
       id: proposalId,
@@ -910,49 +933,34 @@ export function initSessionStateListeners(): () => void {
   };
 
   /**
-   * Handle notification click events.
-   * Switches to the session that was clicked in the OS notification.
-   * If the session is a child of a workstream, selects the parent instead.
+   * Route a native notification click. Never returns a rejected promise: the
+   * IPC callback has nowhere to hand one, so a throw here would surface as an
+   * unhandled rejection instead of a visible failure.
    */
-  const handleNotificationClicked = (data: { sessionId: string }) => {
-    const { sessionId } = data;
-    if (!sessionId) return;
-
-    const workspacePath = store.get(sessionListWorkspaceAtom);
-    if (!workspacePath) {
-      console.warn('[sessionStateListeners] No workspace path available for notification click');
-      return;
-    }
-
-    // Switch to agent mode so the session is visible
-    store.set(setWindowModeAtom, 'agent');
-
-    // Check if this is a child session - if so, select the parent workstream
-    const registry = store.get(sessionRegistryAtom);
-    const sessionMeta = registry.get(sessionId);
-    if (sessionMeta?.parentSessionId) {
-      // Child session - select parent and set this child as active
-      const parentState = store.get(workstreamStateAtom(sessionMeta.parentSessionId));
-      const parentType = parentState.type === 'worktree' ? 'worktree'
-        : parentState.type === 'workstream' ? 'workstream'
-        : 'workstream'; // Default to workstream since it has children
-      store.set(setSelectedWorkstreamAtom, {
-        workspacePath,
-        selection: { type: parentType, id: sessionMeta.parentSessionId },
+  const handleNotificationClicked = (
+    data: SessionNotificationNavigationTarget,
+  ): Promise<void> =>
+    navigateToNotificationSession(data)
+      .then(() => undefined)
+      .catch((error) => {
+        console.error('[sessionStateListeners] Notification navigation failed:', error);
       });
-      return;
+
+  const drainPendingNotificationNavigation = async (
+    workspacePath: string | null,
+  ): Promise<void> => {
+    if (!workspacePath) return;
+    try {
+      const pending = await window.electronAPI.invoke(
+        'notifications:consume-pending-navigation',
+        workspacePath,
+      ) as SessionNotificationNavigationTarget | null;
+      if (pending) {
+        await navigateToNotificationSession(pending);
+      }
+    } catch (error) {
+      console.error('[sessionStateListeners] Failed to consume pending notification navigation:', error);
     }
-
-    // Root session - determine its type
-    const state = store.get(workstreamStateAtom(sessionId));
-    const type = state.type === 'worktree' ? 'worktree'
-      : state.type === 'workstream' ? 'workstream'
-      : 'session';
-
-    store.set(setSelectedWorkstreamAtom, {
-      workspacePath,
-      selection: { type, id: sessionId },
-    });
   };
 
   /**
@@ -1096,6 +1104,7 @@ export function initSessionStateListeners(): () => void {
 
   let cleanupAskUserQuestion: (() => void) | undefined;
   let cleanupAskUserQuestionAnswered: (() => void) | undefined;
+  let cleanupAskUserQuestionCancelled: (() => void) | undefined;
   let cleanupSessionCancelled: (() => void) | undefined;
   let cleanupExitPlanModeConfirm: (() => void) | undefined;
   let cleanupExitPlanModeResolved: (() => void) | undefined;
@@ -1106,6 +1115,7 @@ export function initSessionStateListeners(): () => void {
   let cleanupRequestUserInput: (() => void) | undefined;
   let cleanupRequestUserInputResolved: (() => void) | undefined;
   let cleanupNotificationClicked: (() => void) | undefined;
+  let cleanupPendingNotificationNavigation: (() => void) | undefined;
   let cleanupSyncReadState: (() => void) | undefined;
   let cleanupSyncDraftInput: (() => void) | undefined;
   let cleanupTranscriptEvent: (() => void) | undefined;
@@ -1119,6 +1129,10 @@ export function initSessionStateListeners(): () => void {
     cleanupTitleUpdated = window.electronAPI.on('session:title-updated', handleTitleUpdated);
     cleanupAskUserQuestion = window.electronAPI.on('ai:askUserQuestion', handleAskUserQuestion);
     cleanupAskUserQuestionAnswered = window.electronAPI.on('ai:askUserQuestionAnswered', handleAskUserQuestionResolved);
+    // A question that is aborted or cancelled clears the same pending flag an
+    // answer does -- without it the session keeps advertising a widget that is
+    // already terminalized in the transcript. See #1549.
+    cleanupAskUserQuestionCancelled = window.electronAPI.on('ai:askUserQuestionCancelled', handleAskUserQuestionResolved);
     cleanupSessionCancelled = window.electronAPI.on('ai:sessionCancelled', handleAskUserQuestionResolved);
     cleanupExitPlanModeConfirm = window.electronAPI.on('ai:exitPlanModeConfirm', handleExitPlanModeConfirm);
     cleanupExitPlanModeResolved = window.electronAPI.on('ai:exitPlanModeResolved', handleExitPlanModeResolved);
@@ -1131,6 +1145,11 @@ export function initSessionStateListeners(): () => void {
     cleanupNotificationClicked = window.electronAPI.on('notification-clicked', handleNotificationClicked);
     cleanupSyncReadState = window.electronAPI.on('sessions:sync-read-state', handleSyncReadState);
     cleanupSyncDraftInput = window.electronAPI.on('sessions:sync-draft-input', handleSyncDraftInput);
+
+    void drainPendingNotificationNavigation(store.get(activeWorkspacePathAtom));
+    cleanupPendingNotificationNavigation = store.sub(activeWorkspacePathAtom, () => {
+      void drainPendingNotificationNavigation(store.get(activeWorkspacePathAtom));
+    });
   }
 
   // Return cleanup function
@@ -1172,6 +1191,7 @@ export function initSessionStateListeners(): () => void {
     cleanupTitleUpdated?.();
     cleanupAskUserQuestion?.();
     cleanupAskUserQuestionAnswered?.();
+    cleanupAskUserQuestionCancelled?.();
     cleanupSessionCancelled?.();
     cleanupExitPlanModeConfirm?.();
     cleanupExitPlanModeResolved?.();
@@ -1182,10 +1202,16 @@ export function initSessionStateListeners(): () => void {
     cleanupRequestUserInput?.();
     cleanupRequestUserInputResolved?.();
     cleanupNotificationClicked?.();
+    cleanupPendingNotificationNavigation?.();
     cleanupSyncReadState?.();
     cleanupSyncDraftInput?.();
     cleanupTranscriptEvent?.();
     cleanupTranscriptSessionReparsed?.();
+    store.set(sessionDataReleaseListenersAtom, listeners => {
+      const remaining = new Set(listeners);
+      remaining.delete(releaseTranscript);
+      return remaining;
+    });
     transcriptAccumulator.clear();
   };
 }

@@ -13,12 +13,13 @@
  */
 
 import type { TrackerRecord } from '../../../core/TrackerRecord';
-import type { FieldDefinition, TrackerRelationshipValue } from './TrackerDataModel';
-import { globalRegistry } from './TrackerDataModel';
+import type { FieldDefinition, TrackerRelationshipValue } from '@nimbalyst/tracker-schema';
+import { globalRegistry } from '@nimbalyst/tracker-schema';
 import {
   normalizeRelationshipValue,
   isRelationshipField,
 } from './trackerRelationships';
+import { resolveStatusCategory, type StatusCategory } from '@nimbalyst/tracker-schema';
 
 /** Relationship key a collection uses to point at its members. */
 export const COLLECTION_MEMBER_KEY = 'has-item';
@@ -56,6 +57,43 @@ export function getCollectionField(type: string): FieldDefinition | undefined {
   return globalRegistry
     .get(type)
     ?.fields.find(f => isRelationshipField(f) && f.relationshipTypeKey === COLLECTION_INVERSE_KEY);
+}
+
+/**
+ * Whether a field definition is the member-side link to a collection -- i.e. the
+ * field a "Collection" chip is bound to.
+ *
+ * The `in-collection` vocabulary key is the primary signal. A field that only
+ * declares collection tracker types as its targets counts too, so a custom
+ * schema that points at milestones without adopting the vocabulary still gets
+ * the collection picker rather than the generic relationship editor.
+ */
+export function isCollectionRelationshipField(field: FieldDefinition): boolean {
+  if (!isRelationshipField(field)) return false;
+  if (field.relationshipTypeKey === COLLECTION_INVERSE_KEY) return true;
+  const targets = field.targetTrackerTypes;
+  if (!targets || targets === '*' || targets.length === 0) return false;
+  return targets.every(isCollectionType);
+}
+
+/**
+ * The collection types a field may create into, in schema order.
+ * Falls back to the built-in list when the field targets anything.
+ */
+export function collectionTypesForField(field: FieldDefinition): string[] {
+  const targets = field.targetTrackerTypes;
+  if (!targets || targets === '*') return [...COLLECTION_TYPES];
+  const usable = targets.filter(isCollectionType);
+  return usable.length > 0 ? usable : [...COLLECTION_TYPES];
+}
+
+/** Display label + icon for a collection type, for the inline create toggle. */
+export function collectionTypeDisplay(type: string): { label: string; icon: string } {
+  const model = globalRegistry.get(type) as { displayName?: string; icon?: string } | undefined;
+  return {
+    label: model?.displayName ?? type.charAt(0).toUpperCase() + type.slice(1),
+    icon: model?.icon ?? 'inventory_2',
+  };
 }
 
 /** Member item ids of a collection record, deduped and in stored order. */
@@ -112,17 +150,17 @@ export interface CollectionRollup {
   resolved: number;
   /** Member count per workflow status. */
   byStatus: Record<string, number>;
-  /** Members in a terminal status. */
+  /** Member count per lifecycle category. */
+  byCategory: Record<StatusCategory, number>;
+  /** Members finished successfully. */
   done: number;
-  /** `done / resolved` as a 0-100 integer; 0 when nothing is resolved. */
+  /** Members abandoned. Excluded from the progress denominator. */
+  cancelled: number;
+  /**
+   * `done / (resolved - cancelled)` as a 0-100 integer; 0 when nothing is
+   * resolved, 100 when everything resolvable was abandoned.
+   */
   percentComplete: number;
-}
-
-/** Statuses that count as finished for progress purposes. */
-const TERMINAL_STATUSES = new Set(['done', 'released', 'cancelled', 'resolved', 'closed', 'approved']);
-
-export function isTerminalStatus(status: string): boolean {
-  return TERMINAL_STATUSES.has(status);
 }
 
 /**
@@ -139,8 +177,12 @@ export function computeCollectionRollup(
 ): CollectionRollup {
   const memberIds = getMemberIds(collection);
   const byStatus: Record<string, number> = {};
+  const byCategory: Record<StatusCategory, number> = {
+    backlog: 0, unstarted: 0, started: 0, done: 0, cancelled: 0,
+  };
   let resolved = 0;
   let done = 0;
+  let cancelled = 0;
 
   for (const id of memberIds) {
     const member = itemsById.get(id);
@@ -151,15 +193,28 @@ export function computeCollectionRollup(
     resolved++;
     const status = getStatus(member) || 'to-do';
     byStatus[status] = (byStatus[status] ?? 0) + 1;
-    if (isTerminalStatus(status)) done++;
+    // Resolved per member type, not by status name: members of one collection
+    // routinely span types that close on different values.
+    const category = resolveStatusCategory(member.primaryType, status);
+    byCategory[category]++;
+    if (category === 'done') done++;
+    else if (category === 'cancelled') cancelled++;
   }
+
+  // Abandoned work is not outstanding work, so it leaves the denominator
+  // entirely rather than pinning the collection below 100% forever.
+  const outstanding = resolved - cancelled;
 
   return {
     total: memberIds.length,
     resolved,
     byStatus,
+    byCategory,
     done,
-    percentComplete: resolved === 0 ? 0 : Math.round((done / resolved) * 100),
+    cancelled,
+    percentComplete: resolved === 0
+      ? 0
+      : outstanding === 0 ? 100 : Math.round((done / outstanding) * 100),
   };
 }
 

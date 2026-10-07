@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment node
+import { afterAll, beforeAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -94,7 +95,7 @@ describe.each(["pglite", "sqlite"] as const)(
     let tempDir: string | null = null;
     let store: CollabDocumentReplicaStore;
 
-    beforeEach(async () => {
+    beforeAll(async () => {
       if (backend === "pglite") {
         const pglite = new PGlite();
         await pglite.exec(POSTGRES_SCHEMA);
@@ -121,10 +122,28 @@ describe.each(["pglite", "sqlite"] as const)(
         db = sqlite;
         close = () => sqlite.close();
       }
+    });
+
+    beforeEach(async () => {
+      // Each scenario gets a fresh service and empty persisted state, while
+      // retaining real backend transactions and the initialized schema.
+      for (const table of ["collab_document_replica_updates", "collab_document_outbox", "collab_document_replicas"]) {
+        const { rows } = await db.query<{ count: string | number }>(`SELECT COUNT(*) AS count FROM ${table}`);
+        expect(Number(rows[0].count)).toBe(0);
+      }
       store = new CollabDocumentReplicaStore(db, fixedKeyProvider);
     });
 
     afterEach(async () => {
+      vi.restoreAllMocks();
+      await db.runTransaction([
+        { sql: "DELETE FROM collab_document_replica_updates" },
+        { sql: "DELETE FROM collab_document_outbox" },
+        { sql: "DELETE FROM collab_document_replicas" },
+      ]);
+    });
+
+    afterAll(async () => {
       await close();
       if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
     });
@@ -633,6 +652,46 @@ describe.each(["pglite", "sqlite"] as const)(
         state: "inflight",
         attemptCount: 1,
       });
+    });
+
+    // The drainer decides whether to retry, back off, or report a document as
+    // stranded entirely from this metadata — it never decrypts an outbox row to
+    // find out. A document that is only `rejected` is a settled answer and must
+    // drop out of the enumeration rather than be re-examined every 30 seconds.
+    it("carries retry metadata and filters by batch state", async () => {
+      await store.appendLocalUpdate({
+        identity,
+        documentType: "markdown",
+        updateId: "batch-a",
+        update: new Uint8Array([1]),
+        snapshotGeneration: 0,
+      });
+      await store.claimOutboxBatch(identity, ["batch-a"]);
+      await store.recordOutboxError(identity, ["batch-a"], "HTTP 404", {
+        countAttempt: true,
+      });
+
+      const [pending] = await store.listPendingOutboxes(identity.accountId, {
+        states: ["queued", "inflight"],
+      });
+      expect(pending).toMatchObject({
+        inflightCount: 1,
+        maxAttemptCount: 2,
+        lastErrorCode: "HTTP 404",
+      });
+      expect(pending.lastAttemptAt).toBeTypeOf("number");
+      expect(pending.oldestCreatedAt).toBeTypeOf("number");
+
+      await store.setOutboxState(identity, ["batch-a"], "rejected");
+      expect(
+        await store.listPendingOutboxes(identity.accountId, {
+          states: ["queued", "inflight"],
+        })
+      ).toEqual([]);
+      // Unfiltered callers — the account-purge gate — still see it.
+      expect(
+        await store.listPendingOutboxes(identity.accountId)
+      ).toHaveLength(1);
     });
 
     it("claims multiple rows atomically and preserves the last error on requeue", async () => {

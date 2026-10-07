@@ -14,12 +14,17 @@
 
 import simpleGit, { SimpleGit } from 'simple-git';
 import { simpleGitWithHookEnv } from './gitEnv';
+import { validateGitCwd, validateGitOperand } from './gitOperandValidation';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ulid } from 'ulid';
 import log from 'electron-log/main';
-import { getUntrackedFilesInDirectory } from '../utils/gitUtils';
+import { getUntrackedFilesInDirectories } from '../utils/gitUtils';
+import { GIT_INHERITED_ENV_UNSAFE } from './gitInheritedEnvUnsafe';
 import { gitOperationLock } from './GitOperationLock';
+import { getGitOperationLogService, recordGitActivity } from './GitOperationLogService';
+import { SessionCommitService } from './SessionCommitService';
+import { historyManager } from '../HistoryManager';
 
 const logger = log.scope('GitWorktreeService');
 
@@ -241,7 +246,15 @@ export class GitWorktreeService {
 
     // Use centralized lock to prevent concurrent worktree operations
     return gitOperationLock.withLock(workspacePath, 'createWorktree', () =>
-      this.createWorktreeImpl(workspacePath, options)
+      recordGitActivity(
+        getGitOperationLogService(),
+        workspacePath,
+        // The final name is generated inside the impl when not supplied; the
+        // entry's output line below names the worktree that was actually made.
+        ['worktree', 'add', options.name ?? '(generated name)'],
+        () => this.createWorktreeImpl(workspacePath, options),
+        (worktree) => `Created worktree ${worktree.path} on ${worktree.branch}`,
+      )
     );
   }
 
@@ -445,7 +458,12 @@ export class GitWorktreeService {
 
     // Use centralized lock on workspace to prevent concurrent worktree operations
     return gitOperationLock.withLock(workspacePath, 'deleteWorktree', () =>
-      this.deleteWorktreeImpl(worktreePath, workspacePath)
+      recordGitActivity(
+        getGitOperationLogService(),
+        workspacePath,
+        ['worktree', 'remove', worktreePath],
+        () => this.deleteWorktreeImpl(worktreePath, workspacePath),
+      )
     );
   }
 
@@ -508,6 +526,20 @@ export class GitWorktreeService {
     }
 
     logger.info('Worktree directory confirmed deleted', { worktreePath });
+
+    // Step 4b: Retire pending AI reviews for files that lived in this worktree.
+    // Their paths can never resolve again, so the tags would sit pending
+    // forever, inflating the pending counts (#1403). This marks them reviewed;
+    // the rows and their baselines stay in document_history.
+    try {
+      const { count } = await historyManager.clearAllPending(worktreePath);
+      if (count > 0) {
+        logger.info('Retired pending AI reviews for removed worktree', { worktreePath, count });
+      }
+    } catch (error) {
+      // Never let history bookkeeping fail a worktree removal that succeeded.
+      logger.warn('Failed to retire pending reviews for removed worktree', { error, worktreePath });
+    }
 
     // Step 5: Delete the branch if we found it (best effort, don't fail if this doesn't work)
     if (branchName && branchName !== 'HEAD') {
@@ -1335,9 +1367,16 @@ ${newLines.map(line => '+' + line).join('\n')}`;
    * @param worktreePath - Path to the worktree
    * @param message - Commit message
    * @param files - Optional array of specific files to commit (commits all changes if not specified)
+   * @param sessionId - Optional AI session that produced the commit; recorded in
+   *   the session_commits ledger so the Git Log panel can attribute it
    * @returns Commit information
    */
-  async commitChanges(worktreePath: string, message: string, files?: string[]): Promise<CommitInfo> {
+  async commitChanges(
+    worktreePath: string,
+    message: string,
+    files?: string[],
+    sessionId?: string
+  ): Promise<CommitInfo> {
     if (!worktreePath) {
       throw new Error('worktreePath is required');
     }
@@ -1346,9 +1385,26 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     }
 
     // Use centralized lock to prevent concurrent commit/staging operations
-    return gitOperationLock.withLock(worktreePath, 'commitChanges', () =>
-      this.commitChangesImpl(worktreePath, message, files)
+    const commit = await gitOperationLock.withLock(worktreePath, 'commitChanges', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['commit', '-m', message],
+        () => this.commitChangesImpl(worktreePath, message, files),
+        (result) => `[${result.hash.slice(0, 7)}] ${result.message}`,
+      )
     );
+
+    if (sessionId && commit.hash) {
+      void SessionCommitService.getInstance().recordCommit({
+        commitSha: commit.hash,
+        sessionId,
+        workspaceId: worktreePath,
+        committedAt: commit.date,
+      });
+    }
+
+    return commit;
   }
 
   /**
@@ -1441,7 +1497,15 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     }
 
     // Use centralized lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(mainRepoPath, 'mergeToMain', () => this.mergeToMainImpl(worktreePath, mainRepoPath));
+    return gitOperationLock.withLock(mainRepoPath, 'mergeToMain', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        mainRepoPath,
+        ['merge', worktreePath],
+        () => this.mergeToMainImpl(worktreePath, mainRepoPath),
+        (result) => result.message,
+      )
+    );
   }
 
   /**
@@ -1935,15 +1999,19 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     untrackedFiles?: string[];
     stashWarning?: boolean;
   }> {
-    if (!worktreePath) {
-      throw new Error('worktreePath is required');
-    }
-    if (!baseBranch) {
-      throw new Error('baseBranch is required');
-    }
+    validateGitCwd(worktreePath, 'worktreePath');
+    validateGitOperand(baseBranch, 'baseBranch');
 
     // Use lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(worktreePath, 'rebaseFromBase', () => this.rebaseFromBaseImpl(worktreePath, baseBranch));
+    return gitOperationLock.withLock(worktreePath, 'rebaseFromBase', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['rebase', baseBranch],
+        () => this.rebaseFromBaseImpl(worktreePath, baseBranch),
+        (result) => result.message,
+      )
+    );
   }
 
   /**
@@ -2243,14 +2311,43 @@ ${newLines.map(line => '+' + line).join('\n')}`;
 
     // logger.info('Getting changed files', { worktreePath });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    // The unsafe flags are required because the .env() below makes simple-git
+    // scan the supplied (trusted, process-owned) environment for vars like
+    // GIT_EDITOR and otherwise refuse to spawn git at all.
+    const git: SimpleGit = simpleGit(worktreePath, { unsafe: GIT_INHERITED_ENV_UNSAFE });
 
     try {
       // Get only uncommitted changes from git status
-      // This shows files that need to be staged/committed, not the full branch diff
-      const gitStatus = await git.status();
+      // This shows files that need to be staged/committed, not the full branch diff.
+      // GIT_OPTIONAL_LOCKS=0 is the environment equivalent of the
+      // `--no-optional-locks` flag simple-git gives no way to pass: it stops
+      // this read-only status from refreshing (and so locking) `.git/index`,
+      // where it would contend with concurrent git writers (NIM-2285).
+      const gitStatus = await git.env({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }).status();
 
       const changedFiles: Array<{ path: string; status: 'added' | 'modified' | 'deleted'; staged: boolean }> = [];
+
+      // git status collapses each untracked directory into a single entry, so
+      // they have to be re-expanded. Collect them first and expand them all in
+      // ONE async git call: the previous per-directory version spawned a
+      // synchronous child process each time, blocking the main thread once per
+      // untracked directory (NIM-2286).
+      const untrackedDirs = new Set<string>();
+      for (const file of gitStatus.files) {
+        if (file.working_dir !== '?') continue;
+        const absolutePath = path.join(worktreePath, file.path);
+        try {
+          if (fs.statSync(absolutePath).isDirectory()) {
+            untrackedDirs.add(absolutePath);
+          }
+        } catch {
+          // Not stattable - treated as a plain file below, as before.
+        }
+      }
+      const untrackedExpansions = await getUntrackedFilesInDirectories(
+        worktreePath,
+        Array.from(untrackedDirs)
+      );
 
       for (const file of gitStatus.files) {
         let status: 'added' | 'modified' | 'deleted';
@@ -2266,25 +2363,18 @@ ${newLines.map(line => '+' + line).join('\n')}`;
         // A file is staged if its index status is not ' ' (space) or '?' (untracked)
         const staged = file.index !== ' ' && file.index !== '?';
 
-        // For untracked entries (? in working_dir), check if it's a directory
-        // git status shows untracked directories as a single entry, not individual files
+        // Substitute the individual files git reported for a collapsed
+        // untracked directory. The expansion honors .gitignore so an installed
+        // node_modules/dist doesn't explode into tens of thousands of paths
+        // (NIM-1782). git ls-files emits worktree-relative, forward-slashed
+        // paths already.
         if (file.working_dir === '?') {
           const absolutePath = path.join(worktreePath, file.path);
-          try {
-            const stats = fs.statSync(absolutePath);
-            if (stats.isDirectory()) {
-              // Expand the untracked directory to individual files, honoring
-              // .gitignore so an installed node_modules/dist doesn't explode
-              // into tens of thousands of paths (NIM-1782). git ls-files emits
-              // worktree-relative, forward-slashed paths already.
-              const relFiles = getUntrackedFilesInDirectory(worktreePath, absolutePath);
-              for (const filePath of relFiles) {
-                changedFiles.push({ path: filePath, status: 'added', staged: false });
-              }
-              continue; // Skip adding the directory itself
+          if (untrackedDirs.has(absolutePath)) {
+            for (const filePath of untrackedExpansions.get(absolutePath) ?? []) {
+              changedFiles.push({ path: filePath, status: 'added', staged: false });
             }
-          } catch {
-            // If stat fails (file doesn't exist), just add the path as-is
+            continue; // Skip adding the directory itself
           }
         }
 
@@ -2374,7 +2464,14 @@ ${newLines.map(line => '+' + line).join('\n')}`;
     }
 
     // Use lock to prevent concurrent merge/rebase/squash operations
-    return gitOperationLock.withLock(worktreePath, 'squashCommits', () => this.squashCommitsImpl(worktreePath, commitHashes, message));
+    return gitOperationLock.withLock(worktreePath, 'squashCommits', () =>
+      recordGitActivity(
+        getGitOperationLogService(),
+        worktreePath,
+        ['reset', '--soft', `HEAD~${commitHashes.length}`],
+        () => this.squashCommitsImpl(worktreePath, commitHashes, message),
+      )
+    );
   }
 
   /**

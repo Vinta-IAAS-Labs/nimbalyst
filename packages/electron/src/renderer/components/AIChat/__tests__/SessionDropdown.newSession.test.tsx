@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionDropdown } from '../SessionDropdown';
+import { requestConfirmation } from '../../../dialogs/requestConfirmation';
+
+vi.mock('../../../dialogs/requestConfirmation', () => ({ requestConfirmation: vi.fn() }));
 
 vi.mock('@nimbalyst/runtime', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span data-icon={icon} />,
@@ -58,7 +61,7 @@ afterEach(cleanup);
 describe('SessionDropdown new-session affordance', () => {
   it('shows the current session name in the trigger', () => {
     render(<SessionDropdown {...baseProps} onNewSession={vi.fn()} />);
-    expect(screen.getByText('Agent trust popup review')).toBeTruthy();
+    screen.getByText('Agent trust popup review');
   });
 
   it('creates a new session from the menu row and closes the menu', () => {
@@ -74,5 +77,24 @@ describe('SessionDropdown new-session affordance', () => {
     expect(onNewSession).toHaveBeenCalledTimes(1);
     // Menu closed → row is gone.
     expect(screen.queryByText('New session')).toBeNull();
+  });
+});
+
+describe('SessionDropdown delete', () => {
+  it('deletes only after the in-app confirmation is accepted', async () => {
+    const onDeleteSession = vi.fn();
+    const confirmMock = vi.mocked(requestConfirmation);
+    render(<SessionDropdown {...baseProps} onNewSession={vi.fn()} onDeleteSession={onDeleteSession} />);
+    fireEvent.click(screen.getByTitle('Session History'));
+
+    confirmMock.mockResolvedValueOnce(false);
+    fireEvent.click(screen.getAllByTitle('Delete')[0]);
+    await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(onDeleteSession).not.toHaveBeenCalled();
+
+    confirmMock.mockResolvedValueOnce(true);
+    fireEvent.click(screen.getAllByTitle('Delete')[0]);
+    await waitFor(() => expect(onDeleteSession).toHaveBeenCalledTimes(1));
   });
 });

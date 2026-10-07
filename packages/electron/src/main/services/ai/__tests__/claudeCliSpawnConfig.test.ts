@@ -24,22 +24,36 @@ describe('buildClaudeCliSpawnConfig', () => {
     expect(cfg.args).toContain('--mcp-config');
     expect(cfg.args[cfg.args.indexOf('--mcp-config') + 1]).toBe('/tmp/mcp.json');
     expect(cfg.args).toContain('--model');
-    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('opus');
+    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('claude-opus-5-5');
   });
 
-  // NIM-843: without --strict-mcp-config the genuine `claude` binary merges its
-  // own MCP discovery (~/.claude.json, project .mcp.json, claude.ai connectors)
-  // on top of our --mcp-config snapshot and ignores the `disabled` flag we write,
-  // so user-disabled third-party servers leak into CLI sessions. Strict mode makes
-  // the binary use ONLY the snapshot (which already carries the enabled set,
-  // filtered by isMCPServerEnabledForProvider).
-  it('passes --strict-mcp-config alongside --mcp-config so the binary uses ONLY our snapshot', () => {
-    const cfg = buildClaudeCliSpawnConfig({ ...base, mcpConfigPath: '/tmp/mcp.json' });
-    expect(cfg.args).toContain('--strict-mcp-config');
-  });
-
-  it('omits --strict-mcp-config when there is no --mcp-config snapshot', () => {
+  // NIM-2372: strict mode is gone. It made the binary ignore its own ecosystem —
+  // which killed every claude.ai account connector (NIM-2240) and hard-failed on
+  // machines with an enterprise managed-mcp.json. "Off" is now expressed in the
+  // CLI's own `disabledMcpServers` (see MCPConfigService), not by overriding it.
+  it('never passes --strict-mcp-config (the binary keeps its own MCP discovery)', () => {
+    expect(buildClaudeCliSpawnConfig({ ...base, mcpConfigPath: '/tmp/mcp.json' }).args).not.toContain(
+      '--strict-mcp-config'
+    );
     expect(buildClaudeCliSpawnConfig(base).args).not.toContain('--strict-mcp-config');
+  });
+
+  // Enterprise MCP lockdown (NIM-2372): the binary rejects any --mcp-config when a
+  // managed-mcp.json is present, so the launcher drops the snapshot. Nothing may
+  // then point the model at MCP tools that cannot exist — and the built-in
+  // AskUserQuestion must be left alone, since our MCP replacement is gone.
+  it('under mcpToolsUnavailable: keeps the built-in AskUserQuestion and drops the MCP nudges', () => {
+    const cfg = buildClaudeCliSpawnConfig({
+      ...base,
+      mcpToolsUnavailable: true,
+      additionalDirectories: ['/tmp/attachments'],
+    });
+    expect(cfg.args).not.toContain('--disallowedTools');
+    const nudge = cfg.args[cfg.args.indexOf('--append-system-prompt') + 1] ?? '';
+    expect(nudge).not.toContain('mcp__nimbalyst');
+    // --add-dir is variadic; --append-system-prompt must still terminate it.
+    const addDir = cfg.args.indexOf('--add-dir');
+    expect(cfg.args[addDir + 2]).toBe('--append-system-prompt');
   });
 
   it('resumes a session with --resume <id>', () => {
@@ -111,6 +125,45 @@ describe('buildClaudeCliSpawnConfig', () => {
     expect(cfg.env.ENABLE_TOOL_SEARCH).toBe('true');
   });
 
+  /**
+   * The SDK path forwards the selected effort via CLAUDE_CODE_EFFORT_LEVEL
+   * (sdkOptionsBuilder, #844). The CLI path never did, so the effort selector
+   * had no effect on a `claude-code-cli` session and every launch fell back to
+   * whatever the CLI defaults to.
+   */
+  describe('effort level', () => {
+    it('forwards the resolved effort to the CLI', () => {
+      const cfg = buildClaudeCliSpawnConfig({ ...base, effortLevel: 'max' });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+    });
+
+    it('forwards "high" too, so the selector matches the request (#844)', () => {
+      const cfg = buildClaudeCliSpawnConfig({ ...base, effortLevel: 'high' });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('high');
+    });
+
+    it('leaves the variable unset when no effort is resolved', () => {
+      expect(buildClaudeCliSpawnConfig(base).env.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+    });
+
+    it('does not let an inherited env value override the resolved selection', () => {
+      const cfg = buildClaudeCliSpawnConfig({
+        ...base,
+        baseEnv: { CLAUDE_CODE_EFFORT_LEVEL: 'low' },
+        effortLevel: 'max',
+      });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+    });
+
+    it('leaves an inherited value alone when nothing is selected', () => {
+      const cfg = buildClaudeCliSpawnConfig({
+        ...base,
+        baseEnv: { CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' },
+      });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('xhigh');
+    });
+  });
+
   it('lets the user override ENABLE_TOOL_SEARCH from their own env (default does not clobber it)', () => {
     const cfg = buildClaudeCliSpawnConfig({
       ...base,
@@ -138,7 +191,7 @@ describe('buildClaudeCliSpawnConfig', () => {
   it('resolves a combined 1M model id to the CLI `[1m]` form (never passes the `-1m` suffix or provider prefix to --model)', () => {
     const cfg = buildClaudeCliSpawnConfig({ ...base, model: 'claude-code-cli:opus-1m' });
     expect(cfg.args).toContain('--model');
-    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('opus[1m]');
+    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('claude-opus-5-5[1m]');
   });
 
   // NIM-806: the genuine CLI ships its own built-in AskUserQuestion that renders
@@ -295,7 +348,7 @@ describe('buildClaudeCliSpawnConfig', () => {
       'mcp__nimbalyst-session-context',
     ]);
     // value-bearing flags survived intact, ahead of the variadics
-    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('opus');
+    expect(cfg.args[cfg.args.indexOf('--model') + 1]).toBe('claude-opus-5-5');
     expect(cfg.args[cfg.args.indexOf('--mcp-config') + 1]).toBe('/tmp/mcp.json');
     expect(cfg.args[cfg.args.indexOf('--session-id') + 1]).toBe(id);
     expect(cfg.args.indexOf('--model')).toBeLessThan(allowIdx);
@@ -408,42 +461,56 @@ describe('buildClaudeCliSpawnConfig', () => {
 });
 
 describe('resolveClaudeCliModelArg', () => {
+  it('passes custom gateway models verbatim and never leaks a provider prefix', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:custom/Fast')).toBe('Fast');
+    expect(resolveClaudeCliModelArg('claude-code:custom/Smart')).toBe('Smart');
+    expect(resolveClaudeCliModelArg('claude-code-cli:NotAVariant')).toBeUndefined();
+  });
+
+  it('resolves explicit 5.5 versions while preserving pinned 5 versions', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-5-5')).toBe('claude-opus-5-5');
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-5')).toBe('claude-opus-5');
+    expect(resolveClaudeCliModelArg('claude-code-cli:sonnet-5-5')).toBe('claude-sonnet-5-5');
+    expect(resolveClaudeCliModelArg('claude-code-cli:sonnet-5')).toBe('claude-sonnet-5');
+  });
   it('strips the provider prefix and translates -1m to the CLI `[1m]` form (NIM-809)', () => {
-    expect(resolveClaudeCliModelArg('claude-code-cli:opus-1m')).toBe('opus[1m]');
-    expect(resolveClaudeCliModelArg('claude-code-cli:sonnet')).toBe('sonnet');
-    expect(resolveClaudeCliModelArg('claude-code:haiku')).toBe('haiku');
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-1m')).toBe('claude-opus-5-5[1m]');
+    expect(resolveClaudeCliModelArg('claude-code-cli:sonnet')).toBe('claude-sonnet-5-5');
+    expect(resolveClaudeCliModelArg('claude-code:haiku')).toBe('claude-haiku-5-5');
+    expect(resolveClaudeCliModelArg('claude-code:haiku-4-5')).toBe('claude-haiku-4-5-20251001');
   });
 
-  it('collapses pinned opus variants to the CLI `opus` alias (non-extended → no [1m])', () => {
-    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-7')).toBe('opus');
-    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-6')).toBe('opus');
+  it('preserves pinned opus versions without requesting extended context', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-7')).toBe('claude-opus-4-7');
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-6')).toBe('claude-opus-4-6');
   });
 
-  it('collapses a pinned-variant -1m id to plain `opus[1m]` — why no pinned -1m picker rows exist', () => {
-    // The collapse loses the pin, so an `opus-4-7-1m` row would silently run the
-    // CURRENT Opus at 1M while claiming to be 4.7. CLAUDE_CODE_VARIANTS_WITH_1M
-    // therefore offers `-1m` rows for the dateless aliases only (NIM-2170).
-    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-7-1m')).toBe('opus[1m]');
+  it('preserves the version and explicit context suffix for legacy selections', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:opus-4-7-1m')).toBe('claude-opus-4-7[1m]');
   });
 
-  it('passes the fable variant through as the CLI `fable` alias', () => {
-    expect(resolveClaudeCliModelArg('claude-code-cli:fable')).toBe('fable');
-    expect(resolveClaudeCliModelArg('claude-code-cli:fable-5')).toBe('fable');
-    expect(resolveClaudeCliModelArg('fable')).toBe('fable');
+  it('uses the same explicit current Fable model as the SDK', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:fable')).toBe('claude-fable-5-1');
+    expect(resolveClaudeCliModelArg('fable')).toBe('claude-fable-5-1');
+  });
+
+  it('resolves pinned fable-5 to the full model id (CLI does not accept `fable-5` as alias)', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:fable-5')).toBe('claude-fable-5');
+    expect(resolveClaudeCliModelArg('fable-5')).toBe('claude-fable-5');
   });
 
   // Plain `fable` is 1M on a plan that auto-upgrades, but NOT behind an
   // ANTHROPIC_BASE_URL gateway (our observation proxy) and not on Pro without
   // credits — the explicit `[1m]` form is the user's opt-in for those (NIM-2170).
-  it('translates fable-1m to the CLI `fable[1m]` form', () => {
-    expect(resolveClaudeCliModelArg('claude-code-cli:fable-1m')).toBe('fable[1m]');
-    expect(resolveClaudeCliModelArg('fable-1m')).toBe('fable[1m]');
+  it('preserves the explicit 1M suffix for current Fable', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:fable-1m')).toBe('claude-fable-5-1[1m]');
+    expect(resolveClaudeCliModelArg('fable-1m')).toBe('claude-fable-5-1[1m]');
   });
 
   it('passes a bare variant through (normalized), translating -1m to [1m]', () => {
-    expect(resolveClaudeCliModelArg('opus')).toBe('opus');
-    expect(resolveClaudeCliModelArg('opus-1m')).toBe('opus[1m]');
-    expect(resolveClaudeCliModelArg('SONNET')).toBe('sonnet');
+    expect(resolveClaudeCliModelArg('opus')).toBe('claude-opus-5-5');
+    expect(resolveClaudeCliModelArg('opus-1m')).toBe('claude-opus-5-5[1m]');
+    expect(resolveClaudeCliModelArg('SONNET')).toBe('claude-sonnet-5-5');
   });
 
   it('passes an unrecognized bare model name through unchanged (CLI accepts full model names)', () => {

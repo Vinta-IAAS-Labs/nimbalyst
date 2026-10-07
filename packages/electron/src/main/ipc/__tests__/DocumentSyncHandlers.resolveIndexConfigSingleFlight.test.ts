@@ -14,6 +14,7 @@ const {
   listPendingOutboxesMock,
   prepareForAppendMock,
   registerCollabAssetDocumentMock,
+  resolveTeamForWorkspaceMock,
   safeHandleMock,
 } = vi.hoisted(() => {
   const handlers = new Map<string, (...args: any[]) => any>();
@@ -28,6 +29,7 @@ const {
     },
     estimateLocalAppendBytesMock: vi.fn(),
     findTeamForWorkspaceMock: vi.fn(),
+    resolveTeamForWorkspaceMock: vi.fn(),
     handlers,
     listPendingOutboxesMock: vi.fn(),
     prepareForAppendMock: vi.fn(),
@@ -38,7 +40,8 @@ const {
   };
 });
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
+  app: (await import('../../../../test-stubs/privateUserData')).testApp,
   BrowserWindow: class {
     static getAllWindows() {
       return browserWindowsMock();
@@ -72,12 +75,14 @@ vi.mock('../../services/StytchAuthService', () => ({
 
 vi.mock('../../services/TeamService', () => ({
   findTeamForWorkspace: findTeamForWorkspaceMock,
+  resolveTeamForWorkspace: resolveTeamForWorkspaceMock,
   getOrgScopedJwt: vi.fn(async () => 'org-jwt'),
 }));
 
 vi.mock('../../services/jwtOrg', () => ({
   getOrgIdFromJwt: vi.fn(),
   getJwtExp: vi.fn(() => Date.now() + 60_000),
+  getSubFromJwt: vi.fn(() => 'team-member-1'),
 }));
 
 vi.mock('../../utils/store', () => ({
@@ -116,6 +121,7 @@ import { getOrgScopedJwt } from '../../services/TeamService';
 import { getPersonalSessionJwt, refreshPersonalSessionDetailed } from '../../services/StytchAuthService';
 import { getJwtExp } from '../../services/jwtOrg';
 
+// @vitest-environment node
 /**
  * This handler used to ignore the refresh result entirely and hand back
  * whatever JWT happened to be cached -- including an expired one, after either
@@ -187,6 +193,10 @@ describe('document-sync:open performs no client-side key work (NIM-2036)', () =>
     handlers.clear();
     vi.clearAllMocks();
     findTeamForWorkspaceMock.mockResolvedValue({ orgId: 'org-1', teamProjectId: null });
+    resolveTeamForWorkspaceMock.mockResolvedValue({
+      team: { orgId: 'org-1', teamProjectId: null },
+      complete: true,
+    });
     listPendingOutboxesMock.mockResolvedValue([]);
     registerDocumentSyncHandlers();
   });
@@ -232,20 +242,97 @@ describe('document-sync:open performs no client-side key work (NIM-2036)', () =>
     expect(registerCollabAssetDocumentMock).toHaveBeenCalledTimes(2);
   });
 
+  it('routes the shared room with the team JWT member id, not the ambient personal member id', async () => {
+    const result = await handlers.get('document-sync:open')!(
+      { sender: { id: 3027, isDestroyed: () => false, once: vi.fn() } },
+      { workspacePath: '/workspace/one', documentId: 'doc-team', documentType: 'markdown' },
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      success: true,
+      config: expect.objectContaining({
+        accountId: 'account-a',
+        teamMemberId: 'team-member-1',
+      }),
+    }));
+    expect(result.config).not.toHaveProperty('userId');
+  });
+
   it('resolves the index config without any key probe', async () => {
     const result = await handlers.get('document-sync:resolve-index-config')!(
       null,
       { workspacePath: '/workspace/one' },
     );
 
-    expect(result).toEqual(expect.objectContaining({ success: true }));
+    expect(result).toEqual(expect.objectContaining({
+      success: true,
+      config: expect.objectContaining({ teamMemberId: 'team-member-1' }),
+    }));
+  });
+});
+
+/**
+ * A team lookup that could not be carried out is not the same answer as "this
+ * project has no team", and the renderer acts on the difference: it treats a
+ * terminal answer as permanent, marks the scope unavailable, and stops
+ * retrying, which hides Shared Docs (plus the quick-open Team tab and "Share to
+ * team") for the rest of the app session.
+ *
+ * On 2026-08-23 `GET /api/teams` timed out after 15s during launch. The lookup
+ * returned `complete: false`, the handler reported the terminal message anyway,
+ * and the mode stayed gone across a restart even though the very next request
+ * for the same workspace succeeded.
+ */
+describe('document-sync:resolve-index-config lookup completeness', () => {
+  beforeEach(() => {
+    handlers.clear();
+    resolveTeamForWorkspaceMock.mockReset();
+    listPendingOutboxesMock.mockReset().mockResolvedValue([]);
+    registerDocumentSyncHandlers();
+  });
+
+  it('reports an incomplete lookup as retryable rather than as a missing team', async () => {
+    resolveTeamForWorkspaceMock.mockResolvedValue({ team: null, complete: false });
+
+    const result = await handlers.get('document-sync:resolve-index-config')!(
+      null,
+      { workspacePath: '/workspace/one' },
+    );
+
+    expect(result).toMatchObject({ success: false, retryable: true });
+    expect(result.error).not.toContain('No team found');
+  });
+
+  it('reports a conclusive miss as terminal', async () => {
+    resolveTeamForWorkspaceMock.mockResolvedValue({ team: null, complete: true });
+
+    await expect(
+      handlers.get('document-sync:resolve-index-config')!(null, { workspacePath: '/workspace/one' }),
+    ).resolves.toMatchObject({
+      success: false,
+      retryable: false,
+      error: 'No team found for this workspace.',
+    });
+  });
+
+  // Pages show one project, so the scope needs one; fill it only when the
+  // registry leaves no doubt which project the team's is.
+  it('fills a missing project from a one-project registry, and only then', async () => {
+    const project = (teamProjectId: string) => ({ projectId: `p-${teamProjectId}`, teamProjectId, gitRemoteHash: null, slug: null, name: null });
+    const resolveConfig = () => handlers.get('document-sync:resolve-index-config')!(null, { workspacePath: '/workspace/one' });
+
+    resolveTeamForWorkspaceMock.mockResolvedValue({ team: { orgId: 'org-1', teamProjectId: null, projects: [project('tp-1')] }, complete: true });
+    expect((await resolveConfig()).config.teamProjectId).toBe('tp-1');
+
+    resolveTeamForWorkspaceMock.mockResolvedValue({ team: { orgId: 'org-1', teamProjectId: null, projects: [project('tp-1'), project('tp-2')] }, complete: true });
+    expect((await resolveConfig()).config.teamProjectId).toBeNull();
   });
 });
 
 describe('document-sync:resolve-index-config single-flight (RC4)', () => {
   beforeEach(() => {
     handlers.clear();
-    findTeamForWorkspaceMock.mockReset();
+    resolveTeamForWorkspaceMock.mockReset();
     listPendingOutboxesMock.mockReset();
     listPendingOutboxesMock.mockResolvedValue([]);
 
@@ -266,9 +353,9 @@ describe('document-sync:resolve-index-config single-flight (RC4)', () => {
     ).rejects.toThrow('Local replica account does not match the active account');
   });
 
-  it('collapses N concurrent calls for the same workspace into one findTeamForWorkspace resolution', async () => {
+  it('collapses N concurrent calls for the same workspace into one team resolution', async () => {
     let resolveTeam: (value: unknown) => void;
-    findTeamForWorkspaceMock.mockImplementation(() => new Promise((resolve) => { resolveTeam = resolve; }));
+    resolveTeamForWorkspaceMock.mockImplementation(() => new Promise((resolve) => { resolveTeam = resolve; }));
 
     const handler = handlers.get('document-sync:resolve-index-config');
     expect(handler).toBeTruthy();
@@ -276,20 +363,23 @@ describe('document-sync:resolve-index-config single-flight (RC4)', () => {
     const calls = Array.from({ length: 5 }, () => handler!(null, { workspacePath: '/workspace/one' }));
     await Promise.resolve();
     await Promise.resolve();
-    resolveTeam!({ orgId: 'org-1', teamProjectId: null });
+    resolveTeam!({ team: { orgId: 'org-1', teamProjectId: null }, complete: true });
 
     const results = await Promise.all(calls);
 
-    expect(findTeamForWorkspaceMock).toHaveBeenCalledTimes(1);
+    expect(resolveTeamForWorkspaceMock).toHaveBeenCalledTimes(1);
     for (const result of results) {
       expect(result).toEqual(expect.objectContaining({ success: true }));
     }
   });
 
   it('does not dedupe calls for different workspaces', async () => {
-    findTeamForWorkspaceMock.mockImplementation(async (workspacePath: string) => ({
-      orgId: workspacePath === '/workspace/one' ? 'org-1' : 'org-2',
-      teamProjectId: null,
+    resolveTeamForWorkspaceMock.mockImplementation(async (workspacePath: string) => ({
+      team: {
+        orgId: workspacePath === '/workspace/one' ? 'org-1' : 'org-2',
+        teamProjectId: null,
+      },
+      complete: true,
     }));
 
     const handler = handlers.get('document-sync:resolve-index-config')!;
@@ -298,17 +388,20 @@ describe('document-sync:resolve-index-config single-flight (RC4)', () => {
       handler(null, { workspacePath: '/workspace/two' }),
     ]);
 
-    expect(findTeamForWorkspaceMock).toHaveBeenCalledTimes(2);
+    expect(resolveTeamForWorkspaceMock).toHaveBeenCalledTimes(2);
   });
 
   it('runs a fresh resolution for a later, non-overlapping call', async () => {
-    findTeamForWorkspaceMock.mockResolvedValue({ orgId: 'org-1', teamProjectId: null });
+    resolveTeamForWorkspaceMock.mockResolvedValue({
+      team: { orgId: 'org-1', teamProjectId: null },
+      complete: true,
+    });
 
     const handler = handlers.get('document-sync:resolve-index-config')!;
     await handler(null, { workspacePath: '/workspace/one' });
     await handler(null, { workspacePath: '/workspace/one' });
 
-    expect(findTeamForWorkspaceMock).toHaveBeenCalledTimes(2);
+    expect(resolveTeamForWorkspaceMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -409,5 +502,38 @@ describe('document-sync:replica-append-local fan-out', () => {
 
     expect(appendLocalUpdateMock).not.toHaveBeenCalled();
     expect(siblingSend).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The asset route refuses anything over 25 MiB. Queuing such a blob anyway
+ * spends the local upload budget on bytes that can only ever 413, so the
+ * ceiling is applied before the durable outbox sees them.
+ */
+describe('document-sync:upload-asset size ceiling', () => {
+  const MAX_COLLAB_ASSET_BYTES = 25 * 1024 * 1024;
+
+  beforeEach(() => {
+    handlers.clear();
+    registerDocumentSyncHandlers();
+  });
+
+  it('refuses a payload above the asset route ceiling', async () => {
+    const result = await handlers.get('document-sync:upload-asset')!(
+      { sender: { id: 1, isDestroyed: () => false, once: vi.fn() } },
+      {
+        orgId: 'org-a',
+        documentId: 'conversation-a',
+        fileBytes: new ArrayBuffer(MAX_COLLAB_ASSET_BYTES + 1),
+        mimeType: 'video/quicktime',
+        fileName: 'capture.mov',
+      },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      errorCode: 'asset_too_large',
+    });
+    expect(result.error).toContain('25 MB');
   });
 });

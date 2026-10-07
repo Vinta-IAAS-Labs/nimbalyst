@@ -1,6 +1,7 @@
 import * as path from 'path';
+import type { WorkspaceFileAttributionMode } from '@nimbalyst/runtime/ai/server/providerFileTracking';
 
-export type WorkspaceFileAttributionMode = 'fuzzy' | 'disabled';
+export type { WorkspaceFileAttributionMode };
 
 interface SessionAttributionPolicy {
   workspacePath: string;
@@ -9,9 +10,11 @@ interface SessionAttributionPolicy {
 
 /**
  * Tracks how watcher events may be attributed while an agent session is
- * active. Codex app-server sessions use `disabled`: native fileChange items
- * are authoritative, so filesystem listeners must never attribute edits to
- * those sessions. Everything else retains the legacy matcher modes.
+ * active. A session whose provider reports `'structured'` file changes uses
+ * `disabled`: those items are authoritative, so filesystem listeners must
+ * never attribute edits to the session on top of them. Everything else
+ * retains the legacy matcher modes. See `providerFileTracking.ts` for who
+ * earns which mode.
  */
 class WorkspaceFileAttributionPolicyRegistry {
   private readonly policies = new Map<string, SessionAttributionPolicy>();
@@ -29,6 +32,16 @@ class WorkspaceFileAttributionPolicyRegistry {
 
   clear(sessionId: string): void {
     this.policies.delete(sessionId);
+  }
+
+  /** Active sessions whose workspace can contain this candidate path. */
+  getSessionIds(workspacePath: string, filePath?: string): string[] {
+    const workspace = path.resolve(workspacePath);
+    return [...this.policies].filter(([, policy]) => {
+      if (!filePath) return policy.workspacePath === workspace;
+      const rel = path.relative(policy.workspacePath, filePath);
+      return !!rel && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+    }).map(([id]) => id);
   }
 
   isDisabled(sessionId: string, workspacePath: string): boolean {

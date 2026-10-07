@@ -4,10 +4,17 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { UnifiedEditorHeaderBar } from '../UnifiedEditorHeaderBar';
 
-const { buildSharedDocumentDeepLink, copyToClipboard } = vi.hoisted(() => ({
+const { buildSharedDocumentDeepLink, copyToClipboard, localLinkState } = vi.hoisted(() => ({
   buildSharedDocumentDeepLink: vi.fn((documentId: string, orgId: string) =>
     `nimbalyst://doc/${encodeURIComponent(documentId)}?orgId=${encodeURIComponent(orgId)}`),
   copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  localLinkState: {
+    binding: null as Record<string, unknown> | null,
+    busyAction: null as string | null,
+    refresh: vi.fn().mockResolvedValue(undefined),
+    pullFromSharedDoc: vi.fn().mockResolvedValue(true),
+    reuploadToSharedDoc: vi.fn().mockResolvedValue(true),
+  },
 }));
 
 vi.mock('@nimbalyst/runtime', () => ({
@@ -29,11 +36,21 @@ vi.mock('../../../store', async () => {
   return { historyDialogFileAtom: atom<string | null>(null) };
 });
 
+vi.mock('@nimbalyst/runtime/utils/clipboard', () => ({ copyToClipboard }));
+vi.mock('../DocumentSessionControl', () => ({ DocumentSessionControl: () => null }));
+
 vi.mock('../../../store/atoms/collabDocuments', async () => {
   const { atom } = await import('jotai');
   return {
     sharedDocumentsAtom: atom([]),
     pendingCollabDocumentAtom: atom(null),
+    // Deliberately differs from the explicit link target below. Copy Link must
+    // use the canonical document target, not ambient active-scope identity.
+    activeCollabScopeAtom: atom({
+      scopeKey: '/workspace',
+      orgId: 'different-active-org',
+      indexConfig: { serverUrl: 'wss://test.invalid', teamMemberId: 'user-1' },
+    }),
     activeTeamOrgIdAtom: atom(null),
     buildSharedDocumentDeepLink,
   };
@@ -80,11 +97,12 @@ vi.mock('../../../hooks/useFloatingMenu', async () => {
 
 vi.mock('../../../hooks/useCollabLocalOrigin', () => ({
   useLocalFileSharedDocLink: () => ({
-    binding: null,
-    busyAction: null,
+    binding: localLinkState.binding,
+    busyAction: localLinkState.busyAction,
     loading: false,
-    refresh: vi.fn(),
-    reuploadToSharedDoc: vi.fn(),
+    refresh: localLinkState.refresh,
+    pullFromSharedDoc: localLinkState.pullFromSharedDoc,
+    reuploadToSharedDoc: localLinkState.reuploadToSharedDoc,
   }),
 }));
 
@@ -92,6 +110,12 @@ afterEach(() => {
   cleanup();
   buildSharedDocumentDeepLink.mockClear();
   copyToClipboard.mockClear();
+  localLinkState.binding = null;
+  localLinkState.busyAction = null;
+  localLinkState.refresh.mockClear();
+  localLinkState.pullFromSharedDoc.mockClear();
+  localLinkState.reuploadToSharedDoc.mockClear();
+  vi.unstubAllGlobals();
 });
 
 const lexicalEditor = {
@@ -102,6 +126,30 @@ const lexicalEditor = {
 };
 
 describe('UnifiedEditorHeaderBar shared document link', () => {
+  it.each([true, false])('opens the document’s own project in the browser (markdown: %s)', async (isMarkdown) => {
+    const openExternal = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('electronAPI', { openExternal });
+    render(
+      <UnifiedEditorHeaderBar
+        filePath="collab://org:team%20one:doc:doc/one"
+        fileName="Shared doc"
+        workspaceId="/workspace"
+        isMarkdown={isMarkdown}
+        lexicalEditor={isMarkdown ? lexicalEditor : undefined}
+        showShareLinkButton={false}
+        showSharedDocButton={false}
+        showCommonFileActions={false}
+        sharedDocumentLinkTarget={{ documentId: 'doc/one', orgId: 'team one', teamProjectId: 'project/one' }}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('More actions'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open in browser' }));
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith(
+      'https://console.nimbalyst.com/org/team%20one/project/project%2Fone/document/doc%2Fone',
+    ));
+    expect(screen.queryByRole('button', { name: 'Open in browser' })).toBeNull();
+  });
+
   it('shows and copies the canonical deep link for an open collaborative document', async () => {
     render(
       <UnifiedEditorHeaderBar
@@ -150,6 +198,60 @@ describe('UnifiedEditorHeaderBar shared document link', () => {
     fireEvent.click(screen.getByTitle('More actions'));
 
     expect(screen.queryByRole('button', { name: 'Copy link' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Copy as Markdown' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Open in browser' })).toBeNull();
+    screen.getByRole('button', { name: 'Copy as Markdown' });
+  });
+
+  it('shows Pull from Shared Doc above re-upload for a linked local file', () => {
+    localLinkState.binding = {
+      documentId: 'doc-1',
+      sourceBasename: 'local.md',
+      documentType: 'markdown',
+      createdAt: '2026-08-07T12:00:00.000Z',
+    };
+
+    render(
+      <UnifiedEditorHeaderBar
+        filePath="/workspace/local.md"
+        fileName="local.md"
+        workspaceId="/workspace"
+        isMarkdown
+        lexicalEditor={lexicalEditor}
+        showShareLinkButton={false}
+        showCommonFileActions={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Linked to team shared document'));
+
+    const pull = screen.getByRole('button', { name: 'Pull from Shared Doc' });
+    const reupload = screen.getByRole('button', { name: 'Re-upload to Shared Doc' });
+    expect(pull.nextElementSibling).toBe(reupload);
+    expect(pull.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('disables Pull from Shared Doc while another local-origin action is busy', () => {
+    localLinkState.binding = {
+      documentId: 'doc-1',
+      sourceBasename: 'local.md',
+      documentType: 'markdown',
+      createdAt: '2026-08-07T12:00:00.000Z',
+    };
+    localLinkState.busyAction = 'reupload';
+
+    render(
+      <UnifiedEditorHeaderBar
+        filePath="/workspace/local.md"
+        fileName="local.md"
+        workspaceId="/workspace"
+        isMarkdown
+        lexicalEditor={lexicalEditor}
+        showShareLinkButton={false}
+        showCommonFileActions={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Linked to team shared document'));
+    expect(screen.getByRole('button', { name: 'Pull from Shared Doc' }).hasAttribute('disabled')).toBe(true);
   });
 });

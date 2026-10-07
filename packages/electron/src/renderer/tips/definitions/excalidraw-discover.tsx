@@ -7,7 +7,7 @@
  */
 
 import React from 'react';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { FEATURE_USAGE_KEYS } from '../../../shared/featureUsage';
 import type { TipDefinition } from '../types';
 
@@ -20,8 +20,7 @@ export const excalidrawDiscoverTip: TipDefinition = {
   trigger: {
     screen: '*',
     condition: (context) =>
-      context.hasReachedCount(FEATURE_USAGE_KEYS.SESSION_COMPLETED_WITH_TOOLS, 5) &&
-      !context.hasBeenUsed(FEATURE_USAGE_KEYS.EXCALIDRAW_OPENED),
+      context.hasReachedCount(FEATURE_USAGE_KEYS.SESSION_COMPLETED_WITH_TOOLS, 5),
     delay: 2000,
     priority: 4,
   },

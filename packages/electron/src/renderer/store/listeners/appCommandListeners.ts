@@ -8,6 +8,7 @@
  * - file-new-mockup -> newMockupRequestAtom
  * - file-new-browser-tab -> newBrowserTabRequestAtom
  * - toggle-ai-chat-panel -> toggleAIChatPanelRequestAtom
+ * - toggle-expanded-tab -> toggleExpandedTabRequestAtom
  *
  * Call initAppCommandListeners() once at app startup.
  */
@@ -22,6 +23,7 @@ import {
   marketplaceInstallProgressAtom,
   newBrowserTabRequestAtom,
   sessionLaunchPopupRequestAtom,
+  trackerQuickCreateRequestAtom,
   navigationGoBackRequestAtom,
   navigationGoForwardRequestAtom,
   newMockupRequestAtom,
@@ -35,10 +37,17 @@ import {
   showSessionImportDialogRequestAtom,
   showTrustToastRequestAtom,
   toggleAIChatPanelRequestAtom,
+  toggleExpandedTabRequestAtom,
   unifiedOnboardingRequestAtom,
   windowsClaudeCodeWarningRequestAtom,
   type InstallProgressStage,
 } from '../atoms/appCommands';
+import { openSettingsCommandAtom } from '../atoms/settingsNavigation';
+import type {
+  SettingsCategory,
+  SettingsDestination,
+  SettingsScope,
+} from '../../components/Settings/settingsRoutes';
 
 let onboardingCounter = 0;
 let openNavigationDialogCounter = 0;
@@ -74,10 +83,20 @@ export function initAppCommandListeners(): () => void {
   });
   if (typeof uSessionLaunchPopup === 'function') cleanups.push(uSessionLaunchPopup);
 
+  const uTrackerQuickCreate = window.electronAPI?.on?.('tracker-quick-create-open', () => {
+    store.set(trackerQuickCreateRequestAtom, (v) => v + 1);
+  });
+  if (typeof uTrackerQuickCreate === 'function') cleanups.push(uTrackerQuickCreate);
+
   const u2 = window.electronAPI?.on?.('toggle-ai-chat-panel', () => {
     store.set(toggleAIChatPanelRequestAtom, (v) => v + 1);
   });
   if (typeof u2 === 'function') cleanups.push(u2);
+
+  const uExpandedTab = window.electronAPI?.on?.('toggle-expanded-tab', () => {
+    store.set(toggleExpandedTabRequestAtom, (v) => v + 1);
+  });
+  if (typeof uExpandedTab === 'function') cleanups.push(uExpandedTab);
 
   const u3 = window.electronAPI?.on?.('file-save', () => {
     store.set(fileSaveRequestAtom, (v) => v + 1);
@@ -143,6 +162,27 @@ export function initAppCommandListeners(): () => void {
     store.set(setContentModeRequestAtom, { version: setContentModeCounter, mode });
   });
   if (typeof u8 === 'function') cleanups.push(u8);
+
+  const u8b = window.electronAPI?.on?.(
+    'open-settings-command',
+    (command: {
+      category: SettingsCategory;
+      scope?: SettingsScope;
+      destination?: SettingsDestination;
+      anchor?: string;
+      timestamp?: number;
+    }) => {
+      if (!command?.category) return;
+      store.set(openSettingsCommandAtom, {
+        category: command.category,
+        scope: command.scope,
+        destination: command.destination,
+        anchor: command.anchor,
+        timestamp: command.timestamp ?? Date.now(),
+      });
+    },
+  );
+  if (typeof u8b === 'function') cleanups.push(u8b);
 
   const u9 = window.electronAPI?.on?.('agent:insert-plan-reference', (planPath: string) => {
     agentInsertPlanReferenceCounter += 1;

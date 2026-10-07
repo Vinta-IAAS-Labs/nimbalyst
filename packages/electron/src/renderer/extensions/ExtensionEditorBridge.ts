@@ -7,6 +7,7 @@
 
 import { getExtensionLoader, type EditorHostProps } from '@nimbalyst/runtime';
 import { customEditorRegistry } from '../components/CustomEditors';
+import { registerBuiltinCustomEditors } from '../components/CustomEditors/registerBuiltinCustomEditors';
 import { logger } from '../utils/logger';
 
 // Track which extension editors have been registered
@@ -52,6 +53,7 @@ function registerExtensionEditors(extensionId: string): string[] {
         supportsAI: manifest.permissions?.ai || false,
         supportsSourceMode: contribution.supportsSourceMode || false,
         supportsDiffMode: contribution.supportsDiffMode,
+        readOnlyDuringDiff: contribution.readOnlyDuringDiff,
         showDocumentHeader: contribution.showDocumentHeader,
         supportsTranscriptEmbed: contribution.supportsTranscriptEmbed || false,
         transcriptEmbedHeight: contribution.transcriptEmbedHeight,
@@ -127,6 +129,11 @@ export function syncExtensionEditors(): void {
       }
     }
   }
+
+  // Extension reload unregisters the suffixes from the previous manifest.
+  // Reassert core ownership afterwards so a retired extension contribution
+  // cannot leave its built-in compatibility opener missing until app restart.
+  registerBuiltinCustomEditors();
 }
 
 /**

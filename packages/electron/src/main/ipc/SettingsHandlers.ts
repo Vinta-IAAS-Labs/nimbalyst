@@ -1,13 +1,16 @@
+import { registerProviderCredentialHandlers } from './ProviderCredentialHandlers';
+import { registerCloudflareSandboxHandlers } from './CloudflareSandboxHandlers';
 import { BrowserWindow, safeStorage, session, dialog } from 'electron';
 import { applyAnalyticsEnabled } from '../services/analytics/applyAnalyticsEnabled';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
+import { deleteSecretFile, readSecretFile, writeSecretFile } from '../utils/fileUtils';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
 import {
     getWorkspaceState, updateWorkspaceState,
-    getTheme, getThemeSync, getResolvedThemeSync,
+    getTheme, getThemeSync, getResolvedThemeSync, getThemeBackgroundColor,
     isCompletionSoundEnabled, setCompletionSoundEnabled,
     getCompletionSoundType, setCompletionSoundType, CompletionSoundType,
     getCompletionSoundCustomPath, setCompletionSoundCustomPath,
@@ -36,12 +39,14 @@ import {
     isFeatureWalkthroughCompleted, setFeatureWalkthroughCompleted,
     isWorktreeOnboardingShown, setWorktreeOnboardingShown,
     getClaudeCodeSettings,
+    getAttachmentStagingConfig,
+    setAttachmentStagingConfig,
     setClaudeCodeProjectCommandsEnabled, setClaudeCodeUserCommandsEnabled,
     setClaudeCodeApiUpstreamUrl,
     getAgentWorkflowSourceSettings, getAgentWorkflowExportSettings,
     setAgentWorkflowSourceSettings, setAgentWorkflowExportSettings,
 } from '../utils/store';
-import { getEnhancedPath } from '../services/CLIManager';
+import { getEnhancedPath } from '../services/shellEnvironment';
 import { logger } from '../utils/logger';
 import { getSettingsService, isSettingKey } from '../services/SettingsService';
 import { SessionNamingService } from '../services/SessionNamingService';
@@ -53,7 +58,7 @@ import { getCredentials, resetCredentials, generateQRPairingPayload, isUsingSecu
 import {
     isSyncProviderReady,
     onSyncStatusChange,
-    triggerIncrementalSync,
+    triggerIncrementalSync, projectConfigSync,
     updateSleepPrevention,
 } from '../services/SyncManager';
 import { getDocSyncStatusForWorkspace } from '../file/WorkspaceWatcher';
@@ -69,7 +74,8 @@ import {
     switchPersonalSyncProfile,
 } from '../services/PersonalSyncProfiles';
 import { purgeOfflineCollabAccounts } from '../services/CollabOfflineAccountLifecycle';
-import { listPersonalSyncDevices } from '../services/PersonalSyncDevicesService';
+import { listPersonalSyncDevices, updatePersonalSyncDevices } from '../services/PersonalSyncDevicesService';
+import { recordProjectWalkOriginator } from '../services/ProjectWalkClaim';
 
 // Track if we've subscribed to sync status changes
 let syncStatusListenerSetup = false;
@@ -98,6 +104,43 @@ function ensureStytchInitialized(): void {
 }
 
 /**
+ * Note the window a sign-in was started from, so the post-sign-in project walk
+ * comes back to it. Sign-in finishes in an external browser, so by the time the
+ * auth broadcast lands there is no focused window to infer this from.
+ */
+function rememberSignInWindow(event: Electron.IpcMainInvokeEvent): void {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window) recordProjectWalkOriginator(window.id, Date.now());
+}
+
+function parseAuthFlowOptions(
+    value: unknown,
+    fallbackIntent: StytchAuth.AuthIntent,
+): StytchAuth.AuthFlowOptions {
+    if (value === undefined) return { intent: fallbackIntent };
+    if (!value || typeof value !== 'object') {
+        throw new Error('Auth flow options must be an object');
+    }
+    const options = value as { intent?: unknown; targetPersonalOrgId?: unknown };
+    if (!['sign-in', 'add-account', 'reauth'].includes(String(options.intent))) {
+        throw new Error('Auth flow intent must be sign-in, add-account, or reauth');
+    }
+    if (options.targetPersonalOrgId !== undefined && typeof options.targetPersonalOrgId !== 'string') {
+        throw new Error('targetPersonalOrgId must be a string');
+    }
+    if (options.intent === 'reauth' && !options.targetPersonalOrgId) {
+        throw new Error('Reauth requires targetPersonalOrgId');
+    }
+    if (options.intent !== 'reauth' && options.targetPersonalOrgId) {
+        throw new Error('targetPersonalOrgId is only valid for reauth');
+    }
+    return {
+        intent: options.intent as StytchAuth.AuthIntent,
+        targetPersonalOrgId: options.targetPersonalOrgId as string | undefined,
+    };
+}
+
+/**
  * Get the local network IP address (for LAN access from mobile devices)
  */
 function getLocalNetworkIP(): string | null {
@@ -116,6 +159,8 @@ function getLocalNetworkIP(): string | null {
 }
 
 export function registerSettingsHandlers() {
+    registerProviderCredentialHandlers();
+    registerCloudflareSandboxHandlers();
     // ============================================================
     // Flat-key SettingsService (per-key reads/writes + broadcast)
     //
@@ -210,34 +255,24 @@ export function registerSettingsHandlers() {
         return secretsDir;
     }
 
-    function getSecretFilePath(key: string): string {
-        // Sanitize key to be filesystem-safe
-        const safeKey = key.replace(/[^a-zA-Z0-9_:-]/g, '_');
-        return path.join(getSecretsDir(), `${safeKey}.enc`);
-    }
-
     safeHandle('secrets:get', async (_event, key: string) => {
         if (!key) {
             throw new Error('Key is required for secrets:get');
         }
 
-        const filePath = getSecretFilePath(key);
-
-        if (!fs.existsSync(filePath)) {
-            return null;
-        }
+        const decrypt = (data: Buffer) =>
+            safeStorage.isEncryptionAvailable()
+                ? safeStorage.decryptString(data)
+                : data.toString('utf8');
 
         try {
-            const fileData = fs.readFileSync(filePath);
-
-            if (safeStorage.isEncryptionAvailable()) {
-                return safeStorage.decryptString(fileData);
-            } else {
-                // Fallback: read as plain text
-                return fileData.toString('utf8');
-            }
+            return readSecretFile(getSecretsDir(), key, decrypt);
         } catch (error) {
-            logger.main.error(`[secrets:get] Failed to read secret for key ${key}:`, error);
+            // A file exists but will not read back, which is a different
+            // situation from "no secret stored" - that path returns null
+            // without ever reaching here. Log it so a corrupt or undecryptable
+            // secret is greppable rather than silently indistinguishable.
+            logger.main.error(`[secrets:get] Failed to read existing secret for key ${key}:`, error);
             return null;
         }
     });
@@ -250,16 +285,13 @@ export function registerSettingsHandlers() {
             throw new Error('Value is required for secrets:set');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
             if (safeStorage.isEncryptionAvailable()) {
-                const encrypted = safeStorage.encryptString(value);
-                fs.writeFileSync(filePath, encrypted);
+                writeSecretFile(getSecretsDir(), key, safeStorage.encryptString(value));
             } else {
                 // Fallback: save as plain text (with warning)
                 logger.main.warn(`[secrets:set] safeStorage not available - saving secret without encryption`);
-                fs.writeFileSync(filePath, value, 'utf8');
+                writeSecretFile(getSecretsDir(), key, value);
             }
             logger.main.info(`[secrets:set] Secret saved for key: ${key}`);
         } catch (error) {
@@ -273,13 +305,9 @@ export function registerSettingsHandlers() {
             throw new Error('Key is required for secrets:delete');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
-            }
+            deleteSecretFile(getSecretsDir(), key);
+            logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
         } catch (error) {
             logger.main.error(`[secrets:delete] Failed to delete secret for key ${key}:`, error);
             throw error;
@@ -325,6 +353,14 @@ export function registerSettingsHandlers() {
     safeOn('get-resolved-theme-sync', (event) => {
         const theme = getResolvedThemeSync();
         event.returnValue = theme;
+    });
+
+    // The active theme's resolved --nim-bg, for the same flash-prevention
+    // script. The base theme classes only carry base colours, so an extension
+    // or file-based theme would still paint light/dark white until React
+    // resolves it; this seeds the variable before the first stylesheet applies.
+    safeOn('get-theme-background-color-sync', (event) => {
+        event.returnValue = getThemeBackgroundColor() ?? null;
     });
 
     // Get app version (from app.getVersion)
@@ -651,6 +687,12 @@ export function registerSettingsHandlers() {
     });
 
     safeHandle('developer-mode:set', async (_event, enabled: boolean) => {
+        // Logged because this write was previously silent, which left no way to
+        // tell a spurious flip back to Standard Mode from a deliberate one.
+        const before = isDeveloperMode();
+        if (before !== enabled) {
+            logger.main.info(`[SettingsHandlers] developer-mode:set ${before} -> ${enabled}`);
+        }
         setDeveloperMode(enabled);
     });
 
@@ -713,6 +755,18 @@ export function registerSettingsHandlers() {
     // Claude Code settings
     safeHandle('claudeCode:get-settings', async () => {
         return getClaudeCodeSettings();
+    });
+
+    safeHandle('attachment-staging:get-settings', async () => {
+        return getAttachmentStagingConfig();
+    });
+
+    safeHandle('attachment-staging:set-settings', async (_event, config: {
+        mode: 'temp' | 'workspace' | 'custom';
+        customPath?: string;
+    }) => {
+        setAttachmentStagingConfig(config);
+        return getAttachmentStagingConfig();
     });
 
     safeHandle('agentWorkflows:get-settings', async () => {
@@ -989,6 +1043,7 @@ export function registerSettingsHandlers() {
     // URL and personal-org JWT. The stored config intentionally omits serverUrl
     // when production is selected, and a team JWT targets a different member.
     safeHandle('sync:get-devices', listPersonalSyncDevices);
+    safeHandle('sync:update-devices', (_event, update) => updatePersonalSyncDevices(update));
 
     // Get sync status for the navigation gutter button
     safeHandle('sync:get-status', async (_event, workspacePath?: string) => {
@@ -1019,15 +1074,13 @@ export function registerSettingsHandlers() {
         const isProjectEnabled = workspacePath ? enabledProjects.includes(workspacePath) : false;
 
         // Get sync provider status from SyncManager
-        const { isSyncEnabled, getSyncProvider } = await import('../services/SyncManager');
-        const provider = getSyncProvider();
-        const syncActive = isSyncEnabled();
+        const { getSyncStatusSnapshot, isSyncEnabled } = await import('../services/SyncManager');
 
         // Get session count for this workspace using a simple, fast query
         let sessionCount = 0;
         let lastSyncedAt: number | null = null;
 
-        if (workspacePath && syncActive) {
+        if (workspacePath && isSyncEnabled()) {
             try {
                 // Get session count for status display (only called on mount, not polled)
                 const { database } = await import('../database/PGLiteDatabaseWorker');
@@ -1050,10 +1103,6 @@ export function registerSettingsHandlers() {
             }
         }
 
-        // Check connection status
-        // The provider doesn't expose a direct "isConnected" status, but we can infer from syncActive
-        const connected = syncActive && provider !== null;
-
         // Get doc sync stats from ProjectFileSyncService
         let docSyncStats = { projectCount: 0, fileCount: 0, connected: false };
         try {
@@ -1066,9 +1115,7 @@ export function registerSettingsHandlers() {
         return {
             appConfigured: true,
             projectEnabled: isProjectEnabled,
-            connected,
-            syncing: false, // We don't have real-time syncing status yet
-            error: null,
+            ...getSyncStatusSnapshot(),
             stats: {
                 sessionCount,
                 lastSyncedAt,
@@ -1118,6 +1165,7 @@ export function registerSettingsHandlers() {
             docSyncEnabledProjects,
             enabled: enabledProjects.length > 0,
         }));
+        void projectConfigSync.refresh().catch(err => logger.main.warn('[sync:set-project-selection] Failed to refresh project config', err));
         logger.store.info(
             `[sync:set-project-selection] ${enabledProjects.length} project(s) enabled, `
             + `${docSyncEnabledProjects.length} with document sync`,
@@ -1175,6 +1223,7 @@ export function registerSettingsHandlers() {
         });
 
         logger.store.info(`[sync:toggle-project] Project sync ${enabled ? 'enabled' : 'disabled'} for: ${workspacePath}`);
+        void projectConfigSync.refresh(workspacePath).catch(err => logger.main.warn(`[sync:toggle-project] Failed to refresh config for ${workspacePath}`, err));
 
         // If a project was enabled, trigger sync to push its sessions immediately
         if (enabled) {
@@ -1318,8 +1367,10 @@ export function registerSettingsHandlers() {
     });
 
     // Sign in with Google OAuth
-    safeHandle('stytch:sign-in-google', async () => {
+    safeHandle('stytch:sign-in-google', async (event, rawOptions?: unknown) => {
         ensureStytchInitialized();
+        rememberSignInWindow(event);
+        const options = parseAuthFlowOptions(rawOptions, 'sign-in');
         // Get the sync server URL from settings
         const syncConfig = getSessionSyncConfig();
         const isDev = process.env.NODE_ENV !== 'production';
@@ -1339,15 +1390,17 @@ export function registerSettingsHandlers() {
         // Convert WebSocket URLs to HTTP: wss:// -> https://, ws:// -> http://
         const httpUrl = serverUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
         logger.main.info('[stytch:sign-in-google] Auth URL:', httpUrl, 'effectiveEnvironment:', effectiveEnvironment);
-        return StytchAuth.signInWithGoogle(httpUrl);
+        return StytchAuth.signInWithGoogle(httpUrl, options);
     });
 
     // Send magic link for passwordless authentication
-    safeHandle('stytch:send-magic-link', async (_event, email: string) => {
+    safeHandle('stytch:send-magic-link', async (event, email: string, rawOptions?: unknown) => {
         ensureStytchInitialized();
         if (!email) {
             return { success: false, error: 'Email is required' };
         }
+        rememberSignInWindow(event);
+        const options = parseAuthFlowOptions(rawOptions, 'sign-in');
         // Get the sync server URL from settings
         const syncConfig = getSessionSyncConfig();
         const isDev = process.env.NODE_ENV !== 'production';
@@ -1367,7 +1420,7 @@ export function registerSettingsHandlers() {
         // Convert WebSocket URLs to HTTP: wss:// -> https://, ws:// -> http://
         const httpUrl = serverUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
         logger.main.info('[stytch:send-magic-link] Sending to:', httpUrl, 'effectiveEnvironment:', effectiveEnvironment);
-        return StytchAuth.sendMagicLink(email, httpUrl);
+        return StytchAuth.sendMagicLink(email, httpUrl, options);
     });
 
     // Sign out (all accounts)
@@ -1394,23 +1447,6 @@ export function registerSettingsHandlers() {
         }
         await StytchAuth.signOut();
         return { success: true };
-    });
-
-    // Add a new account (opens OAuth flow)
-    safeHandle('stytch:add-account', async () => {
-        ensureStytchInitialized();
-        const syncConfig = getSessionSyncConfig();
-        const isDev = process.env.NODE_ENV !== 'production';
-        const effectiveEnvironment = isDev ? syncConfig?.environment : undefined;
-        let serverUrl: string;
-        if (effectiveEnvironment === 'development') {
-            serverUrl = 'http://localhost:8790';
-        } else if (syncConfig?.serverUrl) {
-            serverUrl = syncConfig.serverUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
-        } else {
-            serverUrl = 'https://sync.nimbalyst.com';
-        }
-        return StytchAuth.addAccount(serverUrl);
     });
 
     // Remove a specific account by personalOrgId

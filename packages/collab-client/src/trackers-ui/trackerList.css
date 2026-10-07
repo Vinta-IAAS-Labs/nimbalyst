@@ -1,0 +1,45 @@
+/**
+ * Layout rules for the compact list that Tailwind utilities cannot express.
+ *
+ * The row is otherwise authored in utilities beside its markup; these two are
+ * here because both are about the column the eye runs down, and neither has a
+ * utility.
+ */
+
+/* Reserved on every row, not only assigned ones.
+ *
+ * The avatar is the row's last element and the swatch pills before it are
+ * right-aligned, so rendering it conditionally moved both pills 26px left on
+ * exactly the rows that had an assignee. Across a real corpus, where some items
+ * are assigned and some are not, that is a 26px zig-zag in both columns from
+ * one row to the next -- the pills stop being columns at all. `min-w` on the
+ * pills settles their widths; this settles their position. */
+.tracker-list-row-owner {
+  display: flex;
+  flex: 0 0 auto;
+  width: 18px;
+  justify-content: center;
+}
+
+/* The gutter is held whether or not the list currently overflows, so the pill
+   columns keep the same right edge as the toolbar above them, a filtered view
+   that fits does not shift its rows against one that scrolls, and a platform
+   with classic (non-overlay) scrollbars does not paint one over the status
+   pill. */
+.tracker-list-view {
+  scrollbar-gutter: stable;
+}
+
+.tracker-stacked-row {
+  display: flex; flex-direction: column; gap: 8px; width: 100%; min-height: 76px;
+  padding: 14px 16px; border: 0; border-bottom: 1px solid var(--nim-border);
+  background: var(--nim-bg); color: var(--nim-text); text-align: left; cursor: pointer;
+}
+.tracker-stacked-row.is-selected { background: var(--nim-bg-active); }
+.tracker-stacked-row:focus-visible { outline: 2px solid var(--nim-primary); outline-offset: -2px; }
+.tracker-stacked-title {
+  font-size: 15px; line-height: 1.45; font-weight: 500; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.tracker-stacked-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--nim-text-muted); }
+.tracker-stacked-key { font-family: monospace; }

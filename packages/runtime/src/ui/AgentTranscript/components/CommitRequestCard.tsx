@@ -1,11 +1,24 @@
 import React, { useState } from 'react';
 import { MaterialSymbol } from '../../icons/MaterialSymbol';
+import {
+  COMMIT_FILE_LIST_END,
+  COMMIT_FILE_LIST_HEADERS,
+  COMMIT_FILE_COUNT_PREFIX,
+  COMMIT_PROMPT_PREFIX,
+  NO_REPOSITORY_GROUP_HEADER,
+  isCommitPromptSafePath,
+} from '../utils/commitPromptBuilder';
 
-const COMMIT_REQUEST_PREFIX = 'Use the developer_git_commit_proposal tool to create a commit.';
+const EXCLUDED_FILE_NOTICE_PATTERN = /^Excluded file paths with control characters: (\d+)\. Review and commit them separately\.$/;
+
+/** The opening sentence every commit request has always started with. */
+const LEGACY_COMMIT_PROMPT_PREFIX = 'Use the developer_git_commit_proposal tool to create a commit.';
 
 interface ParsedCommitFile {
   path: string;
   status: 'added' | 'modified' | 'deleted';
+  /** Set only when the list spans repos and this file's group named one. */
+  repo?: string;
 }
 
 interface ParsedCommitRequest {
@@ -13,32 +26,124 @@ interface ParsedCommitRequest {
   scenario: 'single' | 'workstream';
   sessionCount?: number;
   isWorktree: boolean;
+  excludedFileCount: number;
+}
+
+interface CommitFileListBounds {
+  lines: string[];
+  headerIndex: number;
+  endIndex: number;
+  /**
+   * Files the producer says it wrote, checked against the rows actually parsed.
+   * That equality is the anti-forgery guarantee: an injected row makes the
+   * counts disagree. Compared after parsing rather than against the raw line
+   * span, because a repo-grouped list interleaves headers and blank lines.
+   */
+  declaredCount?: number;
+}
+
+function findCommitFileListBounds(text: string): CommitFileListBounds | null {
+  if (!text.startsWith(COMMIT_PROMPT_PREFIX)) return null;
+
+  const lines = text.split('\n');
+  const headerIndexes = lines.flatMap((line, index) =>
+    COMMIT_FILE_LIST_HEADERS.some((header) => line.startsWith(header)) ? [index] : [],
+  );
+  const endIndexes = lines.flatMap((line, index) => line === COMMIT_FILE_LIST_END ? [index] : []);
+
+  if (headerIndexes.length !== 1 || endIndexes.length !== 1 || endIndexes[0] <= headerIndexes[0]) {
+    return null;
+  }
+
+  const countLine = lines[headerIndexes[0] + 1];
+  const countMatch = countLine?.match(new RegExp(`^${COMMIT_FILE_COUNT_PREFIX}(\\d+)\\.$`));
+  if (!countMatch) return null;
+
+  return {
+    lines,
+    headerIndex: headerIndexes[0],
+    endIndex: endIndexes[0],
+    declaredCount: Number(countMatch[1]),
+  };
+}
+
+/**
+ * Bounds for messages produced before the count/end markers existed.
+ *
+ * Transcripts are persisted, so every commit request already sitting in a user's
+ * session history lacks those markers. Without this fallback the strict parser
+ * returns null for all of them and years of past commit cards re-render as walls
+ * of raw prompt text. Rows are still bounded to the contiguous block after the
+ * header -- stricter than the original scan-every-line parser -- and these
+ * messages were sent long ago, so the card is display-only history at this point.
+ */
+function findLegacyCommitFileListBounds(text: string): CommitFileListBounds | null {
+  // Match the opening sentence only. The current prefix appends a ToolSearch
+  // instruction that older recorded prompts do not carry.
+  if (!text.startsWith(LEGACY_COMMIT_PROMPT_PREFIX)) return null;
+  if (text.includes(COMMIT_FILE_LIST_END)) return null;
+
+  const lines = text.split('\n');
+  const headerIndex = lines.findIndex((line) =>
+    COMMIT_FILE_LIST_HEADERS.some((header) => line.startsWith(header)),
+  );
+  if (headerIndex === -1) return null;
+
+  let endIndex = headerIndex + 1;
+  while (endIndex < lines.length && /^- (.+) \((added|modified|deleted)\)$/.test(lines[endIndex])) {
+    endIndex += 1;
+  }
+  if (endIndex === headerIndex + 1) return null;
+
+  // The strict reader skips a count line; legacy messages have none, so shift
+  // the header back one to keep `headerIndex + 2` landing on the first row.
+  return { lines, headerIndex: headerIndex - 1, endIndex };
 }
 
 export function isCommitRequestMessage(text: string): boolean {
-  // Detect on the file-list header rather than the exact "call the tool" wording.
-  // The instruction sentence is reworded between producers (GitOperationsPanel,
-  // voiceModeListeners), but the injected list always opens with one of these
-  // headers -- and they're only present when there ARE files for the card to show.
-  // Worktree commits use the "all the uncommitted changes" header; shared-checkout
-  // commits use the "files edited" header.
-  return text.startsWith(COMMIT_REQUEST_PREFIX) &&
-    (text.includes('Here are the files edited') ||
-      text.includes('Here are all the uncommitted changes'));
+  return findCommitFileListBounds(text) !== null || findLegacyCommitFileListBounds(text) !== null;
 }
 
 export function parseCommitRequest(text: string): ParsedCommitRequest | null {
-  if (!isCommitRequestMessage(text)) return null;
+  const strictBounds = findCommitFileListBounds(text);
+  const bounds = strictBounds ?? findLegacyCommitFileListBounds(text);
+  if (!bounds) return null;
 
   const files: ParsedCommitFile[] = [];
-  const lines = text.split('\n');
 
-  for (const line of lines) {
-    const match = line.match(/^- (.+) \((added|modified|deleted)\)$/);
-    if (match) {
-      files.push({ path: match[1], status: match[2] as ParsedCommitFile['status'] });
+  // A file list spanning repos is emitted in `Repository: <path>` groups, so
+  // the rows are interleaved with headers and blank lines. Anything still
+  // unrecognized fails the parse, as before -- the strictness is the point.
+  let currentRepo: string | undefined;
+  for (const line of bounds.lines.slice(bounds.headerIndex + 2, bounds.endIndex)) {
+    if (line === '') continue;
+    const repoHeader = line.match(/^Repository: (.+)$/);
+    if (repoHeader) {
+      currentRepo = repoHeader[1];
+      continue;
     }
+    if (line === NO_REPOSITORY_GROUP_HEADER) {
+      currentRepo = undefined;
+      continue;
+    }
+    const match = line.match(/^- (.+) \((added|modified|deleted)\)$/);
+    if (!match) return null;
+    // Only the marker-bearing format carries the producer's safety guarantee;
+    // legacy history predates it and must still render.
+    if (strictBounds && !isCommitPromptSafePath(match[1])) return null;
+    files.push({
+      path: match[1],
+      status: match[2] as ParsedCommitFile['status'],
+      ...(currentRepo ? { repo: currentRepo } : {}),
+    });
   }
+
+  // The producer's count must match the rows read back, or a row was forged.
+  if (bounds.declaredCount !== undefined && bounds.declaredCount !== files.length) {
+    return null;
+  }
+
+  const excludedFileNotice = bounds.lines[bounds.endIndex + 2]?.match(EXCLUDED_FILE_NOTICE_PATTERN);
 
   const isWorkstream = text.includes('across') && text.includes('sessions');
   const sessionCountMatch = text.match(/across (\d+) sessions/);
@@ -49,6 +154,7 @@ export function parseCommitRequest(text: string): ParsedCommitRequest | null {
     scenario: isWorkstream ? 'workstream' : 'single',
     sessionCount: sessionCountMatch ? parseInt(sessionCountMatch[1], 10) : undefined,
     isWorktree,
+    excludedFileCount: excludedFileNotice ? parseInt(excludedFileNotice[1], 10) : 0,
   };
 }
 
@@ -64,11 +170,14 @@ interface CommitRequestCardProps {
 
 export const CommitRequestCard: React.FC<CommitRequestCardProps> = ({ request }) => {
   const [isExpanded, setIsExpanded] = useState(false);
-  const { files, scenario, sessionCount, isWorktree } = request;
+  const { files, scenario, sessionCount, isWorktree, excludedFileCount } = request;
 
   const scopeLabel = scenario === 'workstream'
     ? `${files.length} file${files.length !== 1 ? 's' : ''} across ${sessionCount ?? '?'} sessions`
     : `${files.length} file${files.length !== 1 ? 's' : ''}`;
+  const requestLabel = files.length === 0 && excludedFileCount > 0
+    ? 'Commit proposal blocked'
+    : 'Requesting commit proposal';
 
   return (
     <div className="rounded-lg bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] overflow-hidden">
@@ -78,11 +187,19 @@ export const CommitRequestCard: React.FC<CommitRequestCardProps> = ({ request })
       >
         <MaterialSymbol icon="commit" size={16} className="text-[var(--nim-primary)] shrink-0" />
         <span className="text-sm font-medium text-[var(--nim-text)] flex-1">
-          Requesting commit proposal
+          {requestLabel}
         </span>
         <span className="text-xs text-[var(--nim-text-faint)]">
           {scopeLabel}
         </span>
+        {excludedFileCount > 0 && (
+          <span
+            className="text-[10px] rounded-full font-medium px-1.5 py-0.5 bg-[var(--nim-bg-tertiary)] text-[var(--nim-warning)]"
+            title="File paths containing control characters cannot be safely included in an AI commit request."
+          >
+            {excludedFileCount} unsupported path{excludedFileCount === 1 ? '' : 's'} excluded
+          </span>
+        )}
         {isWorktree && (
           <span className="text-[10px] rounded-full font-medium px-1.5 py-0.5 bg-[var(--nim-bg-tertiary)] text-[var(--nim-text-muted)]">
             worktree

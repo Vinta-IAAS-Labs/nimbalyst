@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { mergeWithDefaults } from '../agentMode';
 
@@ -29,5 +30,13 @@ describe('mergeWithDefaults - sessionHistoryLayout.sortOrder (#924)', () => {
   it('defaults to "updated" when sortOrder is missing', () => {
     const merged = mergeWithDefaults({ sessionHistoryLayout: {} as never });
     expect(merged.sessionHistoryLayout.sortOrder).toBe('updated');
+  });
+});
+
+describe('mergeWithDefaults - sessionHistoryLayout.compactRows', () => {
+  it('keeps a saved compact preference and defaults older layouts to full rows', () => {
+    expect(mergeWithDefaults({ sessionHistoryLayout: { compactRows: true } as never }).sessionHistoryLayout.compactRows).toBe(true);
+    expect(mergeWithDefaults({ sessionHistoryLayout: { sortOrder: 'created' } as never }).sessionHistoryLayout.compactRows).toBe(false);
+    expect(mergeWithDefaults(undefined).sessionHistoryLayout.compactRows).toBe(false);
   });
 });

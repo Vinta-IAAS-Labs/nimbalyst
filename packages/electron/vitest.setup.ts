@@ -43,10 +43,32 @@ if (!process.env.NIMBALYST_BETTER_SQLITE3_NATIVE) {
   }
 }
 
+// jsdom ships neither ResizeObserver nor Range layout, and any component that
+// positions a floating surface (floating-ui's `autoUpdate`, Lexical's typeahead
+// anchor) reaches for both on mount. Without these a renderer test dies with
+// `ReferenceError: ResizeObserver is not defined` inside a passive effect,
+// which reads as a component bug rather than a missing browser API.
+// Zero-sized rects are enough: unit tests assert what a menu offers, never
+// where it sits.
+if (typeof window !== 'undefined') {
+  if (!window.ResizeObserver) {
+    window.ResizeObserver = class {
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    } as unknown as typeof ResizeObserver;
+  }
+  if (typeof Range.prototype.getBoundingClientRect !== 'function') {
+    Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);
+    Range.prototype.getClientRects = () =>
+      ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} }) as unknown as DOMRectList;
+  }
+}
+
 // Mock electron for tests that import it
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/mock/path'),
+    getPath: (await import('./test-stubs/privateUserData')).testApp.getPath,
     getName: vi.fn(() => 'test-app'),
     getVersion: vi.fn(() => '1.0.0'),
     // Lifecycle event registration: several main-process modules call

@@ -36,6 +36,7 @@ nim <noun> <verb> [--flags]
 
 nim status
 nim workspace list
+nim tracker ready --type bug
 nim tracker list --type bug --status open --priority high --since 1d --limit 20
 nim tracker list --where severity=critical --where tags~auth --json
 nim tracker get  NIM-123
@@ -81,6 +82,7 @@ nim tracker import resnapshot github://owner/repo#42
   `--date-field created` switches off the default `updated`.
 - `--where field<op>value` (repeatable) — ops `=`, `!=`, `~` (contains),
   `=in:a,b,c`.
+- `nim tracker ready` is the preset for `nim tracker list --where readiness=ready`.
 - `--limit <n>` / `--all`, `--archived`.
 
 ### Output
@@ -94,36 +96,54 @@ nim tracker import resnapshot github://owner/repo#42
 
 `0` ok · `1` not found · `2` usage · `3` connection (incl. importers in offline
 mode) · `4` schema-incompatible · `5` write-not-permitted (a live app owns the
-DB, or a live-only command in offline mode).
+DB, or a live-only command in offline mode). `6` is retired.
 
 ### Env
 
 `NIM_DB`, `NIM_WORKSPACE`, `NIM_ENDPOINT` + `NIM_TOKEN` (force live), `NIM_OWNER`
 (resolves `--owner me`), `NO_COLOR`, `NIM_DEBUG` (stack traces).
 
+## Team pages
+
+The `pages` commands work on a Nimbalyst team project's Pages on the sync server with your Nimbalyst Teams sign-in, not through a running Nimbalyst app. Each one calls the same Pages tool a terminal agent uses through the `nimbalyst-pages` Claude Code plugin, with the same arguments, so a script and an agent see the same results. A repository reaches its pages through the team project a team admin connected its remote to; who belongs is decided in Nimbalyst Teams. Only team pages are reachable; Personal pages live in the desktop app.
+
+```sh
+nim login                      # device code, approved in the Nimbalyst console
+nim whoami / nim logout
+nim pages status               # unbound (with your teams) | bound | ambiguous
+nim pages bind --org <id> --project <id>                  # team admins
+nim pages create-project --org <id> --name <n> [--bind]   # team admins
+nim pages pin --org <id> --project <id>                   # one of the projects this repo resolves to
+
+nim pages list                                            # the page tree, with links
+nim pages read collab://org:<o>:doc:<id>                  # a page body as markdown
+nim pages edit <uri> --old "exact text" --new "replacement"
+nim pages create "Flag storage" --parent <pageId> --body-file notes.md
+nim pages move CFS-2 --kind item --parent <pageId>
+nim pages set-type <pageId> technology
+nim pages items --type technology --where maturity=beta --json
+nim pages create-item technology "Flagship" --field maturity=beta --body-file body.md
+nim pages comments --page <uri>                           # citable comments
+```
+
+`nim --help` lists every verb: `list`, `read`, `edit`, `create`, `create-folder`, `move`, `rename`, `delete`, `set-type`, `members`, `types`, `define-type`, `items`, `item`, `create-item`, `update-item`, `comments`. Edits land directly, as an agent's do; each page's history is how a person reverts one.
+
+`repo` is `git remote get-url origin`. `.nimbalyst/wiki.json` holds an optional `{ orgId, projectId }` pin, sent as `project` to choose among projects you can already reach; it grants nothing. `--repo`, or `--org` with `--project`, targets something else and ignores the current directory's wiki.json. `nim pages pin` only accepts a project the repository actually resolves to (one of an ambiguous match, or its bound project), and only for the current checkout. Tokens live in `credentials.json` (mode 0600, directory 0700) under the user config dir, are written under a lock, and refresh on their own; `nim logout` revokes the session on the server before deleting them. `nim wiki` was renamed to `nim pages`.
+
+Env: `NIM_SERVER` (default `https://sync.nimbalyst.com`; `http://` only for localhost), `NIM_CONFIG_DIR` (credentials location), `NIM_GITHUB_NATIVE=on` (the earlier GitHub sign-in for `nim login`, off by default; `NIM_GITHUB_CLIENT_ID` configures its device flow).
+
 ## Notes for maintainers
 
-- `src/vendor/trackerRecord.ts` is a vendored copy of
-  `packages/runtime/src/core/TrackerRecord.ts` (the runtime's Vite build does not
-  emit a Node-resolvable `dist/core/TrackerRecord.js`). Keep the `dbRowToRecord` /
-  `recordToDbParams` logic in sync with the runtime; the CLI must agree
-  byte-for-byte with the app on the `data` column / `type_tags` parsing.
-- `src/vendor/trackerWrite.ts` mirrors the offline write helpers (`appendActivity`,
-  the comment shape, git-config identity) from the app's MCP tool handlers +
-  `TrackerIdentityService`. The offline write path in `DirectGateway` deliberately
-  mirrors those handlers (not `recordToDbParams`) so a CLI-written row is
-  byte-for-byte identical to an app-written one. Keep these in sync if the
-  handlers change.
-- `better-sqlite3` is a native dependency and must match the version the app
-  ships, but built for the **Node** ABI (the app's copy is built for Electron's
-  ABI and cannot be shared). Publishing should ship prebuilt Node-ABI binaries.
+- Pure tracker record, key, release, status, and readiness semantics come from `@nimbalyst/tracker-core`, the same built package consumed by the runtime. Direct mode injects materialized type models alongside the full item corpus.
+- `src/gateway/trackerWrite.ts` owns only host-specific offline write helpers (activity mutation, the stored comment shape, git-config identity, and local ID generation). `DirectGateway` deliberately mirrors the app handlers rather than using `recordToDbParams`, and the cross-host regression test requires their stored activity bytes to remain identical.
+- `better-sqlite3` is a native dependency and must match the version the app ships. Version 13 uses Node-API prebuilds shared by supported Node and Electron hosts; the CLI's Node 22 floor matches its upstream engine requirement.
 - `MAX_KNOWN_SCHEMA` in `src/gateway/schema.ts` pins the newest tracker schema
   this build was verified against; bump it as the app's schema advances.
 
 ## Develop
 
 ```
-npm run build       # tsc -> dist/
-npm run typecheck
-npm test            # vitest (DirectGateway fixture tests)
+pnpm run build       # tsc -> dist/
+pnpm run typecheck
+pnpm test            # vitest (DirectGateway fixture tests)
 ```

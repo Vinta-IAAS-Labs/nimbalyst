@@ -102,15 +102,18 @@ vi.mock('@nimbalyst/runtime/sync', async (importOriginal) => {
     onAwarenessChange() { return () => {}; }
     setLocalAwareness() {}
     setRoomMetadata() {}
-    acceptRemoteChanges() {}
-    rejectRemoteChanges() {}
   }
 
   return { ...actual, DocumentSyncProvider: FakeDocumentSyncProvider };
 });
 
 vi.mock('../../utils/collabDocumentOpener', () => ({
-  resolveCollabConfigForUri: vi.fn(async (_w: string, _u: string, documentId: string) => ({
+  resolveDesktopCollabConfigForUri: vi.fn(async (scopeKey: string, _u: string, documentId: string) => ({
+    scope: {
+      scopeKey,
+      orgId: 'org-1',
+      indexConfig: { serverUrl: 'wss://test.invalid', teamMemberId: 'user-1' },
+    },
     serverUrl: 'wss://test.invalid',
     getJwt: async () => 'jwt',
     orgId: 'org-1',
@@ -157,15 +160,14 @@ const BODY_MARKDOWN = [
  * arguments, same editor config shape, same
  * `key={`collab-${itemId}-${providerEpoch}`}` remount key.
  */
-function TrackerBodyHarness(): React.ReactElement {
+function TrackerBodyHarness({ focused = false }: { focused?: boolean }): React.ReactElement {
   const { collaboration, loading, providerEpoch } = useTrackerContentCollab({
     itemId: ITEM_ID,
     title: 'NIM-TEST',
     workspacePath: '/workspace',
-    syncMode: 'shared',
-    teamMemberCount: 1,
+    sharing: 'team',
     teamOrgId: 'org-1',
-    itemShared: true,
+    itemPublished: true,
   });
 
   const config = useMemo((): EditorConfig | null => {
@@ -174,12 +176,15 @@ function TrackerBodyHarness(): React.ReactElement {
       isRichText: true,
       editable: true,
       showToolbar: false,
+      // TrackerItemDetail rebuilds this config when item -> document
+      // presentation flips `forceFloatingToolbar` with focusActive.
+      forceFloatingToolbar: focused,
       isCodeHighlighted: true,
       hasLinkAttributes: true,
       markdownOnly: true,
       collaboration: { ...collaboration },
     } as EditorConfig;
-  }, [collaboration, loading]);
+  }, [collaboration, focused, loading]);
 
   if (!config) return <div data-testid="tracker-content-not-ready" />;
   return <NimbalystEditor key={`collab-${ITEM_ID}-${providerEpoch}`} config={config} />;
@@ -241,6 +246,7 @@ describe('shared tracker body paints on reopen (NIM-1985 harness)', () => {
 
     (window as any).electronAPI = {
       documentService: {
+        getTrackerCreationStatus: vi.fn().mockResolvedValue(null),
         getTrackerBodyCacheForDetail: vi.fn(async () => ({
           success: true,
           row: { content: BODY_MARKDOWN },
@@ -253,6 +259,30 @@ describe('shared tracker body paints on reopen (NIM-1985 harness)', () => {
   afterEach(() => {
     cleanup();
     _resetBodyDocCacheForTests();
+  });
+
+  it.each(['pending', 'published'])('never seeds a receipt-backed %s creation from its local cache', async (status) => {
+    (window as any).electronAPI.documentService.getTrackerCreationStatus.mockResolvedValue({ itemId: ITEM_ID, status });
+    render(<TrackerBodyHarness />);
+    await settle();
+    expect(document.body.textContent).not.toContain(MARKER);
+    expect(roomBytes()).toBeLessThan(100);
+  });
+
+  it.each([
+    ['a local (personal) receipt', { itemId: ITEM_ID, status: 'local' }],
+    ['a failed receipt lookup', new Error('handler missing')],
+  ])('keeps the cold-paint path for %s', async (_label, receipt) => {
+    // Only team creations the main publisher seeds may skip bootstrap; a
+    // personal item later shared, or an older main process without the
+    // receipt handler, must paint exactly as before receipts existed.
+    const status = (window as any).electronAPI.documentService.getTrackerCreationStatus;
+    if (receipt instanceof Error) status.mockRejectedValue(receipt);
+    else status.mockResolvedValue(receipt);
+    render(<div data-testid="detail"><TrackerBodyHarness /></div>);
+    await settle();
+    expectPainted('detail', 'cold cache, empty room');
+    expect(roomBytes()).toBeGreaterThan(100);
   });
 
   it('close -> reopen against a warm BodyDocCache entry', async () => {
@@ -274,6 +304,24 @@ describe('shared tracker body paints on reopen (NIM-1985 harness)', () => {
     app.rerender(<App open={true} />);
     await settle();
     expectPainted('detail', 'reopen (warm cache, populated room)');
+  });
+
+  it('keeps content when the right-panel detail expands into document view (NIM-2431)', async () => {
+    function App({ focused }: { focused: boolean }) {
+      return (
+        <React.StrictMode>
+          <div data-testid="detail"><TrackerBodyHarness focused={focused} /></div>
+        </React.StrictMode>
+      );
+    }
+
+    const app = render(<App focused={false} />);
+    await settle();
+    expectPainted('detail', 'right-panel detail');
+
+    app.rerender(<App focused={true} />);
+    await settle();
+    expectPainted('detail', 'focused document view');
   });
 
   it('React <Activity> hide/show -- how Tracker mode actually switches (App.tsx:2291)', async () => {

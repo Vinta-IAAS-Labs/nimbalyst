@@ -16,17 +16,31 @@
 import React from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import type { EditorHost, ExtensionStorage } from '@nimbalyst/runtime';
-import { getExtensionLoader, createExtensionStorage, registerEditorAPI, unregisterEditorAPI, hasExtensionEditorAPI } from '@nimbalyst/runtime';
+import {
+  createEditorAPIOwnerToken,
+  createExtensionStorage,
+  getExtensionLoader,
+  hasExtensionEditorAPI,
+  registerEditorAPI,
+  unregisterEditorAPI,
+  type EditorAPIOwnerToken,
+} from '@nimbalyst/runtime';
 import { store } from '@nimbalyst/runtime/store';
 import { DocumentModelRegistry } from './document-model/DocumentModelRegistry';
+import type { DocumentModel } from './document-model/DocumentModel';
 import type { DocumentModelEditorHandle } from './document-model/types';
 import { fileDeletedAtomFamily } from '../store/atoms/fileWatch';
+import { assertFileSaveSucceeded } from '../utils/fileSaveResult';
+import { createProjectFileSystemHost } from './projectFileSystemHost';
+import { isCollabUri } from '@nimbalyst/collab-protocol';
 
 const LOG_PREFIX = '[HiddenTabManager]';
 const TTL_MS = 30_000; // 30 seconds after last release before cleanup
 const MAX_HIDDEN_EDITORS = 5;
 const POLL_INTERVAL_MS = 100;
 const POLL_TIMEOUT_MS = 10_000;
+/** How long a shared-page editor gets to bind to its document after registering its API. */
+const BINDING_SETTLE_MS = 1_000;
 
 interface HiddenEditorInstance {
   filePath: string;
@@ -40,6 +54,9 @@ interface HiddenEditorInstance {
   documentModelHandle: DocumentModelEditorHandle | null;
   /** Cleanup for the file-deleted atom subscription */
   fileDeletedUnsub: (() => void) | null;
+  editorAPIOwnerToken: EditorAPIOwnerToken;
+  /** A shared page's replica, released with the editor. */
+  releaseCollab?: () => void;
 }
 
 class HiddenTabManager {
@@ -95,6 +112,14 @@ class HiddenTabManager {
     // Check if a visible editor already has this file open
     if (this.isEditorAPIAvailable(filePath)) {
       // console.log(`${LOG_PREFIX} Visible editor already open for ${filePath}`);
+      return;
+    }
+
+    // A shared page (collab:// URI) has no file extension and no file on disk;
+    // its editor binds to the page's shared document instead (NIM-7397).
+    if (isCollabUri(filePath)) {
+      if (this.editors.size >= MAX_HIDDEN_EDITORS) this.evictOldest();
+      await this.mountCollabEditor(filePath, workspacePath);
       return;
     }
 
@@ -211,12 +236,20 @@ class HiddenTabManager {
     this.hiddenContainer!.appendChild(container);
 
     // Acquire a DocumentModel handle for coordinated save/dirty tracking
-    const { handle: documentModelHandle } = DocumentModelRegistry.getOrCreate(filePath, {
+    const { model: documentModel, handle: documentModelHandle } = DocumentModelRegistry.getOrCreate(filePath, {
       autosaveInterval: 0, // Hidden editors save immediately on dirty (100ms debounce)
     });
 
     // Create EditorHost
-    const host = this.createEditorHost(filePath, workspacePath, editorInfo.extensionId, documentModelHandle);
+    const editorAPIOwnerToken = createEditorAPIOwnerToken(`hidden:${filePath}`);
+    const host = this.createEditorHost(
+      filePath,
+      workspacePath,
+      documentModel,
+      documentModelHandle,
+      editorAPIOwnerToken,
+      editorInfo.extensionId,
+    );
 
     // Create React root and mount
     const root = createRoot(container);
@@ -243,6 +276,7 @@ class HiddenTabManager {
       extensionId: editorInfo.extensionId,
       documentModelHandle,
       fileDeletedUnsub,
+      editorAPIOwnerToken,
     });
 
     // Wait for the editor API to register, then move offscreen
@@ -262,6 +296,56 @@ class HiddenTabManager {
   }
 
   /**
+   * Mount the editor of a shared page, bound to its shared document. Resolves
+   * once its API is registered and its binding has registered a content flush,
+   * or a settle window passes for editors that bind without one.
+   */
+  private async mountCollabEditor(uri: string, workspacePath: string): Promise<void> {
+    if (!this.hiddenContainer) this.initialize();
+    const editorAPIOwnerToken = createEditorAPIOwnerToken(`hidden:${uri}`);
+    // Loaded on first use: it brings in the shared-document and editor-registry graph.
+    const { prepareHiddenCollabEditor } = await import('./hiddenCollabEditor');
+    const prepared = await prepareHiddenCollabEditor(uri, workspacePath, editorAPIOwnerToken);
+    const container = document.createElement('div');
+    container.style.width = '100%';
+    container.style.height = '100%';
+    // Visible while it initializes, as for a file: canvas editors need it.
+    this.hiddenContainer!.style.left = '0px';
+    this.hiddenContainer!.style.top = '0px';
+    this.hiddenContainer!.style.zIndex = '-9999';
+    this.hiddenContainer!.appendChild(container);
+    const root = createRoot(container);
+    root.render(React.createElement(prepared.component, { host: prepared.host }));
+    this.editors.set(uri, {
+      filePath: uri,
+      container,
+      root,
+      host: prepared.host,
+      refCount: 1,
+      ttlTimer: null,
+      extensionId: prepared.extensionId,
+      documentModelHandle: null,
+      fileDeletedUnsub: null,
+      editorAPIOwnerToken,
+      releaseCollab: prepared.release,
+    });
+    try {
+      await this.waitForEditorAPI(uri);
+      const deadline = Date.now() + BINDING_SETTLE_MS;
+      while (!prepared.isBound() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    } catch (error) {
+      this.unmountEditor(uri);
+      throw error;
+    } finally {
+      this.hiddenContainer!.style.left = '-9999px';
+      this.hiddenContainer!.style.top = '-9999px';
+      this.hiddenContainer!.style.zIndex = '';
+    }
+  }
+
+  /**
    * Unmount a hidden editor and clean up.
    */
   private unmountEditor(filePath: string): void {
@@ -271,7 +355,7 @@ class HiddenTabManager {
     // console.log(`${LOG_PREFIX} Unmounting hidden editor for ${filePath}`);
 
     // Clean up the central editor API registry
-    unregisterEditorAPI(filePath);
+    unregisterEditorAPI(filePath, instance.editorAPIOwnerToken);
 
     // Release DocumentModel handle
     if (instance.documentModelHandle) {
@@ -288,6 +372,7 @@ class HiddenTabManager {
     }
 
     instance.root.unmount();
+    instance.releaseCollab?.();
 
     if (instance.container.parentNode) {
       instance.container.parentNode.removeChild(instance.container);
@@ -321,7 +406,14 @@ class HiddenTabManager {
    * Create an EditorHost for a hidden editor.
    * This creates a functional host with file I/O and auto-save support.
    */
-  private createEditorHost(filePath: string, workspacePath: string, extensionId: string, documentModelHandle?: DocumentModelEditorHandle | null): EditorHost {
+  private createEditorHost(
+    filePath: string,
+    workspacePath: string,
+    documentModel: DocumentModel,
+    documentModelHandle: DocumentModelEditorHandle | null | undefined,
+    editorAPIOwnerToken: EditorAPIOwnerToken,
+    extensionId: string,
+  ): EditorHost {
     const fileName = filePath.split('/').pop() || filePath;
     const electronAPI = (window as any).electronAPI;
 
@@ -445,6 +537,16 @@ class HiddenTabManager {
         const content = result.content || '';
         // Establish the conflict baseline for this hidden editor.
         lastKnownContent = content;
+        // ...and the shared model's, from the same read. This is the hidden
+        // editor's half of the production hydration seam (NIM-5359, defect H):
+        // the manager takes a registry handle before anything has read a byte,
+        // so without this the shared model has no baseline at all. It does NOT
+        // make the hidden editor a diff presenter -- it never registers a diff
+        // callback, so a pending generation parks in `awaiting-presenter` for a
+        // real editor rather than waiting on an acknowledgement that has no
+        // surface to come from. A lookup failure must not fail the load; the
+        // model logs and retries on its own timer.
+        await documentModel.ensureInitialized(content).catch(() => {});
         return content;
       },
 
@@ -489,7 +591,8 @@ class HiddenTabManager {
           // Delegate to DocumentModel for coordinated save
           await documentModelHandle.saveContent(content);
         } else if (typeof content === 'string') {
-          await electronAPI.saveFile(content, filePath);
+          const result = await electronAPI.saveFile(content, filePath, undefined, 'auto');
+          assertFileSaveSucceeded(result);
         } else {
           throw new Error('Binary content saving not yet implemented for hidden editors');
         }
@@ -529,15 +632,33 @@ class HiddenTabManager {
       setEditorContext(): void {
         // Hidden editors don't push context to chat
       },
+
+      /*
+       * Sibling-file reads, the same surface a visible tab gets.
+       *
+       * Without this an editor whose document references files next to it --
+       * an animation's `htmlFile` partials, a mockup's assets -- renders those
+       * regions as nothing here while looking correct in a tab, so a screenshot
+       * taken to check the work quietly disagrees with the work. Nothing about
+       * the offscreen path made `fs` impossible; it was simply never wired.
+       */
+      fs: createProjectFileSystemHost({
+        // Nothing on screen to refresh: this host exists to render once.
+        onAfterWrite: async () => {},
+      }),
+
       setEditorContextItems(): void {
         // Hidden editors don't push context to chat
       },
 
       registerEditorAPI(api: unknown | null): void {
         if (api) {
-          registerEditorAPI(filePath, api, conflictAwareFlush);
+          registerEditorAPI(filePath, api, conflictAwareFlush, {
+            ownerToken: editorAPIOwnerToken,
+            priority: 'hidden',
+          });
         } else {
-          unregisterEditorAPI(filePath);
+          unregisterEditorAPI(filePath, editorAPIOwnerToken);
         }
       },
 

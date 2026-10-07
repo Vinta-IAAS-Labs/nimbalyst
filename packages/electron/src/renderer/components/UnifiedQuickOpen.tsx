@@ -20,7 +20,8 @@ import React, {
 } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { usePostHog } from 'posthog-js/react';
-import { MaterialSymbol, ProviderIcon } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { ProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import { getFileName, getRelativeDir } from '../utils/pathUtils';
 import { getRelativeTimeString } from '../utils/dateFormatting';
 import { revealFolderAtom } from '../store';
@@ -33,6 +34,7 @@ import { fileMentionOptionsAtom, searchFileMentionAtom } from '../store/atoms/fi
 import { setWindowModeAtom } from '../store/atoms/windowMode';
 import { setTrackerModeLayoutAtom } from '../store/atoms/trackers';
 import {
+  activeCollabScopeAtom,
   pendingCollabDocumentAtom,
   sharedDocumentsAtom,
   sharedFoldersAtom,
@@ -55,8 +57,19 @@ import {
   type FilterChipOption,
 } from './UnifiedQuickOpen/FilterChip';
 import { useRecentHistory } from './UnifiedQuickOpen/useRecentHistory';
-import { parseFileMask, matchesFileMask } from './UnifiedQuickOpen/fileMask';
+import {
+  findTrackersByIssueKey,
+  matchesTrackerText,
+  mergeIssueKeyMatches,
+  parseIssueKeyQuery,
+  type QuickOpenSearchResult,
+} from './UnifiedQuickOpen/issueKeyLookup';
+import { getTypeIcon } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/trackerColumns';
+import { revealEditorPosition } from './TabEditor/editorRevealCommand';
+import { parseFileMask, matchesFileMask } from '@nimbalyst/extension-sdk/file-mask';
 import type { TrackerItem } from '@nimbalyst/runtime/core/DocumentService';
+
+import { attachWorkspaceFolderWithPicker } from '../store/actions/workspaceFolders';
 
 const isMac =
   typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac');
@@ -113,6 +126,31 @@ const TAB_SPECS: TabSpec[] = [
 
 const FUTURE_TABS: DisabledTabSpec[] = [];
 
+type ShortcutPart =
+  | { type: 'modifier'; icon: string }
+  | { type: 'key'; label: string };
+
+function getShortcutParts(shortcut: string): ShortcutPart[] {
+  return shortcut.split('+').map((part) => {
+    if (part === 'Cmd') {
+      return {
+        type: 'modifier',
+        icon: isMac ? 'keyboard_command_key' : 'keyboard_control_key',
+      };
+    }
+    if (part === 'Ctrl') {
+      return { type: 'modifier', icon: 'keyboard_control_key' };
+    }
+    if (part === 'Shift') {
+      return { type: 'modifier', icon: 'shift' };
+    }
+    if (part === 'Option' || part === 'Alt') {
+      return { type: 'modifier', icon: 'keyboard_option_key' };
+    }
+    return { type: 'key', label: part };
+  });
+}
+
 // File mask options for the Files / In Files filter chip. Values are
 // comma-separated glob patterns — same syntax as the git extension's file
 // mask. The curated list covers common languages; users can type any custom
@@ -146,6 +184,7 @@ const RECENT_FILE_EXT_KEY = 'unifiedQuickOpen.recentFileMasks';
 const RECENT_TRACKER_TYPE_KEY = 'unifiedQuickOpen.recentTrackerTypes';
 const SELECTED_FILE_EXT_KEY = 'unifiedQuickOpen.selectedFileMask';
 const SELECTED_TRACKER_TYPE_KEY = 'unifiedQuickOpen.selectedTrackerType';
+const SELECTED_FILE_SOURCE_KEY = 'unifiedQuickOpen.selectedFileSource';
 
 type SemanticSearchScope = 'all' | 'docs' | 'trackers' | 'sessions';
 
@@ -165,6 +204,20 @@ const SEMANTIC_SEARCH_SCOPES: SemanticSearchScopeSpec[] = [
   { id: 'trackers', label: 'Trackers', sourceClasses: ['trackers'] },
   { id: 'sessions', label: 'Sessions', sourceClasses: ['sessions'] },
 ];
+
+// Files-tab source scope. Only rendered for team workspaces that actually have
+// shared documents — a solo workspace never sees this row.
+type FileSourceScope = 'all' | 'local' | 'shared';
+
+const FILE_SOURCE_SCOPES: ReadonlyArray<ScopeBubbleSpec<FileSourceScope>> = [
+  { id: 'all', label: 'All' },
+  { id: 'local', label: 'Local' },
+  { id: 'shared', label: 'Shared' },
+];
+
+function toFileSourceScope(stored: string | null): FileSourceScope {
+  return stored === 'local' || stored === 'shared' ? stored : 'all';
+}
 
 // Tracker status badge colors. Kept here so the Trackers pane and any future
 // status filter stay consistent with the tracker mode UI.
@@ -260,6 +313,65 @@ function usePersistedFilterValue(storageKey: string): [string | null, (value: st
 }
 
 // -----------------------------------------------------------------------------
+// Scope bubbles — the pill row shared by Memory ("Search in") and Files
+// ("Show"). Clicking the active pill falls back to `defaultScope`.
+// -----------------------------------------------------------------------------
+
+interface ScopeBubbleSpec<T extends string> {
+  id: T;
+  label: string;
+}
+
+interface ScopeBubblesProps<T extends string> {
+  rootClassName: string;
+  itemClassName: string;
+  label: string;
+  scopes: ReadonlyArray<ScopeBubbleSpec<T>>;
+  scope: T;
+  defaultScope: T;
+  onChange: (scope: T) => void;
+}
+
+function ScopeBubbles<T extends string>({
+  rootClassName,
+  itemClassName,
+  label,
+  scopes,
+  scope,
+  defaultScope,
+  onChange,
+}: ScopeBubblesProps<T>) {
+  return (
+    <div
+      className={`${rootClassName} shrink-0 flex items-center gap-1.5 px-3 py-2 border-b border-nim bg-nim-secondary`}
+      role="group"
+      aria-label={label}
+    >
+      <span className="mr-1 text-xs text-nim-faint">{label}</span>
+      {scopes.map((candidate) => {
+        const active = candidate.id === scope;
+        return (
+          <button
+            key={candidate.id}
+            type="button"
+            aria-pressed={active}
+            className={`${itemClassName} px-2.5 py-1 text-xs font-medium rounded-full border cursor-pointer transition-colors duration-100 ${
+              active
+                ? 'bg-nim-primary border-[var(--nim-primary)] text-white'
+                : 'bg-nim border-nim text-nim-muted hover:bg-nim-hover hover:text-nim'
+            }`}
+            onClick={() => onChange(active ? defaultScope : candidate.id)}
+            tabIndex={-1}
+          >
+            {candidate.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
 // Main shell
 // -----------------------------------------------------------------------------
 
@@ -291,9 +403,12 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
   // Memory search merges indexed docs, trackers, and sessions behind one tab.
   // The standalone Trackers tab remains available only when Memory is off.
   const [memoryScope, setMemoryScope] = useState<SemanticSearchScope>('all');
+  const [promptActorScope, setPromptActorScope] = useState<PromptActorScope>('all');
   // Per-tab filter chip values, hoisted so they survive tab switches.
   const [fileExtFilter, setFileExtFilter] = usePersistedFilterValue(SELECTED_FILE_EXT_KEY);
   const [trackerTypeFilter, setTrackerTypeFilter] = usePersistedFilterValue(SELECTED_TRACKER_TYPE_KEY);
+  const [storedFileSource, setStoredFileSource] = usePersistedFilterValue(SELECTED_FILE_SOURCE_KEY);
+  const fileSourceScope = toFileSourceScope(storedFileSource);
   const inputRef = useRef<HTMLInputElement>(null);
   const trackerTypeFilterRef = useRef<FilterChipHandle>(null);
   // Whether the nimbalyst-memory engine is running for this workspace. `null`
@@ -301,6 +416,10 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
   // it's still being determined). When false, the Memory tab is hidden entirely.
   const [searchAvailable, setSearchAvailable] = useState<boolean | null>(null);
   const hasTeam = useAtomValue(workspaceHasTeamAtom);
+  // The Files source row only earns its space once the workspace is on a team
+  // AND that team has shared documents to filter to.
+  const hasSharedDocuments = useAtomValue(sharedDocumentsAtom).length > 0;
+  const showFileSourceScopes = hasTeam && hasSharedDocuments;
   const visibleTabs = useMemo(
     () => [
       ...TAB_SPECS.filter(
@@ -338,6 +457,7 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
     if (isOpen) {
       setActiveTab(initialTab);
       setMemoryScope(initialTab === 'trackers' ? 'trackers' : 'all');
+      setPromptActorScope('all');
       setQuery('');
       setSessionFileFilter(null);
       // Focus shortly after mount so React has time to render the input.
@@ -534,7 +654,7 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
           : activeTab === 'sessions'
             ? 'Search sessions... (@ to filter by file edited)'
             : activeTab === 'prompts'
-              ? 'Search your prompts...'
+              ? 'Search prompts...'
               : 'Search files...';
 
   return (
@@ -547,8 +667,7 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
         className="unified-quick-open-modal fixed top-[15%] left-1/2 -translate-x-1/2 w-[92%] max-w-[820px] max-h-[70vh] flex flex-col overflow-hidden rounded-lg z-[99999] bg-nim border border-nim shadow-[0_20px_60px_rgba(0,0,0,0.3)]"
         data-testid="unified-quick-open"
       >
-        {/* Tab strip — equal-width tabs so the row stays stable when switching
-            (the kbd chip widths varied otherwise). */}
+        {/* Tab strip — equal-width tabs so the row stays stable when switching. */}
         <div
           className="unified-quick-open-tabs flex items-stretch border-b border-nim bg-nim-secondary"
           role="tablist"
@@ -560,7 +679,13 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
                 key={tab.id}
                 role="tab"
                 aria-selected={active}
+                aria-label={tab.label}
                 data-tab={tab.id}
+                title={
+                  tab.shortcut
+                    ? `${tab.label} (${getShortcutDisplay(tab.shortcut)})`
+                    : tab.label
+                }
                 className={`unified-quick-open-tab flex-1 min-w-0 flex items-center justify-center gap-1.5 px-2 py-1.5 text-[13px] font-medium whitespace-nowrap border-b-2 cursor-pointer transition-colors duration-100 ${
                   active
                     ? 'text-nim border-[var(--nim-primary)] bg-nim'
@@ -572,13 +697,41 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
                 <span>{tab.label}</span>
                 {tab.shortcut && (
                   <kbd
-                    className={`unified-quick-open-tab-shortcut font-mono text-[10px] px-1.5 py-0.5 rounded border min-w-[26px] text-center ${
+                    className={`unified-quick-open-tab-shortcut inline-flex shrink-0 items-center justify-center rounded border text-center leading-none ${
                       active
-                        ? 'text-[var(--nim-primary)] border-[var(--nim-primary)] bg-transparent'
+                        ? 'bg-transparent'
                         : 'text-nim-faint border-nim bg-nim-secondary'
                     }`}
+                    style={{
+                      minWidth: 26,
+                      padding: '2px 4px',
+                      columnGap: 1,
+                      ...(active
+                        ? {
+                            color: 'var(--nim-primary)',
+                            borderColor: 'var(--nim-primary)',
+                          }
+                        : {}),
+                    }}
                   >
-                    {getShortcutDisplay(tab.shortcut)}
+                    {getShortcutParts(tab.shortcut).map((part, index) =>
+                      part.type === 'modifier' ? (
+                        <MaterialSymbol
+                          key={`${part.icon}-${index}`}
+                          icon={part.icon}
+                          size={11}
+                        />
+                      ) : (
+                        <span
+                          key={`${part.label}-${index}`}
+                          className="unified-quick-open-shortcut-key font-mono"
+                          data-shortcut-key
+                          style={{ fontSize: 10 }}
+                        >
+                          {part.label}
+                        </span>
+                      ),
+                    )}
                   </kbd>
                 )}
               </button>
@@ -708,21 +861,35 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
             </div>
           )}
           <div className={activeTab === 'files' ? 'contents' : 'hidden'}>
-            <FilesPane
-              isOpen={isOpen}
-              isActive={activeTab === 'files'}
-              query={activeTab === 'files' ? query : ''}
-              extFilter={fileExtFilter}
-              workspacePath={workspacePath}
-              currentFilePath={currentFilePath}
-              onFileSelect={onFileSelect}
-              onFolderSelect={onFolderSelect}
-              onClose={onClose}
-              onShowFileSessions={(filePath) => {
-                setSessionFileFilter(filePath);
-                switchTab('sessions');
-              }}
-            />
+            <div className="files-pane-container flex-1 min-h-0 flex flex-col">
+              {showFileSourceScopes && (
+                <ScopeBubbles
+                  rootClassName="files-source-scopes"
+                  itemClassName="files-source-scope"
+                  label="Show"
+                  scopes={FILE_SOURCE_SCOPES}
+                  scope={fileSourceScope}
+                  defaultScope="all"
+                  onChange={(next) => setStoredFileSource(next === 'all' ? null : next)}
+                />
+              )}
+              <FilesPane
+                isOpen={isOpen}
+                isActive={activeTab === 'files'}
+                query={activeTab === 'files' ? query : ''}
+                extFilter={fileExtFilter}
+                sourceScope={showFileSourceScopes ? fileSourceScope : 'all'}
+                workspacePath={workspacePath}
+                currentFilePath={currentFilePath}
+                onFileSelect={onFileSelect}
+                onFolderSelect={onFolderSelect}
+                onClose={onClose}
+                onShowFileSessions={(filePath) => {
+                  setSessionFileFilter(filePath);
+                  switchTab('sessions');
+                }}
+              />
+            </div>
           </div>
           <div className={activeTab === 'in-files' ? 'contents' : 'hidden'}>
             <InFilesPane
@@ -779,6 +946,8 @@ export const UnifiedQuickOpen: React.FC<UnifiedQuickOpenProps> = ({
               isOpen={isOpen}
               isActive={activeTab === 'prompts'}
               query={activeTab === 'prompts' ? query : ''}
+              actorScope={promptActorScope}
+              onActorScopeChange={setPromptActorScope}
               workspacePath={workspacePath}
               onPromptSelect={onPromptSelect}
               onClose={onClose}
@@ -847,6 +1016,7 @@ const SharedDocsPane: React.FC<SharedDocsPaneProps> = memo(({
   const favorites = useAtomValue(collabFavoritesAtom);
   const changedDocIds = useAtomValue(changedDocIdsAtom);
   const recentDocuments = useAtomValue(recentSharedDocsAtom);
+  const activeCollabScope = useAtomValue(activeCollabScopeAtom);
   const setPendingCollabDocument = useSetAtom(pendingCollabDocumentAtom);
   const setWindowMode = useSetAtom(setWindowModeAtom);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -910,15 +1080,18 @@ const SharedDocsPane: React.FC<SharedDocsPaneProps> = memo(({
 
   const handleSelect = useCallback(
     (doc: SharedDocument) => {
+      if (!activeCollabScope) return;
       setPendingCollabDocument({
         documentId: doc.documentId,
+        scopeKey: activeCollabScope.scopeKey,
+        orgId: activeCollabScope.orgId,
         documentType: doc.documentType,
         analyticsSource: 'quick_open',
       });
       setWindowMode('collab');
       onClose();
     },
-    [setPendingCollabDocument, setWindowMode, onClose],
+    [activeCollabScope, setPendingCollabDocument, setWindowMode, onClose],
   );
 
   useEffect(() => {
@@ -1042,6 +1215,8 @@ interface FilesPaneProps {
   query: string;
   /** File-extension filter (e.g. ".ts"). Null means no filter. */
   extFilter: string | null;
+  /** Local / shared source scope. 'all' merges both. */
+  sourceScope: FileSourceScope;
   workspacePath: string;
   currentFilePath?: string | null;
   onFileSelect: (filePath: string) => void;
@@ -1055,6 +1230,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
   isActive,
   query,
   extFilter,
+  sourceScope,
   workspacePath,
   currentFilePath,
   onFileSelect,
@@ -1066,6 +1242,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
   const revealFolder = useSetAtom(revealFolderAtom);
   const sharedDocuments = useAtomValue(sharedDocumentsAtom);
   const sharedFolders = useAtomValue(sharedFoldersAtom);
+  const activeCollabScope = useAtomValue(activeCollabScopeAtom);
   const setPendingCollabDocument = useSetAtom(pendingCollabDocumentAtom);
   const setWindowMode = useSetAtom(setWindowModeAtom);
   const [results, setResults] = useState<FileItem[]>([]);
@@ -1091,15 +1268,15 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     }
   }, [isOpen, workspacePath]);
 
-  // Reset selected index when query changes
+  // Reset selected index when the result set is re-scoped
   useEffect(() => {
     setSelectedIndex(0);
-  }, [query]);
+  }, [query, sourceScope]);
 
   // Debounced file name search
   useEffect(() => {
     if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    if (!query.trim()) {
+    if (!query.trim() || sourceScope === 'shared') {
       setResults([]);
       return;
     }
@@ -1163,7 +1340,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     return () => {
       if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     };
-  }, [query, extFilter, workspacePath, recentFiles, posthog]);
+  }, [query, extFilter, sourceScope, workspacePath, recentFiles, posthog]);
 
   const recentItems: FileItem[] = useMemo(
     () =>
@@ -1180,13 +1357,16 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     [extFilter],
   );
   const displayFiles = useMemo(() => {
-    const localFiles = query ? results : recentItems;
+    const localFiles = sourceScope === 'shared' ? [] : query ? results : recentItems;
     const filteredLocalFiles = maskPatterns.length === 0 ? localFiles : localFiles.filter((f) => {
       if (f.type === 'directory') return false;
       return matchesFileMask(f.path, maskPatterns);
     });
 
-    if (!query.trim()) return filteredLocalFiles;
+    if (sourceScope === 'local') return filteredLocalFiles;
+    // With no query the local side shows recents; the shared side has no
+    // equivalent, so it only lists the team index when scoped to it explicitly.
+    if (!query.trim() && sourceScope !== 'shared') return filteredLocalFiles;
 
     const sharedFiles = searchSharedDocuments(sharedDocuments, sharedFolders, query)
       .filter(({ displayPath }) => (
@@ -1201,7 +1381,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
       }));
 
     return [...sharedFiles, ...filteredLocalFiles];
-  }, [query, results, recentItems, maskPatterns, sharedDocuments, sharedFolders]);
+  }, [query, results, recentItems, maskPatterns, sharedDocuments, sharedFolders, sourceScope]);
 
   // Track mouse movement
   useEffect(() => {
@@ -1222,8 +1402,11 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
   const handleSelect = useCallback(
     (file: FileItem) => {
       if (file.source === 'shared' && file.sharedDocument) {
+        if (!activeCollabScope) return;
         setPendingCollabDocument({
           documentId: file.sharedDocument.documentId,
+          scopeKey: activeCollabScope.scopeKey,
+          orgId: activeCollabScope.orgId,
           documentType: file.sharedDocument.documentType,
           analyticsSource: 'quick_open',
         });
@@ -1240,7 +1423,7 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
       onFileSelect(file.path);
       onClose();
     },
-    [onFileSelect, onFolderSelect, onClose, revealFolder, setPendingCollabDocument, setWindowMode],
+    [activeCollabScope, onFileSelect, onFolderSelect, onClose, revealFolder, setPendingCollabDocument, setWindowMode],
   );
 
   // Keyboard navigation — only when this pane is active
@@ -1275,7 +1458,11 @@ const FilesPane: React.FC<FilesPaneProps> = memo(({
     <div className="files-pane flex-1 overflow-y-auto">
       {displayFiles.length === 0 ? (
         <div className="p-10 text-center text-nim-faint">
-          {isSearching ? 'Searching...' : query ? 'No files found' : 'No recent files'}
+          {isSearching
+            ? 'Searching...'
+            : sourceScope === 'shared'
+              ? query ? 'No shared documents found' : 'No shared documents'
+              : query ? 'No files found' : 'No recent files'}
         </div>
       ) : (
         <ul
@@ -1475,6 +1662,13 @@ const InFilesPane: React.FC<InFilesPaneProps> = memo(({
 
   const handleSelect = useCallback(
     (file: FileItem) => {
+      // Land on the match the user picked this result for, not the top of the
+      // file. Armed before the open so the registry replays it once the tab's
+      // editor mounts.
+      const matchLine = file.matches?.[0]?.line;
+      if (matchLine !== undefined) {
+        revealEditorPosition(file.path, { line: matchLine });
+      }
       onFileSelect(file.path);
       onClose();
     },
@@ -2051,7 +2245,53 @@ interface PromptItem {
   sessionTitle: string;
   provider: string;
   parentSessionId?: string | null;
+  promptActor?: 'human' | 'agent';
 }
+
+type PromptActorScope = 'all' | 'human' | 'agent';
+
+const PROMPT_ACTOR_SCOPES: Array<{ id: PromptActorScope; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'human', label: 'Me' },
+  { id: 'agent', label: 'Agents' },
+];
+
+interface PromptActorBubblesProps {
+  scope: PromptActorScope;
+  onChange: (scope: PromptActorScope) => void;
+}
+
+const PromptActorBubbles: React.FC<PromptActorBubblesProps> = memo(({
+  scope,
+  onChange,
+}) => (
+  <div
+    className="prompt-actor-scopes shrink-0 flex items-center gap-1.5 px-3 py-2 border-b border-nim bg-nim-secondary"
+    role="group"
+    aria-label="Prompts from"
+  >
+    <span className="mr-1 text-xs text-nim-faint">Prompts from</span>
+    {PROMPT_ACTOR_SCOPES.map((candidate) => {
+      const active = candidate.id === scope;
+      return (
+        <button
+          key={candidate.id}
+          type="button"
+          aria-pressed={active}
+          className={`prompt-actor-scope px-2.5 py-1 text-xs font-medium rounded-full border cursor-pointer transition-colors duration-100 ${
+            active
+              ? 'bg-nim-primary border-[var(--nim-primary)] text-white'
+              : 'bg-nim border-nim text-nim-muted hover:bg-nim-hover hover:text-nim'
+          }`}
+          onClick={() => onChange(active ? 'all' : candidate.id)}
+          tabIndex={-1}
+        >
+          {candidate.label}
+        </button>
+      );
+    })}
+  </div>
+));
 
 const extractPromptText = (content: string): string => {
   try {
@@ -2072,6 +2312,8 @@ interface PromptsPaneProps {
   isOpen: boolean;
   isActive: boolean;
   query: string;
+  actorScope: PromptActorScope;
+  onActorScopeChange: (scope: PromptActorScope) => void;
   workspacePath: string;
   onPromptSelect: (sessionId: string, messageTimestamp?: number) => void;
   onClose: () => void;
@@ -2081,6 +2323,8 @@ const PromptsPane: React.FC<PromptsPaneProps> = memo(({
   isOpen,
   isActive,
   query,
+  actorScope,
+  onActorScopeChange,
   workspacePath,
   onPromptSelect,
   onClose,
@@ -2096,7 +2340,7 @@ const PromptsPane: React.FC<PromptsPaneProps> = memo(({
 
   useEffect(() => {
     setSelectedIndex(0);
-  }, [visibleQuery]);
+  }, [visibleQuery, actorScope]);
 
   // Reset list synchronously before paint so the empty state doesn't flash
   // "No recent prompts" while the IPC call is in flight.
@@ -2121,10 +2365,12 @@ const PromptsPane: React.FC<PromptsPaneProps> = memo(({
   }, [isOpen, workspacePath]);
 
   const displayPrompts = useMemo(() => {
-    if (!visibleQuery.trim()) return allPrompts;
-    const q = visibleQuery.toLowerCase();
-    return allPrompts.filter((p) => extractPromptText(p.content).toLowerCase().includes(q));
-  }, [visibleQuery, allPrompts]);
+    const q = visibleQuery.trim().toLowerCase();
+    return allPrompts.filter((prompt) => {
+      if (actorScope !== 'all' && prompt.promptActor !== actorScope) return false;
+      return !q || extractPromptText(prompt.content).toLowerCase().includes(q);
+    });
+  }, [visibleQuery, actorScope, allPrompts]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -2204,25 +2450,31 @@ const PromptsPane: React.FC<PromptsPaneProps> = memo(({
   }, [isOpen, isActive, displayPrompts, selectedIndex, handleSelect, handleCopy, onClose]);
 
   return (
-    <div className="prompts-pane flex-1 overflow-y-auto relative">
-      {copiedPromptId && (
-        <div
-          className="absolute top-2 left-1/2 -translate-x-1/2 z-10 py-1 px-3 rounded-full text-[11px] font-medium bg-[var(--nim-success)] text-white shadow"
-          data-testid="prompt-quick-open-copied-toast"
-        >
-          Copied to clipboard
-        </div>
-      )}
-      {displayPrompts.length === 0 ? (
-        <div className="p-10 text-center text-nim-faint">
-          {isLoading ? 'Loading...' : query ? 'No prompts found' : 'No recent prompts'}
-        </div>
-      ) : (
-        <ul
-          ref={listRef}
-          className={`list-none m-0 p-0 ${mouseHasMoved ? '' : 'pointer-events-none'}`}
-        >
-          {displayPrompts.map((prompt, index) => (
+    <div className="prompts-pane flex-1 min-h-0 flex flex-col">
+      <PromptActorBubbles scope={actorScope} onChange={onActorScopeChange} />
+      <div className="relative flex-1 overflow-y-auto">
+        {copiedPromptId && (
+          <div
+            className="absolute top-2 left-1/2 -translate-x-1/2 z-10 py-1 px-3 rounded-full text-[11px] font-medium bg-[var(--nim-success)] text-white shadow"
+            data-testid="prompt-quick-open-copied-toast"
+          >
+            Copied to clipboard
+          </div>
+        )}
+        {displayPrompts.length === 0 ? (
+          <div className="p-10 text-center text-nim-faint">
+            {isLoading
+              ? 'Loading...'
+              : query || actorScope !== 'all'
+                ? 'No prompts found'
+                : 'No recent prompts'}
+          </div>
+        ) : (
+          <ul
+            ref={listRef}
+            className={`list-none m-0 p-0 ${mouseHasMoved ? '' : 'pointer-events-none'}`}
+          >
+            {displayPrompts.map((prompt, index) => (
             <li
               key={prompt.id}
               className={`unified-quick-open-item py-3 px-4 cursor-pointer border-l-[3px] flex items-start gap-3 transition-all duration-100 ${
@@ -2255,9 +2507,10 @@ const PromptsPane: React.FC<PromptsPaneProps> = memo(({
                 </div>
               </div>
             </li>
-          ))}
-        </ul>
-      )}
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 });
@@ -2273,6 +2526,17 @@ interface ProjectItem {
   isOpen: boolean;
   isCurrent: boolean;
 }
+
+/**
+ * A Projects-pane row. The attach action shares the list so one arrow-key model
+ * covers both, rather than a separate focus trap for a single button.
+ */
+type ProjectsPaneRow =
+  | { kind: 'attach' }
+  | { kind: 'project'; project: ProjectItem };
+
+/** Query words that surface the attach action. */
+const ATTACH_FOLDER_KEYWORDS = ['attach', 'folder', 'workspace', 'add'];
 
 interface RecentWorkspaceItem {
   path: string;
@@ -2338,6 +2602,22 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
     );
   }, [visibleQuery, projects]);
 
+  /**
+   * Rows the pane navigates. "Attach Folder to Workspace..." leads, because it
+   * acts on the project you already have open rather than switching away from
+   * it -- the same reason it sits under File rather than under Open Recent.
+   */
+  const rows = useMemo<ProjectsPaneRow[]>(() => {
+    const projectRows = displayProjects.map<ProjectsPaneRow>((project) => ({
+      kind: 'project',
+      project,
+    }));
+    if (!currentWorkspacePath) return projectRows;
+    const q = visibleQuery.trim().toLowerCase();
+    const matchesAttach = !q || ATTACH_FOLDER_KEYWORDS.some((word) => word.includes(q));
+    return matchesAttach ? [{ kind: 'attach' }, ...projectRows] : projectRows;
+  }, [displayProjects, currentWorkspacePath, visibleQuery]);
+
   useEffect(() => {
     if (!isOpen) return;
     const onMove = () => setMouseHasMoved(true);
@@ -2353,11 +2633,19 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
   }, [selectedIndex]);
 
   const handleSelect = useCallback(
-    async (p: ProjectItem) => {
+    async (row: ProjectsPaneRow) => {
       onClose();
-      await window.electronAPI.workspaceManager.openWorkspace(p.path);
+      if (row.kind === 'attach') {
+        if (!currentWorkspacePath) return;
+        const outcome = await attachWorkspaceFolderWithPicker(currentWorkspacePath);
+        if (!outcome.success && outcome.error) {
+          console.error('[ProjectsPane] Attach folder failed:', outcome.error);
+        }
+        return;
+      }
+      await window.electronAPI.workspaceManager.openWorkspace(row.project.path);
     },
-    [onClose],
+    [onClose, currentWorkspacePath],
   );
 
   useEffect(() => {
@@ -2367,7 +2655,7 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
       switch (e.key) {
         case 'ArrowDown':
           e.preventDefault();
-          setSelectedIndex((i) => (i < displayProjects.length - 1 ? i + 1 : i));
+          setSelectedIndex((i) => (i < rows.length - 1 ? i + 1 : i));
           break;
         case 'ArrowUp':
           e.preventDefault();
@@ -2375,7 +2663,7 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
           break;
         case 'Enter':
           e.preventDefault();
-          if (displayProjects[selectedIndex]) handleSelect(displayProjects[selectedIndex]);
+          if (rows[selectedIndex]) handleSelect(rows[selectedIndex]);
           break;
         case 'Escape':
           e.preventDefault();
@@ -2385,11 +2673,11 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, isActive, displayProjects, selectedIndex, handleSelect, onClose]);
+  }, [isOpen, isActive, rows, selectedIndex, handleSelect, onClose]);
 
   return (
     <div className="projects-pane flex-1 overflow-y-auto">
-      {displayProjects.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="p-10 text-center text-nim-faint">
           {query ? 'No projects found' : 'No recent projects'}
         </div>
@@ -2398,23 +2686,69 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
           ref={listRef}
           className={`list-none m-0 p-0 ${mouseHasMoved ? '' : 'pointer-events-none'}`}
         >
-          {displayProjects.map((project, index) => (
+          {rows.map((row, index) => row.kind === 'attach' ? (
             <li
-              key={project.path}
-              className={`unified-quick-open-item flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
+              key="attach-folder"
+              className={`unified-quick-open-item projects-pane-attach flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
                 index === selectedIndex
                   ? 'selected bg-nim-selected border-l-nim-primary'
                   : 'border-transparent hover:bg-nim-hover'
               }`}
-              onClick={() => handleSelect(project)}
+              onClick={() => handleSelect(row)}
               onMouseEnter={() => {
                 if (mouseHasMoved) setSelectedIndex(index);
               }}
             >
               <div className="shrink-0 flex items-center justify-center w-5 h-5 text-nim-muted">
-                <MaterialSymbol icon="folder" size={16} fill={project.isOpen} />
+                <MaterialSymbol icon="create_new_folder" size={16} />
               </div>
               <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-nim overflow-hidden text-ellipsis whitespace-nowrap">
+                  Attach Folder to Workspace...
+                </div>
+                <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap">
+                  Browse it here and let agents read it, without leaving this project
+                </div>
+              </div>
+            </li>
+          ) : (
+            <ProjectRow
+              key={row.project.path}
+              project={row.project}
+              isSelected={index === selectedIndex}
+              onSelect={() => handleSelect(row)}
+              onHover={() => {
+                if (mouseHasMoved) setSelectedIndex(index);
+              }}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+});
+
+/** One recent-project row in the Projects pane. */
+const ProjectRow: React.FC<{
+  project: ProjectItem;
+  isSelected: boolean;
+  onSelect: () => void;
+  onHover: () => void;
+}> = memo(({ project, isSelected, onSelect, onHover }) => {
+  return (
+    <li
+      className={`unified-quick-open-item flex items-center gap-3 py-2.5 px-4 cursor-pointer border-l-[3px] transition-all duration-100 ${
+        isSelected
+          ? 'selected bg-nim-selected border-l-nim-primary'
+          : 'border-transparent hover:bg-nim-hover'
+      }`}
+      onClick={onSelect}
+      onMouseEnter={onHover}
+    >
+      <div className="shrink-0 flex items-center justify-center w-5 h-5 text-nim-muted">
+        <MaterialSymbol icon="folder" size={16} fill={project.isOpen} />
+      </div>
+      <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-nim flex items-center gap-2 overflow-hidden text-ellipsis whitespace-nowrap">
                   {project.name}
                   {project.isCurrent && (
@@ -2428,15 +2762,11 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap direction-rtl text-left">
-                  {project.path}
-                </div>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+        <div className="text-xs text-nim-faint mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap direction-rtl text-left">
+          {project.path}
+        </div>
+      </div>
+    </li>
   );
 });
 
@@ -2444,41 +2774,19 @@ const ProjectsPane: React.FC<ProjectsPaneProps> = memo(({
 // Memory search — global semantic search plus merged rich Tracker results
 // =============================================================================
 
-interface MemoryScopeBubblesProps {
+const MemoryScopeBubbles: React.FC<{
   scope: SemanticSearchScope;
   onChange: (scope: SemanticSearchScope) => void;
-}
-
-const MemoryScopeBubbles: React.FC<MemoryScopeBubblesProps> = memo(({
-  scope,
-  onChange,
-}) => (
-  <div
-    className="memory-search-scopes shrink-0 flex items-center gap-1.5 px-3 py-2 border-b border-nim bg-nim-secondary"
-    role="group"
-    aria-label="Search in"
-  >
-    <span className="mr-1 text-xs text-nim-faint">Search in</span>
-    {SEMANTIC_SEARCH_SCOPES.map((candidate) => {
-      const active = candidate.id === scope;
-      return (
-        <button
-          key={candidate.id}
-          type="button"
-          aria-pressed={active}
-          className={`memory-search-scope px-2.5 py-1 text-xs font-medium rounded-full border cursor-pointer transition-colors duration-100 ${
-            active
-              ? 'bg-nim-primary border-[var(--nim-primary)] text-white'
-              : 'bg-nim border-nim text-nim-muted hover:bg-nim-hover hover:text-nim'
-          }`}
-          onClick={() => onChange(active ? 'all' : candidate.id)}
-          tabIndex={-1}
-        >
-          {candidate.label}
-        </button>
-      );
-    })}
-  </div>
+}> = memo(({ scope, onChange }) => (
+  <ScopeBubbles
+    rootClassName="memory-search-scopes"
+    itemClassName="memory-search-scope"
+    label="Search in"
+    scopes={SEMANTIC_SEARCH_SCOPES}
+    scope={scope}
+    defaultScope="all"
+    onChange={onChange}
+  />
 ));
 
 interface SearchPaneProps {
@@ -2506,10 +2814,11 @@ function refTypeLabel(result: SemanticSearchResult): string {
   }
 }
 
-function refTypeIcon(refType: string): string {
-  switch (refType) {
+function refTypeIcon(result: QuickOpenSearchResult): string {
+  switch (result.refType) {
     case 'tracker':
-      return 'label';
+      // Semantic hits carry no type, so they keep the generic tracker glyph.
+      return result.trackerType ? getTypeIcon(result.trackerType) : 'label';
     case 'session':
       return 'forum';
     case 'doc-file':
@@ -2530,7 +2839,7 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
   onSessionSelect,
   onClose,
 }) => {
-  const [results, setResults] = useState<SemanticSearchResult[]>([]);
+  const [semanticResults, setSemanticResults] = useState<SemanticSearchResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [mouseHasMoved, setMouseHasMoved] = useState(false);
@@ -2538,6 +2847,15 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
   // Guards against out-of-order responses clobbering a newer query's results.
   const latestReq = useRef(0);
   const visibleQuery = isActive ? query : '';
+  // Tracker list backing exact issue-key lookup. Loaded lazily the first time
+  // the user types something key-shaped — the list is large and most Memory
+  // queries never need it.
+  const [keyLookupItems, setKeyLookupItems] = useState<TrackerItem[] | null>(null);
+  const keyLookupRequested = useRef(false);
+  // Only the merged "all" scope reaches trackers here; the dedicated Trackers
+  // scope renders TrackersPane, which already matches on issue key.
+  const issueKeyQuery =
+    scope === 'all' && parseIssueKeyQuery(visibleQuery) ? visibleQuery : '';
   const scopeSpec =
     SEMANTIC_SEARCH_SCOPES.find((candidate) => candidate.id === scope) ??
     SEMANTIC_SEARCH_SCOPES[0];
@@ -2547,7 +2865,7 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
   }, [visibleQuery, scope]);
 
   useEffect(() => {
-    setResults([]);
+    setSemanticResults([]);
   }, [scope]);
 
   // Debounced query → engine. Embedding the query is per-submit, not per
@@ -2556,7 +2874,7 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
     if (!isOpen || !isActive) return;
     const q = visibleQuery.trim();
     if (!q) {
-      setResults([]);
+      setSemanticResults([]);
       setIsLoading(false);
       return;
     }
@@ -2566,10 +2884,12 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
       window.electronAPI.semanticSearch
         .query(workspacePath, q, 25, scopeSpec.sourceClasses)
         .then((res) => {
-          if (reqId === latestReq.current) setResults(Array.isArray(res) ? res : []);
+          if (reqId === latestReq.current) {
+            setSemanticResults(Array.isArray(res) ? res : []);
+          }
         })
         .catch(() => {
-          if (reqId === latestReq.current) setResults([]);
+          if (reqId === latestReq.current) setSemanticResults([]);
         })
         .finally(() => {
           if (reqId === latestReq.current) setIsLoading(false);
@@ -2577,6 +2897,30 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
     }, 200);
     return () => clearTimeout(timer);
   }, [isOpen, isActive, visibleQuery, workspacePath, scopeSpec]);
+
+  // Fetch the tracker list once, on the first key-shaped query.
+  useEffect(() => {
+    if (!issueKeyQuery || keyLookupRequested.current) return;
+    keyLookupRequested.current = true;
+    window.electronAPI
+      .invoke('document-service:tracker-items-list')
+      .then((result: TrackerItem[] | null) => {
+        setKeyLookupItems(Array.isArray(result) ? result : []);
+      })
+      .catch(() => setKeyLookupItems([]));
+  }, [issueKeyQuery]);
+
+  // Exact issue-key hits are pinned above the semantic ranking.
+  const results = useMemo(
+    () =>
+      mergeIssueKeyMatches(
+        issueKeyQuery && keyLookupItems
+          ? findTrackersByIssueKey(issueKeyQuery, keyLookupItems)
+          : [],
+        semanticResults,
+      ),
+    [issueKeyQuery, keyLookupItems, semanticResults],
+  );
 
   useEffect(() => {
     if (!isOpen) return;
@@ -2677,7 +3021,7 @@ const SearchPane: React.FC<SearchPaneProps> = memo(({
               }}
             >
               <div className="shrink-0 mt-0.5 text-nim-muted">
-                <MaterialSymbol icon={refTypeIcon(result.refType)} size={16} />
+                <MaterialSymbol icon={refTypeIcon(result)} size={16} />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-nim flex items-center gap-2 overflow-hidden text-ellipsis whitespace-nowrap">
@@ -2815,13 +3159,7 @@ const TrackersPane: React.FC<TrackersPaneProps> = memo(({
 
     const q = visibleQuery.toLowerCase();
     const exactItems = pool
-      .filter((it) => {
-        if (it.title.toLowerCase().includes(q)) return true;
-        if (it.issueKey?.toLowerCase().includes(q)) return true;
-        if (it.description?.toLowerCase().includes(q)) return true;
-        if (it.id.toLowerCase().includes(q)) return true;
-        return false;
-      })
+      .filter((it) => matchesTrackerText(it, q))
       .sort(byRecency);
     if (!includeSemantic) return exactItems.slice(0, 200);
 
@@ -2919,7 +3257,7 @@ const TrackersPane: React.FC<TrackersPaneProps> = memo(({
               }}
             >
               <div className="shrink-0 mt-0.5 text-nim-muted">
-                <MaterialSymbol icon={trackerTypeIcon(it.type)} size={16} />
+                <MaterialSymbol icon={getTypeIcon(it.type)} size={16} />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-nim flex items-center gap-2 overflow-hidden text-ellipsis whitespace-nowrap">
@@ -2928,7 +3266,7 @@ const TrackersPane: React.FC<TrackersPaneProps> = memo(({
                       {it.issueKey}
                     </span>
                   )}
-                  <span className="truncate">{it.title}</span>
+                  <span className="truncate">{it.title || it.id}</span>
                 </div>
                 <div className="text-xs text-nim-faint mt-0.5 flex items-center gap-2">
                   <span
@@ -2961,22 +3299,3 @@ const TrackersPane: React.FC<TrackersPaneProps> = memo(({
     </div>
   );
 });
-
-function trackerTypeIcon(type: string): string {
-  switch (type) {
-    case 'bug':
-      return 'bug_report';
-    case 'task':
-      return 'task_alt';
-    case 'plan':
-      return 'flag';
-    case 'idea':
-      return 'lightbulb';
-    case 'decision':
-      return 'gavel';
-    case 'feature':
-      return 'auto_awesome';
-    default:
-      return 'label';
-  }
-}

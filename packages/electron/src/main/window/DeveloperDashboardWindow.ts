@@ -7,6 +7,7 @@ import { getBackgroundColor } from '../theme/ThemeManager';
 import { windows, windowStates } from './windowState';
 import * as workspaceEventBus from '../file/WorkspaceEventBus';
 import { database } from '../database/PGLiteDatabaseWorker';
+import { windowControlsOverlayOptions } from './windowChrome';
 
 let developerDashboardWindow: BrowserWindow | null = null;
 
@@ -38,6 +39,35 @@ safeHandle('dev:get-atomfamily-stats', async () => {
         );
     } catch {
         return [];
+    }
+});
+
+/**
+ * Drive the renderer's React render profiler from the dashboard window.
+ *
+ * The dashboard is its own window, so this always profiles a *different*
+ * renderer — the main app window. That is the intent (you want to watch the
+ * window under load, not the dashboard), but it also means Chromium's
+ * background throttling applies: the snapshot carries `visibilityState` /
+ * `hasFocus` so a suspiciously quiet reading can be recognized as a hidden
+ * window rather than a healthy one.
+ */
+safeHandle('dev:render-profiler', async (_event, action: 'start' | 'stop' | 'snapshot' | 'reset') => {
+    const mainWin = findMainAppWindow();
+    if (!mainWin) return { available: false, reason: 'no main app window' };
+
+    if (!['start', 'stop', 'snapshot', 'reset'].includes(action)) {
+        throw new Error(`dev:render-profiler: unknown action "${action}"`);
+    }
+
+    try {
+        return await mainWin.webContents.executeJavaScript(
+            `window.__renderProfiler
+                ? Promise.resolve(window.__renderProfiler.${action}()).then(r => r ?? { ok: true })
+                : { available: false, reason: 'profiler not installed (production build?)' }`
+        );
+    } catch (error) {
+        return { available: false, reason: error instanceof Error ? error.message : String(error) };
     }
 });
 
@@ -121,6 +151,7 @@ export function createDeveloperDashboardWindow() {
         show: false,
         titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
         trafficLightPosition: { x: 10, y: 10 },
+        ...windowControlsOverlayOptions(),
         vibrancy: 'sidebar',
         backgroundColor: getBackgroundColor()
     });

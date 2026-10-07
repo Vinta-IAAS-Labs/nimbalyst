@@ -1,7 +1,9 @@
 # Relative to packages/marketplace/
+../extensions/animation
 ../extensions/automations
 ../extensions/browser
 ../extensions/calc-sheets
+../extensions/canvas
 ../extensions/csv-spreadsheet
 ../extensions/datamodellm
 ../extensions/developer
@@ -10,6 +12,7 @@
 ../extensions/github-issues-importer
 ../extensions/image-generation
 ../extensions/ios-dev
+../extensions/media-viewer
 ../extensions/mockuplm
 ../extensions/nimbalyst-memory
 ../extensions/pdf-viewer

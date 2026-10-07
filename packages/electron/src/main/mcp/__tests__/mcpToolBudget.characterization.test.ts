@@ -14,10 +14,13 @@ import {
 import { getInteractiveToolSchemas } from '../tools/interactiveToolHandlers';
 import { displayToolSchemas } from '../tools/displayToolHandler';
 import { getEditorToolSchemas } from '../tools/editorToolHandlers';
+import { CANVAS_WORKING_SET_TOOL_SCHEMAS } from '../tools/canvasWorkingSetToolHandlers';
 import { trackerToolSchemas } from '../tools/trackerToolHandlers';
 import { feedbackToolSchemas } from '../tools/feedbackToolHandlers';
 import { voiceToolSchemas } from '../tools/voiceToolHandlers';
 import { getCollabIndexToolSchemas } from '../tools/collabIndexToolHandlers';
+import { getCollabReadToolSchemas } from '../tools/collabReadToolHandlers';
+import { getRequestFeedbackToolSchemas } from '../tools/requestFeedbackToolHandler';
 
 /**
  * Phase 0 characterization harness for the MCP server consolidation.
@@ -36,7 +39,10 @@ describe('MCP tool budget characterization (current first-party surface)', () =>
       ...getInteractiveToolSchemas('characterization-session'),
       ...displayToolSchemas,
       ...getEditorToolSchemas('characterization-session'),
+      ...CANVAS_WORKING_SET_TOOL_SCHEMAS.map((tool) => ({ ...tool })),
       ...getCollabIndexToolSchemas(),
+      ...getCollabReadToolSchemas(),
+      ...getRequestFeedbackToolSchemas(),
       ...trackerToolSchemas,
       ...feedbackToolSchemas,
       ...voiceToolSchemas,
@@ -88,6 +94,11 @@ describe('MCP tool budget characterization (current first-party surface)', () =>
       .filter((name) => !FIRST_PARTY_TOOL_TO_SERVER.has(name) && !allowedUnmapped.has(name));
 
     expect(unmapped).toEqual([]);
+    // Custom ontology setup uses the existing schema/predicate definition tool.
+    const defineType = trackerToolSchemas.find((tool) => tool.name === 'tracker_define_type');
+    expect(defineType?.inputSchema.properties).toHaveProperty('predicates');
+    expect(trackerToolSchemas.filter((tool) => tool.name.includes('_pack'))).toEqual([]);
+    expect([...FIRST_PARTY_TOOL_TO_SERVER.keys()].filter((name) => name.includes('_pack'))).toEqual([]);
   });
 
   it('confirms core is the only eager server', () => {

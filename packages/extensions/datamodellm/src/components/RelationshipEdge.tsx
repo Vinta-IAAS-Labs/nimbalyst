@@ -6,11 +6,16 @@
  */
 
 import { memo } from 'react';
-import { type EdgeProps, type Edge, getSmoothStepPath } from '@xyflow/react';
+import { type EdgeProps, type Edge } from '@xyflow/react';
+import type { Route } from '../layout/geometry';
 import type { Relationship } from '../types';
+import type { RemotePresence } from '../collab/presence';
 
 export interface RelationshipEdgeData extends Record<string, unknown> {
   relationship: Relationship;
+  route: Route;
+  /** Remote collaborators who currently have this relationship selected. */
+  presences?: RemotePresence[];
 }
 
 const EDGE_OFFSET = 22;
@@ -20,29 +25,29 @@ const EDGE_HOVER_TARGET_WIDTH = 20;
 
 function RelationshipEdgeComponent({
   id,
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  sourcePosition,
-  targetPosition,
   data,
   selected,
 }: EdgeProps<Edge<RelationshipEdgeData>>) {
-  const [edgePath, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
-  });
+  const route = data?.route;
+  if (!route) return null;
+  const first = route.points[0], last = route.points[route.points.length - 1];
+  const sourceX = first.x, sourceY = first.y, targetX = last.x, targetY = last.y;
+  const sourcePosition = route.source.side, targetPosition = route.target.side;
+  const edgePath = route.points.map((p,i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ');
+  const {x: labelX, y: labelY} = route.labelPosition;
 
   const relationship = data?.relationship;
 
+  // A remote collaborator's selection colors the edge -- but the local
+  // selection wins, so your own focus is never repainted out from under you.
+  const remotePresence = data?.presences?.[0];
+  const emphasized = Boolean(selected || remotePresence);
+
   // Get stroke color based on selection state
   const getStrokeColor = () => {
-    return selected ? 'var(--nim-primary)' : 'var(--nim-text-muted)';
+    if (selected) return 'var(--nim-primary)';
+    if (remotePresence) return remotePresence.color;
+    return 'var(--nim-text-muted)';
   };
 
   // Get cardinality type for source and target
@@ -78,7 +83,7 @@ function RelationshipEdgeComponent({
     position: 'left' | 'right' | 'top' | 'bottom'
   ) => {
     const strokeColor = getStrokeColor();
-    const strokeWidth = selected ? EDGE_STROKE_WIDTH_SELECTED : EDGE_STROKE_WIDTH;
+    const strokeWidth = emphasized ? EDGE_STROKE_WIDTH_SELECTED : EDGE_STROKE_WIDTH;
 
     let rotation = 0;
     switch (position) {
@@ -132,7 +137,7 @@ function RelationshipEdgeComponent({
         style={{
           fill: 'none',
           stroke: getStrokeColor(),
-          strokeWidth: selected ? EDGE_STROKE_WIDTH_SELECTED : EDGE_STROKE_WIDTH,
+          strokeWidth: emphasized ? EDGE_STROKE_WIDTH_SELECTED : EDGE_STROKE_WIDTH,
           pointerEvents: 'none',
         }}
         d={edgePath}

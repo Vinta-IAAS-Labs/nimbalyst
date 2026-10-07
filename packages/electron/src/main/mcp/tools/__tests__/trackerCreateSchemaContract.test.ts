@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -20,6 +21,7 @@ const { mockQuery, mockDocumentServices } = vi.hoisted(() => ({
 vi.mock('../../../database/initialize', () => ({
   getDatabase: () => ({
     query: mockQuery,
+    runTransaction: async (statements: Array<{ sql: string; params: unknown[] }>) => { for (const statement of statements) await mockQuery(statement.sql, statement.params); },
     getEngine: vi.fn(() => 'pglite'),
   }),
 }));
@@ -29,13 +31,14 @@ vi.mock('../../../services/TrackerIdentityService', () => ({
 }));
 
 vi.mock('../../../services/TrackerPolicyService', () => ({
-  getEffectiveTrackerSyncPolicy: vi.fn(() => ({ mode: 'local', scope: 'project' })),
+  getEffectiveTrackerSharingPolicy: vi.fn(() => ({ sharing: 'personal', draftByDefault: false })),
   getInitialTrackerSyncStatus: vi.fn(() => 'local'),
   shouldSyncTrackerItem: vi.fn(() => false),
 }));
 
 vi.mock('../../../services/TrackerSyncManager', () => ({
   isTrackerSyncActive: vi.fn(() => false),
+  isTrackerSyncConfigured: vi.fn(() => false),
   syncTrackerItem: vi.fn(),
 }));
 
@@ -58,9 +61,9 @@ vi.mock('../../../services/MainBodyDocService', () => ({
   applyHeadlessBodyMarkdown: vi.fn(async () => undefined),
 }));
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/tmp'),
+    getPath: (await import('../../../../../test-stubs/privateUserData')).testApp.getPath,
     isPackaged: false,
     getName: vi.fn(() => 'Nimbalyst'),
   },
@@ -69,7 +72,7 @@ vi.mock('electron', () => ({
 
 import { handleTrackerCreate } from '../trackerToolHandlers';
 import { loadBuiltinTrackers } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/ModelLoader';
-import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
+import { globalRegistry } from '@nimbalyst/tracker-schema';
 
 function makeRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -84,18 +87,13 @@ function makeRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function setupCreateQueue(type: string) {
+function setupCreateQueue(type: string, hasDescription = false) {
   const createdRow = makeRow({ id: `${type}_test`, type, type_tags: [type], workspace: '/tmp/ws' });
-  const keyedRow = { ...createdRow, issue_key: 'NIM-1', issue_number: 1 };
-  mockQuery
-    .mockResolvedValueOnce({ rows: [] }) // INSERT
-    .mockResolvedValueOnce({ rows: [createdRow] }) // resolve created
-    .mockResolvedValueOnce({ rows: [{ max_num: 0 }] }) // MAX(issue_number)
-    .mockResolvedValueOnce({ rows: [] }) // UPDATE issue_key
-    .mockResolvedValueOnce({ rows: [keyedRow] }) // re-resolve
-    .mockResolvedValueOnce({ rows: [{ body_version: 1 }] }) // UPDATE content (description path)
-    .mockResolvedValueOnce({ rows: [] }) // INSERT tracker_body_cache
-    .mockResolvedValueOnce({ rows: [keyedRow] }); // notifyTrackerItemAdded
+  mockQuery.mockResolvedValueOnce({ rows: [] }); // INSERT item
+  if (hasDescription) mockQuery.mockResolvedValueOnce({ rows: [] }); // cache in same transaction
+  mockQuery.mockResolvedValueOnce({ rows: [createdRow] }); // resolve created
+  mockQuery.mockResolvedValueOnce({ rows: [createdRow] }); // notify
+
 }
 
 /** The data JSONB handed to the INSERT. */
@@ -116,7 +114,7 @@ beforeEach(() => {
 
 describe('tracker_create honors the builtin schema contract (real schemas)', () => {
   it('creates a decision with exactly the docs/TRACKER_WORKFLOWS.md arguments', async () => {
-    setupCreateQueue('decision');
+    setupCreateQueue('decision', true);
     // Verbatim shape from docs/TRACKER_WORKFLOWS.md "Decision Tracking".
     const result = await handleTrackerCreate(
       {

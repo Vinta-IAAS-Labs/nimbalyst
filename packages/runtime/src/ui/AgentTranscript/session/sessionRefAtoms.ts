@@ -18,7 +18,7 @@
  */
 
 import { atom } from 'jotai';
-import { atomFamily } from 'jotai/utils';
+import { atomFamily } from 'jotai-family';
 
 /** The minimal live data a session chip needs to render. */
 export interface SessionRefMeta {
@@ -40,6 +40,15 @@ export interface SessionRefMeta {
  * chips read from it.
  */
 export const sessionRefMapAtom = atom<Map<string, SessionRefMeta>>(new Map());
+
+/**
+ * Sorted, comma-joined known session ids. A string, so subscribers (every
+ * transcript markdown block) are notified only when the set of ids changes,
+ * not when a title or phase in the map does.
+ */
+export const sessionRefIdsKeyAtom = atom((get) =>
+  Array.from(get(sessionRefMapAtom).keys()).sort().join(','),
+);
 
 /**
  * A single session's live meta by id, or null when unknown (not yet loaded /

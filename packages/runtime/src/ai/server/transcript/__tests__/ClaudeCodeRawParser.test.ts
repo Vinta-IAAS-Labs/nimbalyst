@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { ClaudeCodeRawParser } from '../parsers/ClaudeCodeRawParser';
 import type { ParseContext, CanonicalEventDescriptor } from '../parsers/IRawMessageParser';
 import type { RawMessage } from '../TranscriptTransformer';
+import { stagedAttachmentRegistry } from '../../attachments/stagedAttachmentRegistry';
 
 const SESSION_ID = 'test-session';
 
@@ -151,6 +152,71 @@ describe('ClaudeCodeRawParser', () => {
       });
     });
 
+    // #1341: at 120s the harness moves a slow MCP call to the background and
+    // returns an acknowledgement in the tool_result slot. The call is still
+    // running and the user can still answer it, so completing the tool call
+    // here retires the question widget and strands the prompt.
+    it('does not complete an interactive prompt on the MCP auto-background acknowledgement', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const ack =
+        'MCP tool "nimbalyst - AskUserQuestion (MCP)" is still running after 120s. '
+        + 'It was moved to the background as task bq7x2k and keeps running; you\'ll receive a '
+        + 'notification with the result when it completes. You can keep working in the meantime. '
+        + 'To stop it, use TaskStop with task_id "bq7x2k". Note: it does not survive exiting this session.';
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'ask-1', content: ack }],
+          },
+        }),
+      });
+
+      const context = makeContext({
+        hasToolCall: (id) => id === 'ask-1',
+        findByProviderToolCallId: async () => ({
+          id: 'evt-1',
+          payload: { toolName: 'mcp__nimbalyst__AskUserQuestion' },
+        }) as any,
+      });
+      const descriptors = await parser.parseMessage(msg, context);
+
+      expect(descriptors.some(d => d.type === 'tool_call_completed')).toBe(false);
+    });
+
+    it('still completes a non-interactive tool on the MCP auto-background acknowledgement', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const ack =
+        'MCP tool "nimbalyst - tracker_list (MCP)" is still running after 120s. '
+        + 'It was moved to the background as task bq7x2k and keeps running.';
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tracker-1', content: ack }],
+          },
+        }),
+      });
+
+      const context = makeContext({
+        hasToolCall: (id) => id === 'tracker-1',
+        findByProviderToolCallId: async () => ({
+          id: 'evt-2',
+          payload: { toolName: 'mcp__nimbalyst-trackers__tracker_list' },
+        }) as any,
+      });
+      const descriptors = await parser.parseMessage(msg, context);
+
+      expect(descriptors[0]).toMatchObject({
+        type: 'tool_call_completed',
+        providerToolCallId: 'tracker-1',
+      });
+    });
+
     it('treats plain text as user_message', async () => {
       const parser = new ClaudeCodeRawParser();
       const msg = makeRawMessage({
@@ -267,6 +333,58 @@ describe('ClaudeCodeRawParser', () => {
         providerToolCallId: 'tool-1',
         arguments: { file_path: '/test.ts' },
       });
+    });
+
+    it('emits an attachment staging warning for a denied Read result', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const stagedPath = '/tmp/nimbalyst-attachment-report.txt';
+      stagedAttachmentRegistry.resetForTests();
+      stagedAttachmentRegistry.register(SESSION_ID, {
+        path: stagedPath,
+        filename: 'report.txt',
+        mode: 'temp',
+      });
+
+      await parser.parseMessage(makeRawMessage({
+        content: JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [{
+              type: 'tool_use',
+              id: 'attachment-read',
+              name: 'Read',
+              input: { file_path: stagedPath },
+            }],
+          },
+        }),
+      }), makeContext());
+
+      const descriptors = await parser.parseMessage(makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result',
+              tool_use_id: 'attachment-read',
+              is_error: true,
+              content: 'File is in a directory that is denied by your permission settings.',
+            }],
+          },
+        }),
+      }), makeContext());
+
+      expect(descriptors).toHaveLength(2);
+      expect(descriptors[1]).toMatchObject({
+        type: 'system_message',
+        systemType: 'permission_denied',
+        isAttachmentStagingDenied: true,
+        attachmentPath: stagedPath,
+        attachmentFilename: 'report.txt',
+        attachmentStagingMode: 'temp',
+        attachmentDetection: 'reactive',
+      });
+      stagedAttachmentRegistry.resetForTests();
     });
 
     it('parses MCP tool calls with server/tool extraction', async () => {
@@ -855,6 +973,34 @@ describe('ClaudeCodeRawParser', () => {
       const started = descriptors.find(d => d.type === 'subagent_started') as any;
       expect(started).toBeDefined();
       expect(started.agentType).toBe('Explore');
+    });
+  });
+
+  describe('system/informational (SDK 0.3.283+)', () => {
+    // Shape captured live from CLI 2.1.284 (a UserPromptSubmit hook systemMessage).
+    const informational = (level: string, content = 'UserPromptSubmit says: probe hook system message') => makeRawMessage({
+      content: JSON.stringify({ type: 'system', subtype: 'informational', content, level, uuid: 'u-1', session_id: 's-1' }),
+    });
+
+    it.each([
+      ['notice', 'status'],
+      ['suggestion', 'status'],
+      ['warning', 'error'],
+    ])('renders level %s as a %s system message', async (level, systemType) => {
+      const descriptors = await new ClaudeCodeRawParser().parseMessage(informational(level), makeContext());
+      expect(descriptors).toEqual([expect.objectContaining({
+        type: 'system_message',
+        systemType,
+        text: 'UserPromptSubmit says: probe hook system message',
+      })]);
+    });
+
+    it('keeps level info out of the transcript (SDK: verbose transcript mode only)', async () => {
+      expect(await new ClaudeCodeRawParser().parseMessage(informational('info'), makeContext())).toEqual([]);
+    });
+
+    it('ignores an informational message with blank content', async () => {
+      expect(await new ClaudeCodeRawParser().parseMessage(informational('warning', '  '), makeContext())).toEqual([]);
     });
   });
 

@@ -14,25 +14,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtom, useAtomValue } from 'jotai';
 
-import {
-  DndContext,
-  KeyboardSensor,
-  MouseSensor,
-  PointerSensor,
-  TouchSensor,
-  closestCenter,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from '@dnd-kit/core';
-import {
-  SortableContext,
-  arrayMove,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
-} from '@dnd-kit/sortable';
-import { CSS } from '@dnd-kit/utilities';
+import { ReorderList } from './shared/ReorderList';
 
 import {
   $convertFromMarkdownString,
@@ -71,6 +53,12 @@ import {
   type RequestUserInputDraft,
   type RequestUserInputFieldDraft,
 } from '../../../../store/atoms/requestUserInputDraft';
+import {
+  draftToAnswers,
+  fieldDraftValid,
+  seedDraft,
+  decidePriming,
+} from './requestUserInputFieldLogic';
 import type {
   RequestUserInputAnswer,
   RequestUserInputArgs,
@@ -130,6 +118,8 @@ function parseArgs(args: any): RequestUserInputArgs | null {
 
 interface ParsedResult {
   cancelled: boolean;
+  /** Why the prompt closed, e.g. `superseded` when the user sent a new message instead. */
+  reason?: string;
   answers: Record<string, RequestUserInputAnswer>;
 }
 
@@ -170,6 +160,7 @@ function parseFromUnknown(value: unknown): ParsedResult | null {
   if (record.cancelled === true || record.canceled === true) {
     return {
       cancelled: true,
+      reason: typeof record.reason === 'string' ? record.reason : undefined,
       answers: typeof record.answers === 'object' && record.answers !== null
         ? (record.answers as Record<string, RequestUserInputAnswer>)
         : {},
@@ -191,147 +182,6 @@ function parseFromUnknown(value: unknown): ParsedResult | null {
   }
 
   return null;
-}
-
-// ============================================================
-// Initial-draft seeding from field defaults
-// ============================================================
-
-function seedFieldDraft(field: RequestUserInputField): RequestUserInputFieldDraft {
-  switch (field.type) {
-    case 'multiSelect':
-      return {
-        type: 'multiSelect',
-        state: {
-          selectedIds: field.items.filter((i) => i.defaultChecked).map((i) => i.id),
-        },
-      };
-    case 'singleSelect':
-      return {
-        type: 'singleSelect',
-        state: { selectedId: null, otherSelected: false, otherText: '' },
-      };
-    case 'reorder':
-      return {
-        type: 'reorder',
-        state: { orderedIds: field.items.map((i) => i.id), removedIds: [] },
-      };
-    case 'editText':
-      return {
-        type: 'editText',
-        state: { text: field.initialText ?? '' },
-      };
-    case 'confirm':
-      return {
-        type: 'confirm',
-        state: { value: field.defaultValue ?? false },
-      };
-  }
-}
-
-function seedDraft(args: RequestUserInputArgs): RequestUserInputDraft {
-  const fields: Record<string, RequestUserInputFieldDraft> = {};
-  for (const f of args.fields) {
-    fields[f.id] = seedFieldDraft(f);
-  }
-  return { fields, primed: true };
-}
-
-// ============================================================
-// Validation - is the draft submittable?
-// ============================================================
-
-function fieldDraftValid(
-  field: RequestUserInputField,
-  draft: RequestUserInputFieldDraft | undefined,
-): boolean {
-  if (!draft) return false;
-  if (draft.type !== field.type) return false;
-
-  switch (field.type) {
-    case 'multiSelect': {
-      const min = field.minSelected ?? 0;
-      const max = field.maxSelected ?? field.items.length;
-      const count = (draft as any).state.selectedIds.length;
-      return count >= min && count <= max;
-    }
-    case 'singleSelect': {
-      const s = (draft as any).state;
-      if (s.otherSelected) {
-        return field.allowOther === true && typeof s.otherText === 'string' && s.otherText.trim().length > 0;
-      }
-      return typeof s.selectedId === 'string' && s.selectedId.length > 0;
-    }
-    case 'reorder': {
-      const min = field.minItems ?? 0;
-      return (draft as any).state.orderedIds.length >= Math.max(min, 0);
-    }
-    case 'editText': {
-      const s = (draft as any).state;
-      const trimmed = typeof s.text === 'string' ? s.text.trim() : '';
-      const min = field.minLength ?? 0;
-      const max = field.maxLength ?? Infinity;
-      return trimmed.length >= min && (s.text?.length ?? 0) <= max;
-    }
-    case 'confirm':
-      return true;
-  }
-}
-
-function draftToAnswers(
-  args: RequestUserInputArgs,
-  draft: RequestUserInputDraft,
-): Record<string, RequestUserInputAnswer> {
-  const out: Record<string, RequestUserInputAnswer> = {};
-  for (const field of args.fields) {
-    const fd = draft.fields[field.id];
-    if (!fd) continue;
-
-    switch (field.type) {
-      case 'multiSelect':
-        if (fd.type === 'multiSelect') {
-          out[field.id] = { type: 'multiSelect', selectedIds: [...fd.state.selectedIds] };
-        }
-        break;
-      case 'singleSelect':
-        if (fd.type === 'singleSelect') {
-          if (fd.state.otherSelected) {
-            out[field.id] = {
-              type: 'singleSelect',
-              selectedId: '__other__',
-              otherText: fd.state.otherText.trim(),
-            };
-          } else if (fd.state.selectedId) {
-            out[field.id] = { type: 'singleSelect', selectedId: fd.state.selectedId };
-          }
-        }
-        break;
-      case 'reorder':
-        if (fd.type === 'reorder') {
-          out[field.id] = {
-            type: 'reorder',
-            orderedIds: [...fd.state.orderedIds],
-            removedIds: [...fd.state.removedIds],
-          };
-        }
-        break;
-      case 'editText':
-        if (fd.type === 'editText') {
-          out[field.id] = {
-            type: 'editText',
-            text: fd.state.text,
-            edited: fd.state.text !== (field.initialText ?? ''),
-          };
-        }
-        break;
-      case 'confirm':
-        if (fd.type === 'confirm') {
-          out[field.id] = { type: 'confirm', value: fd.state.value };
-        }
-        break;
-    }
-  }
-  return out;
 }
 
 // ============================================================
@@ -558,93 +408,6 @@ function SingleSelectRenderer({
   );
 }
 
-interface ReorderRowProps {
-  itemId: string;
-  index: number;
-  title: string;
-  subtitle?: string;
-  removable: boolean;
-  canRemove: boolean;
-  onRemove: () => void;
-  disabled: boolean;
-}
-
-function ReorderRow({ itemId, index, title, subtitle, removable, canRemove, onRemove, disabled }: ReorderRowProps) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: itemId });
-
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  };
-
-  // iOS WKWebView: the long-press text-selection callout will hijack a drag
-  // gesture if we let any text on the row be selectable. Keep the row's
-  // touchAction permissive (so vertical scroll still works on the transcript)
-  // but disable selection and the callout outright.
-  const rowStyle: React.CSSProperties = {
-    ...style,
-    WebkitUserSelect: 'none',
-    userSelect: 'none',
-    WebkitTouchCallout: 'none',
-  };
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={rowStyle}
-      data-testid="request-user-input-reorder-row"
-      data-item-id={itemId}
-      data-dragging={isDragging || undefined}
-      className={`flex items-center gap-2.5 py-2 px-2.5 rounded border bg-nim-secondary ${
-        isDragging ? 'border-nim-primary shadow-lg' : 'border-nim'
-      }`}
-    >
-      <button
-        type="button"
-        {...attributes}
-        {...listeners}
-        disabled={disabled}
-        aria-label="Drag to reorder"
-        // touch-action: none on the handle -- once the TouchSensor fires
-        // (after the activation delay) the browser must NOT also try to
-        // pan/scroll. Without this, iOS routes the gesture to scroll and
-        // @dnd-kit cancels the drag mid-flight, snapping the row back to its
-        // original position on release.
-        style={{ touchAction: 'none' }}
-        className="w-5 h-5 shrink-0 text-nim-faint cursor-grab disabled:cursor-not-allowed flex items-center justify-center"
-      >
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-          <circle cx="5" cy="3" r="1" fill="currentColor" />
-          <circle cx="9" cy="3" r="1" fill="currentColor" />
-          <circle cx="5" cy="7" r="1" fill="currentColor" />
-          <circle cx="9" cy="7" r="1" fill="currentColor" />
-          <circle cx="5" cy="11" r="1" fill="currentColor" />
-          <circle cx="9" cy="11" r="1" fill="currentColor" />
-        </svg>
-      </button>
-      <div className="w-6 text-center text-xs font-semibold text-nim-muted font-mono shrink-0">{index + 1}</div>
-      <div className="flex-1 min-w-0">
-        <div className="text-[0.8125rem] font-medium text-nim leading-snug">{title}</div>
-        {subtitle && <div className="text-xs text-nim-muted leading-snug">{subtitle}</div>}
-      </div>
-      {removable && (
-        <button
-          type="button"
-          data-testid="request-user-input-reorder-remove"
-          onClick={onRemove}
-          disabled={disabled || !canRemove}
-          aria-label="Remove item"
-          className="w-6 h-6 shrink-0 rounded text-nim-faint hover:text-nim-error hover:bg-[color-mix(in_srgb,var(--nim-error)_12%,transparent)] disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center"
-        >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M3 4h8M5 4V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1M4 4l.5 7a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1L10 4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
-      )}
-    </div>
-  );
-}
-
 function ReorderRenderer({
   field,
   draft,
@@ -653,86 +416,19 @@ function ReorderRenderer({
 }: FieldRendererProps<RequestUserInputReorderField>) {
   if (draft.type !== 'reorder') return null;
 
-  // Three sensors for cross-platform support:
-  //  - MouseSensor (distance) for desktop click-drag
-  //  - TouchSensor (delay) for iOS/Android long-press drag. The delay is what
-  //    lets us coexist with the iOS text-selection callout: short taps still
-  //    select text, but ~200ms holds initiate the drag and the activation
-  //    swallows the touch so the OS doesn't pop the callout.
-  //  - KeyboardSensor for accessibility
-  // PointerSensor is intentionally NOT used here -- on iOS WKWebView its
-  // default activation conflicts with the selection callout, which cancels
-  // the drag and snaps items back to their original order.
-  const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 6 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
-
-  const itemsById = useMemo(() => {
-    const map = new Map<string, RequestUserInputReorderField['items'][number]>();
-    for (const i of field.items) map.set(i.id, i);
-    return map;
-  }, [field.items]);
-
-  const min = Math.max(field.minItems ?? 0, 0);
-
-  const handleDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
-    const oldIndex = draft.state.orderedIds.indexOf(String(active.id));
-    const newIndex = draft.state.orderedIds.indexOf(String(over.id));
-    if (oldIndex === -1 || newIndex === -1) return;
-    setDraft({
-      type: 'reorder',
-      state: {
-        orderedIds: arrayMove(draft.state.orderedIds, oldIndex, newIndex),
-        removedIds: draft.state.removedIds,
-      },
-    });
-  };
-
-  const remove = (id: string) => {
-    if (disabled) return;
-    if (draft.state.orderedIds.length <= min) return;
-    setDraft({
-      type: 'reorder',
-      state: {
-        orderedIds: draft.state.orderedIds.filter((x) => x !== id),
-        removedIds: [...draft.state.removedIds, id],
-      },
-    });
-  };
-
   return (
-    <div data-testid={`request-user-input-reorder-${field.id}`} className="flex flex-col gap-1.5">
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-        <SortableContext items={draft.state.orderedIds} strategy={verticalListSortingStrategy}>
-          {draft.state.orderedIds.map((id, index) => {
-            const item = itemsById.get(id);
-            if (!item) return null;
-            return (
-              <ReorderRow
-                key={id}
-                itemId={id}
-                index={index}
-                title={item.title}
-                subtitle={item.subtitle}
-                removable={item.removable === true}
-                canRemove={draft.state.orderedIds.length > min}
-                onRemove={() => remove(id)}
-                disabled={disabled}
-              />
-            );
-          })}
-        </SortableContext>
-      </DndContext>
-      {draft.state.removedIds.length > 0 && (
-        <div className="text-[0.6875rem] text-nim-faint italic px-1">
-          Removed: {draft.state.removedIds.length} item{draft.state.removedIds.length === 1 ? '' : 's'}
-        </div>
-      )}
-    </div>
+    <ReorderList
+      items={field.items}
+      state={draft.state}
+      minItems={field.minItems}
+      disabled={disabled}
+      onChange={(state) => setDraft({ type: 'reorder', state })}
+      testIds={{
+        root: `request-user-input-reorder-${field.id}`,
+        row: 'request-user-input-reorder-row',
+        remove: 'request-user-input-reorder-remove',
+      }}
+    />
   );
 }
 
@@ -861,9 +557,11 @@ function FormatToolbar({ disabled }: { disabled: boolean }) {
 }
 
 function InlineLexicalEditor({ initialText, format, placeholder, onChange, disabled }: InlineLexicalEditorProps) {
-  // Capture the initial text so we don't reseed the editor when the parent
+  // Capture the seed text so we don't reseed the editor when the parent
   // re-renders. The editor owns its content state thereafter; the draft atom
-  // mirrors it via OnChangePlugin.
+  // mirrors it via OnChangePlugin. Callers must pass the draft's current text,
+  // not the agent's original -- this ref is re-read on every mount, and the
+  // transcript's virtual scroller remounts the widget freely (#1418).
   const initialTextRef = useRef(initialText);
 
   const initialConfig = useMemo(
@@ -965,7 +663,10 @@ function EditTextRenderer({
   return (
     <div data-testid={`request-user-input-edittext-${field.id}`}>
       <InlineLexicalEditor
-        initialText={initial}
+        // Seed from the draft, which survives unmount, not from field.initialText.
+        // Seeding from the agent's original threw away everything the user had
+        // typed the moment the transcript scrolled the widget out of view (#1418).
+        initialText={draft.state.text}
         format={format}
         placeholder={field.placeholder}
         onChange={onChange}
@@ -991,37 +692,53 @@ function ConfirmRenderer({
   if (draft.type !== 'confirm') return null;
   const value = draft.state.value;
 
-  const toggle = () => {
+  const pick = (next: boolean) => {
     if (disabled) return;
-    setDraft({ type: 'confirm', state: { value: !value } });
+    setDraft({ type: 'confirm', state: { value: next } });
   };
 
+  // Both answers are always on screen as separate targets. The old single
+  // toggle labelled itself with its own current value ("No" when false), which
+  // reads as "the No option" rather than "currently set to No" -- users had no
+  // visible way to say yes, and untouched fields submitted a silent false.
   return (
-    <button
-      type="button"
+    <div
+      role="radiogroup"
+      aria-label={field.label}
       data-testid={`request-user-input-confirm-${field.id}`}
-      data-checked={value}
-      onClick={toggle}
-      disabled={disabled}
-      className={`flex items-start gap-2 py-2 px-2.5 rounded border transition-colors duration-150 cursor-pointer text-left bg-transparent disabled:opacity-50 disabled:cursor-not-allowed w-full ${
-        value
-          ? 'border-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_8%,var(--nim-bg-secondary))]'
-          : 'border-nim bg-nim-secondary hover:bg-nim-hover'
-      }`}
+      data-checked={value === null ? 'unanswered' : value}
+      className="flex gap-2"
     >
-      <span
-        className={`w-4 h-4 mt-0.5 shrink-0 border rounded-sm flex items-center justify-center transition-colors ${
-          value ? 'bg-nim-primary border-nim-primary text-nim-on-primary' : 'bg-nim border-nim text-nim-primary'
-        }`}
-      >
-        {value && (
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M8.5 2.5L3.75 7.25L1.5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        )}
-      </span>
-      <span className="text-[0.8125rem] font-medium text-nim leading-snug">{value ? 'Yes' : 'No'}</span>
-    </button>
+      {([true, false] as const).map((option) => {
+        const isSelected = value === option;
+        return (
+          <button
+            key={String(option)}
+            type="button"
+            role="radio"
+            aria-checked={isSelected}
+            data-testid={`request-user-input-confirm-${field.id}-${option ? 'yes' : 'no'}`}
+            data-selected={isSelected}
+            onClick={() => pick(option)}
+            disabled={disabled}
+            className={`flex-1 flex items-center justify-center gap-2 py-2 px-2.5 rounded border transition-colors duration-150 cursor-pointer bg-transparent disabled:opacity-50 disabled:cursor-not-allowed ${
+              isSelected
+                ? 'border-nim-primary bg-[color-mix(in_srgb,var(--nim-primary)_8%,var(--nim-bg-secondary))]'
+                : 'border-nim bg-nim-secondary hover:bg-nim-hover'
+            }`}
+          >
+            <span
+              className={`w-4 h-4 shrink-0 border rounded-full flex items-center justify-center transition-colors ${
+                isSelected ? 'bg-nim-primary border-nim-primary' : 'bg-nim border-nim'
+              }`}
+            >
+              {isSelected && <span className="w-2 h-2 rounded-full bg-white" />}
+            </span>
+            <span className="text-[0.8125rem] font-medium text-nim leading-snug">{option ? 'Yes' : 'No'}</span>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1059,7 +776,7 @@ function FieldCard({
       case 'editText':
         return field.format === 'plain' ? 'Plain text' : 'Markdown supported';
       case 'confirm':
-        return undefined;
+        return 'Answer yes or no';
     }
   })();
 
@@ -1095,7 +812,7 @@ function FieldCard({
 // Main widget component
 // ============================================================
 
-export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ message, sessionId }) => {
+export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ message, sessionId, superseded }) => {
   const toolCall = message.toolCall;
   const promptId = toolCall?.providerToolCallId || '';
 
@@ -1111,24 +828,26 @@ export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ messag
 
   const rawResult = toolCall.result;
   const parsedResult = useMemo(() => parseResult(rawResult), [rawResult]);
-  const isCompleted = parsedResult !== null;
-  const isCancelled = parsedResult?.cancelled === true;
+  // The user sent a new message instead of answering. Older transcripts have
+  // no durable result for this, so the transcript also passes `superseded`.
+  const isSkipped = parsedResult?.reason === 'superseded' || (parsedResult === null && superseded === true);
+  const isCompleted = parsedResult !== null || isSkipped;
   const isPending = !isCompleted;
 
   const [draft, setDraft] = useAtom(requestUserInputDraftAtom(promptId));
 
-  // Prime the draft on first mount.
-  const primedRef = useRef(false);
+  // Prime the draft once per prompt KEY. Tracking which key was primed (not a
+  // bare "primed once" boolean) keeps this key-aware: if the atom key changes
+  // while the component stays mounted, the new draft is re-seeded rather than
+  // left as an empty, still-interactive form. See decidePriming + issue #1218.
+  const primedKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (primedRef.current) return;
     if (!args) return;
-    if (draft.primed) {
-      primedRef.current = true;
-      return;
-    }
-    setDraft(seedDraft(args));
-    primedRef.current = true;
-  }, [args, draft.primed, setDraft]);
+    const decision = decidePriming(promptId, primedKeyRef.current, draft.primed);
+    if (decision === 'skip') return;
+    if (decision === 'seed') setDraft(seedDraft(args));
+    primedKeyRef.current = promptId;
+  }, [args, promptId, draft.primed, setDraft]);
 
   const setFieldDraft = useCallback(
     (fieldId: string, next: RequestUserInputFieldDraft) => {
@@ -1185,19 +904,23 @@ export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ messag
 
   if (!args) return null;
 
-  const displayResult = localResult || (isCompleted && parsedResult ? parsedResult : null);
+  const displayResult = localResult
+    || (isSkipped ? { cancelled: true, answers: {} } : isCompleted && parsedResult ? parsedResult : null);
   const displayCancelled = displayResult?.cancelled === true;
+  const displaySkipped = !localResult && isSkipped;
 
   const voiceHint = computeVoiceHint(args);
 
   // ---- Completed state ----
   if (displayResult || hasResponded) {
-    const statusText = displayCancelled ? 'Input Cancelled' : 'Input Submitted';
+    const statusText = displaySkipped
+      ? 'Input Skipped'
+      : displayCancelled ? 'Input Cancelled' : 'Input Submitted';
 
     return (
       <div
         data-testid="request-user-input-widget"
-        data-state={displayCancelled ? 'cancelled' : 'completed'}
+        data-state={displaySkipped ? 'skipped' : displayCancelled ? 'cancelled' : 'completed'}
         className="request-user-input-widget rounded-lg bg-nim-secondary border border-nim overflow-hidden opacity-85"
       >
         <div className="flex items-center gap-2 py-3 px-4 border-b border-nim bg-nim-tertiary">
@@ -1214,7 +937,15 @@ export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ messag
               Submitted
             </span>
           )}
-          {displayCancelled && (
+          {displaySkipped && (
+            <span
+              data-testid="request-user-input-skipped"
+              className="flex items-center gap-1 text-xs font-medium text-nim-muted py-1 px-2 bg-nim-tertiary rounded-full"
+            >
+              Skipped
+            </span>
+          )}
+          {displayCancelled && !displaySkipped && (
             <span
               data-testid="request-user-input-cancelled"
               className="flex items-center gap-1 text-xs font-medium text-nim-muted py-1 px-2 bg-nim-tertiary rounded-full"
@@ -1228,7 +959,20 @@ export const RequestUserInputWidget: React.FC<CustomToolWidgetProps> = ({ messag
         </div>
         <div className="p-3 flex flex-col gap-2">
           {args.intro && <div className="text-sm text-nim-muted">{args.intro}</div>}
-          <CompletedSummary fields={args.fields} answers={displayResult?.answers ?? {}} cancelled={displayCancelled} />
+          {displaySkipped && (
+            <div
+              data-testid="request-user-input-skipped-note"
+              className="request-user-input-skipped-note text-xs text-nim-muted italic select-text"
+            >
+              You sent a new message instead of answering.
+            </div>
+          )}
+          <CompletedSummary
+            fields={args.fields}
+            answers={displayResult?.answers ?? {}}
+            cancelled={displayCancelled && !displaySkipped}
+            skipped={displaySkipped}
+          />
         </div>
       </div>
     );
@@ -1336,10 +1080,13 @@ function CompletedSummary({
   fields,
   answers,
   cancelled,
+  skipped,
 }: {
   fields: RequestUserInputField[];
   answers: Record<string, RequestUserInputAnswer>;
   cancelled: boolean;
+  /** Show what was asked, with no answer line. */
+  skipped: boolean;
 }) {
   if (cancelled) {
     return <div className="text-xs text-nim-muted italic">User cancelled the request.</div>;
@@ -1353,7 +1100,7 @@ function CompletedSummary({
             <div className="text-[0.6875rem] font-semibold uppercase tracking-wide text-nim-primary mb-1">
               {field.label}
             </div>
-            <SummaryAnswer field={field} answer={ans} />
+            {!skipped && <SummaryAnswer field={field} answer={ans} />}
           </div>
         );
       })}

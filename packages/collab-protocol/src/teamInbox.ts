@@ -37,6 +37,17 @@ export type InboxWatermark = {
   updatedAt: number;
 };
 
+export type TeamPresenceStatus = "online" | "away" | "offline";
+
+export type PresenceDesiredStatus = Exclude<TeamPresenceStatus, "offline">;
+
+export type TeamPresenceMember = {
+  teamMemberId: string;
+  status: TeamPresenceStatus;
+  lastHeartbeatAt?: number;
+  updatedAt: number;
+};
+
 // ============================================================================
 // Client -> Server Messages
 // ============================================================================
@@ -44,7 +55,11 @@ export type InboxWatermark = {
 export type TeamInboxClientMessage =
   | InboxSyncRequestMessage
   | MarkInboxReadMessage
-  | DismissInboxMessage;
+  | DismissInboxMessage
+  | ClaimAgentDeliveryMessage
+  | CompleteAgentDeliveryMessage
+  | PresenceHeartbeatMessage
+  | PresenceStatusSetMessage;
 
 /** Request the full hydrated inbox state; answered with `inboxSyncResponse`. */
 export interface InboxSyncRequestMessage {
@@ -67,6 +82,38 @@ export interface DismissInboxMessage {
   deliveryIds: string[];
 }
 
+/** Lease one attached-session target before creating its local queued prompt. */
+export interface ClaimAgentDeliveryMessage {
+  type: "claimAgentDelivery";
+  requestId: string;
+  deliveryId: string;
+  sessionId: string;
+  clientId: string;
+}
+
+/** Mark the target dispatched once the durable queued prompt is claimed. */
+export interface CompleteAgentDeliveryMessage {
+  type: "completeAgentDelivery";
+  requestId: string;
+  deliveryId: string;
+  sessionId: string;
+  clientId: string;
+}
+
+/** Periodic team-presence liveness signal over the org inbox socket. */
+export interface PresenceHeartbeatMessage {
+  type: "presenceHeartbeat";
+  status: PresenceDesiredStatus;
+  sentAt: number;
+}
+
+/** Explicit user status change; the client persists the desired state. */
+export interface PresenceStatusSetMessage {
+  type: "presenceStatusSet";
+  status: PresenceDesiredStatus;
+  sentAt: number;
+}
+
 // ============================================================================
 // Server -> Client Messages
 // ============================================================================
@@ -78,7 +125,35 @@ export type TeamInboxServerMessage =
   | ConversationSubscriptionBroadcastMessage
   | MarkInboxReadResponseMessage
   | DismissInboxResponseMessage
+  | AgentDeliveryClaimResponseMessage
+  | AgentDeliveryCompleteResponseMessage
+  | AgentDeliveryDispatchBroadcastMessage
+  | PresenceRosterMessage
+  | PresenceDeltaMessage
   | InboxErrorMessage;
+
+export interface AgentDeliveryClaimResponseMessage {
+  type: "agentDeliveryClaimResponse";
+  requestId: string;
+  deliveryId: string;
+  sessionId: string;
+  claimed: boolean;
+}
+
+export interface AgentDeliveryCompleteResponseMessage {
+  type: "agentDeliveryCompleteResponse";
+  requestId: string;
+  deliveryId: string;
+  sessionId: string;
+  dispatched: boolean;
+}
+
+export interface AgentDeliveryDispatchBroadcastMessage {
+  type: "agentDeliveryDispatchBroadcast";
+  deliveryId: string;
+  sessionId: string;
+  dispatchedAt: number;
+}
 
 /** Full hydrated state: undismissed deliveries (newest first, capped server-side). */
 export interface InboxSyncResponseMessage {
@@ -123,6 +198,20 @@ export interface DismissInboxResponseMessage {
   deliveryIds: string[];
   dismissedAt: number;
   unreadCount: number;
+}
+
+/** Full current team-presence roster for one organization. */
+export interface PresenceRosterMessage {
+  type: "presenceRoster";
+  orgId: string;
+  members: TeamPresenceMember[];
+}
+
+/** Incremental team-presence change for one organization member. */
+export interface PresenceDeltaMessage {
+  type: "presenceDelta";
+  orgId: string;
+  member: TeamPresenceMember;
 }
 
 /** Terminal error for the in-flight request (no request id on the wire). */

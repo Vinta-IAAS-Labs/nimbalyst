@@ -18,7 +18,7 @@
 
 import React from 'react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { Provider as JotaiProvider } from 'jotai';
 import { store } from '../../../../../store/store';
 import { setInteractiveWidgetHost } from '../../../../../store/atoms/interactiveWidgetHost';
@@ -65,6 +65,21 @@ describe('ToolPermissionWidget — host-null regression (#276)', () => {
     setInteractiveWidgetHost(sessionId, null);
   });
 
+  it('starts a constrained request on deny and offers only one-call approval', async () => {
+    const host = makeFakeHost();
+    setInteractiveWidgetHost(sessionId, host);
+    const message = makeMessage();
+    Object.assign(message.toolCall.arguments, { defaultToNo: true, suppressAlwaysAllowRule: true });
+    renderWithStore(<ToolPermissionWidget message={message} sessionId={sessionId} isExpanded={false} onToggle={() => {}} />);
+    expect(document.activeElement).toBe(screen.getByTestId('tool-permission-deny'));
+    expect(screen.queryByTestId('tool-permission-allow-session')).toBeNull();
+    expect(screen.queryByTestId('tool-permission-allow-always')).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('tool-permission-allow-once'));
+    });
+    expect(host.toolPermissionSubmit).toHaveBeenCalledWith('req-stuck-on-gh-api', { decision: 'allow', scope: 'once' });
+  });
+
   it('renders the action buttons even when host is null', () => {
     setInteractiveWidgetHost(sessionId, null);
 
@@ -80,10 +95,10 @@ describe('ToolPermissionWidget — host-null regression (#276)', () => {
     // Before the fix, the widget short-circuited to a Waiting-only shell.
     // The fix means we should see all four interactive buttons even
     // without a host installed.
-    expect(screen.getByTestId('tool-permission-deny')).toBeTruthy();
-    expect(screen.getByTestId('tool-permission-allow-once')).toBeTruthy();
-    expect(screen.getByTestId('tool-permission-allow-session')).toBeTruthy();
-    expect(screen.getByTestId('tool-permission-allow-always')).toBeTruthy();
+    screen.getByTestId('tool-permission-deny');
+    screen.getByTestId('tool-permission-allow-once');
+    screen.getByTestId('tool-permission-allow-session');
+    screen.getByTestId('tool-permission-allow-always');
   });
 
   it('shows a "Reconnecting to permission backend" note when host is null', () => {
@@ -98,7 +113,7 @@ describe('ToolPermissionWidget — host-null regression (#276)', () => {
       />,
     );
 
-    expect(screen.getByTestId('tool-permission-host-reconnecting')).toBeTruthy();
+    screen.getByTestId('tool-permission-host-reconnecting');
   });
 
   it('hides the reconnecting note once a host is installed', () => {
@@ -114,7 +129,7 @@ describe('ToolPermissionWidget — host-null regression (#276)', () => {
     );
 
     expect(screen.queryByTestId('tool-permission-host-reconnecting')).toBeNull();
-    expect(screen.getByTestId('tool-permission-deny')).toBeTruthy();
+    screen.getByTestId('tool-permission-deny');
   });
 
   it('does not regress the no-toolCall guard', () => {

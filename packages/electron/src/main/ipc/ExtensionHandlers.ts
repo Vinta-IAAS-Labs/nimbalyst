@@ -8,7 +8,7 @@
  * - Directory listing
  */
 
-import { app } from 'electron';
+import { app, BrowserWindow } from 'electron';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from '../utils/logger';
@@ -33,10 +33,12 @@ import {
 } from '../utils/store';
 import { registerFileExtension, clearRegisteredExtensions } from '../extensions/RegisteredFileTypes';
 import { getBuiltinExtensionsDirectory } from '../extensions/builtinExtensionsDirectory';
+import { ensureClaudePluginDefaultEnabledMigration } from '../extensions/claudePluginDefaultEnabledMigration';
 import {
   detectStaleBuiltinExtensionBundle,
   formatStaleBundleWarning,
 } from '../extensions/staleExtensionBundle';
+import { rebuildExtensionForDev } from '../extensions/extensionDevRebuild';
 import {
   startExtensionBackendModules,
   stopExtensionBackendModules,
@@ -239,6 +241,21 @@ export async function initializeExtensionFileTypes(): Promise<void> {
  * In Playwright tests, uses a temp directory to avoid touching production extensions.
  */
 export async function getUserExtensionsDirectory(): Promise<string> {
+  // Per-run extension dir for E2E fixtures. Never honoured in a packaged
+  // build, so a stray environment variable cannot redirect a user's
+  // extensions directory.
+  const playwrightExtensionDir = process.env.PLAYWRIGHT === '1' && !app.isPackaged
+    ? process.env.NIMBALYST_E2E_EXTENSIONS_DIR
+    : undefined;
+  if (playwrightExtensionDir) {
+    const resolved = path.resolve(playwrightExtensionDir);
+    const tempRoot = path.resolve(app.getPath('temp'));
+    if (resolved === tempRoot || !resolved.startsWith(`${tempRoot}${path.sep}`)) {
+      throw new Error('NIMBALYST_E2E_EXTENSIONS_DIR must be inside the system temp directory');
+    }
+    await fs.mkdir(resolved, { recursive: true });
+    return resolved;
+  }
   // Use test-specific path for Playwright tests to avoid conflicts
   const userDataPath = process.env.PLAYWRIGHT === '1'
     ? path.join(app.getPath('temp'), 'nimbalyst-test-extensions')
@@ -405,8 +422,11 @@ export async function getExtensionPluginCommands(): Promise<ExtensionPluginComma
 
     // Scan all extension directories
     const extensionDirs = await getAllExtensionDirectories();
+    const migrated = await ensureClaudePluginDefaultEnabledMigration(extensionDirs[0]);
 
     for (const extensionsDir of extensionDirs) {
+      // Legacy behavior for user extensions until their state is pinned.
+      const honorDefaultEnabled = migrated || extensionsDir !== extensionDirs[0];
       let subdirs;
       try {
         subdirs = await fs.readdir(extensionsDir, { withFileTypes: true });
@@ -447,7 +467,7 @@ export async function getExtensionPluginCommands(): Promise<ExtensionPluginComma
           }
 
           // Check if extension is enabled
-          if (!getExtensionEnabled(extensionId)) {
+          if (!getExtensionEnabled(extensionId, honorDefaultEnabled ? manifest.defaultEnabled : undefined)) {
             continue;
           }
 
@@ -510,7 +530,8 @@ async function scanDirectoryForClaudePlugins(
   extensionsDir: string,
   plugins: Array<{ type: 'local'; path: string }>,
   seenExtensionIds: Set<string>,
-  currentChannel: ReleaseChannel
+  currentChannel: ReleaseChannel,
+  honorDefaultEnabled: boolean
 ): Promise<void> {
   let subdirs;
   try {
@@ -557,7 +578,7 @@ async function scanDirectoryForClaudePlugins(
         continue;
       }
 
-      const isEnabled = getExtensionEnabled(extensionId);
+      const isEnabled = getExtensionEnabled(extensionId, honorDefaultEnabled ? manifest.defaultEnabled : undefined);
       if (!isEnabled) {
         logger.main.debug(`[ExtensionHandlers] Skipping disabled extension: ${extensionId}`);
         continue;
@@ -712,22 +733,40 @@ async function getClaudeCliPluginPaths(workspacePath?: string): Promise<Array<{ 
   return plugins;
 }
 
+/** Deduplicate plugin roots by resolved path, keeping the first occurrence. */
+function dedupeClaudePluginPaths(
+  plugins: Array<{ type: 'local'; path: string }>
+): Array<{ type: 'local'; path: string }> {
+  const seenPaths = new Set<string>();
+  const deduplicatedPlugins: Array<{ type: 'local'; path: string }> = [];
+  for (const plugin of plugins) {
+    const resolvedPath = path.resolve(plugin.path);
+    if (seenPaths.has(resolvedPath)) {
+      logger.main.debug(`[ExtensionHandlers] Skipping duplicate plugin: ${plugin.path}`);
+      continue;
+    }
+    seenPaths.add(resolvedPath);
+    deduplicatedPlugins.push(plugin);
+  }
+  return deduplicatedPlugins;
+}
+
 /**
- * Get Claude Agent SDK plugin paths from enabled extensions and CLI-installed plugins.
- * This is a main-process-native implementation that directly reads extension manifests
- * without requiring the renderer-process ExtensionLoader.
+ * Claude plugin roots contributed by ENABLED Nimbalyst extensions, read straight
+ * from extension manifests in the main process (no renderer ExtensionLoader).
  *
- * Scans:
- * 1. User extensions directory
- * 2. Built-in extensions directory
- * 3. Claude CLI plugins (~/.claude/plugins/)
+ * Scans the user extensions directory first, then the built-in one; a user
+ * extension wins over a built-in with the same id.
  *
- * User extensions take priority over built-in extensions with the same ID.
+ * This is the INJECTION set -- the only plugins Nimbalyst may hand to a Claude
+ * session as SDK `plugins` or CLI `--plugin-dir`. They ship inside extension
+ * bundles, so nothing else would load them. Plugins the user installed through
+ * Claude's own `/plugin` command are deliberately excluded; see
+ * `getDiscoverableClaudePluginPaths`.
  *
- * @param workspacePath - If provided, includes project-scoped CLI plugins for this workspace
  * @returns Paths in the format expected by the Claude Agent SDK: { type: 'local', path: string }
  */
-export async function getNativeClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
+export async function getExtensionClaudePluginPaths(): Promise<Array<{ type: 'local'; path: string }>> {
   try {
     const plugins: Array<{ type: 'local'; path: string }> = [];
     const seenExtensionIds = new Set<string>();
@@ -735,36 +774,49 @@ export async function getNativeClaudePluginPaths(workspacePath?: string): Promis
 
     // Scan all extension directories (user first, then built-in)
     const extensionDirs = await getAllExtensionDirectories();
+    const migrated = await ensureClaudePluginDefaultEnabledMigration(extensionDirs[0]);
     for (const extensionsDir of extensionDirs) {
-      await scanDirectoryForClaudePlugins(extensionsDir, plugins, seenExtensionIds, currentChannel);
+      // Legacy behavior for user extensions until their state is pinned.
+      const honorDefaultEnabled = migrated || extensionsDir !== extensionDirs[0];
+      await scanDirectoryForClaudePlugins(extensionsDir, plugins, seenExtensionIds, currentChannel, honorDefaultEnabled);
     }
 
-    // Also scan CLI-installed plugins
-    const cliPlugins = await getClaudeCliPluginPaths(workspacePath);
-    plugins.push(...cliPlugins);
-
-    // Deduplicate by resolved path (in case same plugin is both an extension and CLI-installed)
-    const seenPaths = new Set<string>();
-    const deduplicatedPlugins: Array<{ type: 'local'; path: string }> = [];
-    for (const plugin of plugins) {
-      const resolvedPath = path.resolve(plugin.path);
-      if (!seenPaths.has(resolvedPath)) {
-        seenPaths.add(resolvedPath);
-        deduplicatedPlugins.push(plugin);
-      } else {
-        logger.main.debug(`[ExtensionHandlers] Skipping duplicate plugin: ${plugin.path}`);
-      }
-    }
-
-    return deduplicatedPlugins;
+    return dedupeClaudePluginPaths(plugins);
   } catch (error) {
-    logger.main.error('[ExtensionHandlers] Failed to get Claude plugin paths:', error);
+    logger.main.error('[ExtensionHandlers] Failed to get extension Claude plugin paths:', error);
     return [];
   }
 }
 
-export async function getClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
-  return getNativeClaudePluginPaths(workspacePath);
+/**
+ * Every Claude plugin root Nimbalyst can SEE: enabled extension plugins plus the
+ * plugins the user installed through Claude's own `/plugin` command
+ * (~/.claude/plugins/installed_plugins.json, user-scoped always, project-scoped
+ * when `workspacePath` falls under the registered project).
+ *
+ * DISCOVERY ONLY -- the slash-command picker uses this to mirror what the
+ * launched Claude will actually have loaded. #1465: never feed this set back in
+ * as a launch input. Claude loads the user's own plugins natively, with their
+ * marketplace identity and settings; injecting them again produces a second,
+ * unconfigured `@inline` copy of every one of them.
+ *
+ * @param workspacePath - If provided, includes project-scoped CLI plugins for this workspace
+ */
+export async function getDiscoverableClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
+  const extensionPlugins = await getExtensionClaudePluginPaths();
+  const cliPlugins = await getClaudeCliPluginPaths(workspacePath);
+  // Dedupe in case the same directory is both an extension plugin and CLI-installed.
+  return dedupeClaudePluginPaths([...extensionPlugins, ...cliPlugins]);
+}
+
+/**
+ * Plugin paths for a Claude session with no workspace (the SDK fallback wired up
+ * in index.ts). This is a launch input, so it carries the injection set only.
+ * The parameter is kept for call-site symmetry; project-scoped CLI plugins are
+ * not injectable, and without a workspace there would be none to match anyway.
+ */
+export async function getClaudePluginPaths(_workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
+  return getExtensionClaudePluginPaths();
 }
 
 /**
@@ -1017,6 +1069,7 @@ export function registerExtensionHandlers(): void {
         path: string;
         manifest: unknown;
         isBuiltin: boolean;
+        staleBundleWarning?: string;
       }> = [];
       const seenExtensionIds = new Set<string>();
       const currentChannel = getReleaseChannel();
@@ -1111,6 +1164,7 @@ export function registerExtensionHandlers(): void {
             // older than its source, so features that run at activate() time
             // (e.g. collab codec registration) aren't silently broken by a
             // stale dev bundle. See NIM-1983.
+            let staleBundleWarning: string | undefined;
             if (isBuiltinDir && !app.isPackaged) {
               try {
                 const stale = await detectStaleBuiltinExtensionBundle(
@@ -1118,7 +1172,10 @@ export function registerExtensionHandlers(): void {
                   extensionPath,
                   typeof manifest.main === 'string' ? manifest.main : undefined,
                 );
-                if (stale) logger.main.warn(formatStaleBundleWarning(stale));
+                if (stale) {
+                  staleBundleWarning = formatStaleBundleWarning(stale);
+                  logger.main.warn(staleBundleWarning);
+                }
               } catch {
                 // Diagnostic only -- never block loading.
               }
@@ -1129,6 +1186,7 @@ export function registerExtensionHandlers(): void {
               path: extensionPath,
               manifest,
               isBuiltin: isBuiltinDir,
+              staleBundleWarning,
             });
           } catch {
             // Skip directories without valid manifest
@@ -1385,21 +1443,42 @@ export function registerExtensionHandlers(): void {
   // The renderers will unload the old version and load the new one
   safeHandle('extensions:dev-reload', async (_event, extensionId: string, extensionPath: string) => {
     try {
-      const { BrowserWindow } = await import('electron');
-      const windows = BrowserWindow.getAllWindows();
-
-      logger.main.info(`[ExtensionHandlers] Broadcasting extension reload: ${extensionId} from ${extensionPath}`);
-
-      // Broadcast reload message to all renderer windows
-      for (const win of windows) {
-        if (!win.isDestroyed()) {
-          win.webContents.send('extension:dev-reload', { extensionId, extensionPath });
-        }
+      if (app.isPackaged) {
+        return { success: false, error: 'Extension rebuild is only available in development mode.' };
+      }
+      if (typeof extensionId !== 'string' || !extensionId.trim()) {
+        return { success: false, error: 'Extension rebuild requires an extension ID.' };
+      }
+      if (typeof extensionPath !== 'string' || !extensionPath.trim()) {
+        return { success: false, error: 'Extension rebuild requires an extension path.' };
       }
 
-      return { success: true };
+      const normalizedPath = path.resolve(extensionPath);
+      const manifest = JSON.parse(await fs.readFile(path.join(normalizedPath, 'manifest.json'), 'utf-8'));
+      if (manifest.id !== extensionId) {
+        return {
+          success: false,
+          error: `Extension manifest ID ${String(manifest.id)} does not match ${extensionId}.`,
+        };
+      }
+
+      return await rebuildExtensionForDev(
+        { extensionId, extensionPath: normalizedPath },
+        {
+          broadcastReload: async (request) => {
+            logger.main.info(
+              `[ExtensionHandlers] Broadcasting extension reload: ${request.extensionId} from ${request.extensionPath}`,
+            );
+            for (const win of BrowserWindow.getAllWindows()) {
+              if (!win.isDestroyed()) {
+                win.webContents.send('extension:dev-reload', request);
+              }
+            }
+          },
+        },
+      );
     } catch (error) {
-      logger.main.error('[ExtensionHandlers] Failed to broadcast extension reload:', error);
+      logger.main.error('[ExtensionHandlers] Failed to rebuild extension:', error);
       return { success: false, error: String(error) };
     }
   });
@@ -1407,7 +1486,6 @@ export function registerExtensionHandlers(): void {
   // Notify all renderer processes to unload an extension
   safeHandle('extensions:dev-unload', async (_event, extensionId: string) => {
     try {
-      const { BrowserWindow } = await import('electron');
       const windows = BrowserWindow.getAllWindows();
 
       logger.main.info(`[ExtensionHandlers] Broadcasting extension unload: ${extensionId}`);

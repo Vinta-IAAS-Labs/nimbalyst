@@ -6,6 +6,8 @@ description: Prepare and execute an iOS release (patch/minor/major)
 
 Prepare an iOS release following this workflow:
 
+Before running the release script, reconcile the iOS release's notable Added/Changed/Removed capabilities against `docs/FEATURE_INVENTORY.md`, including the Mobile (iOS) and shared feature sections. Follow the root `CLAUDE.md` feature-inventory rule: preserve platform limitations, verify unclear scope against current code, and report the updated sections or a short "No inventory impact" reason. Keep desktop-only and unfinished mobile features out of iOS capability claims.
+
 ## iOS RELEASE WORKFLOW
 
 1. **Get commits since last iOS release**:
@@ -63,8 +65,11 @@ Prepare an iOS release following this workflow:
   - Push main and tag: `git push origin main && git push origin ios/v[VERSION]`
   - Open Xcode, select the NimbalystApp scheme
   - Product > Archive
+  - Verify the archive embeds `PlugIns/NimbalystWidgets.appex` — without it there is no Live Activity, and the build still uploads cleanly
   - Upload to App Store Connect
   - Copy the App Store "What's New" text into the version description
+
+  The first archive after the widget extension was added will prompt to create an App ID for `com.nimbalyst.app.widgets`; accept it. The release script keeps the widget's `Info.plist` version in step with the app's, which App Store Connect requires.
 
 7. **Done**: Show the App Store "What's New" text for easy copy-paste into App Store Connect.
 

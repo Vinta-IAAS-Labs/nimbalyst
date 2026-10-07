@@ -1,7 +1,10 @@
+import { refreshOrganizationDirectory } from '../../../store/listeners/stytchAuthListeners';
+import { organizationDirectoryStateAtom } from '../../../store/atoms/settingsDomains';
+import { DeviceInventoryPanel } from './DeviceInventoryPanel';
 import React, { useState, useEffect } from 'react';
 import { usePostHog } from 'posthog-js/react';
 import { useAtom, useAtomValue } from 'jotai';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { QRPairingModal } from './QRPairingModal';
 import {
   syncConfigAtom,
@@ -18,32 +21,6 @@ import { AccountOrgList } from './AccountOrgList';
 import { groupOrganizationsByAccount } from './accountOrganizations';
 import { applyProjectSyncChange, persistProjectSyncSelection, selectionState } from './projectSyncSelection';
 
-/** Format a timestamp as relative time (e.g., "5 minutes ago") */
-function formatRelativeTime(timestamp: number): string {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
-
-  if (seconds < 60) {
-    return 'just now';
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-
-  const days = Math.floor(hours / 24);
-  if (days < 7) {
-    return `${days}d ago`;
-  }
-
-  return new Date(timestamp).toLocaleDateString();
-}
-
 // SyncConfig is now exported from appSettings.ts
 // Re-export for backward compatibility
 export type { SyncConfig } from '../../../store/atoms/appSettings';
@@ -51,18 +28,6 @@ export type { SyncConfig } from '../../../store/atoms/appSettings';
 interface Project {
   path: string;
   name: string;
-}
-
-interface DeviceInfo {
-  deviceId: string;
-  name: string;
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
-  platform: string;
-  appVersion?: string;
-  connectedAt: number;
-  lastActiveAt: number;
-  isOnline?: boolean;
-  lastSeenAt?: number;
 }
 
 // NOTE: Props have been removed - SyncPanel now uses Jotai atoms directly.
@@ -93,9 +58,6 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [showQRModal, setShowQRModal] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
-  const [connectedDevices, setConnectedDevices] = useState<DeviceInfo[]>([]);
-  const [devicesLoading, setDevicesLoading] = useState(false);
-  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [, setAuthError] = useState<string | null>(null);
   const stytchAuth = useAtomValue(stytchAuthAtom) ?? { isAuthenticated: false, user: null };
 
@@ -103,7 +65,8 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
   const [allAccounts, setAllAccounts] = useAtom(personalAccountsAtom);
   const organizationDirectory = useAtomValue(organizationDirectoryAtom);
   const [, setPersonalSyncProfiles] = useAtom(personalSyncProfilesAtom);
-  const [refreshingOrganizations, setRefreshingOrganizations] = useState(false);
+  const organizationDirectoryState = useAtomValue(organizationDirectoryStateAtom);
+  const refreshingOrganizations = organizationDirectoryState.status === 'loading';
   // One bucket per signed-in login, in the same order as `allAccounts`, so each
   // account row can render its own organizations inline beneath it.
   const accountOrganizationGroups = React.useMemo(
@@ -111,19 +74,7 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
     [allAccounts, organizationDirectory],
   );
 
-  // Force a server round-trip, then let the central Stytch listener re-derive
-  // the directory atom (components never subscribe to IPC directly).
-  const handleRefreshOrganizations = async () => {
-    setRefreshingOrganizations(true);
-    try {
-      await window.electronAPI?.team?.list({ forceRefresh: true });
-      window.dispatchEvent(new CustomEvent('nimbalyst:organizations-changed'));
-    } catch (error) {
-      console.warn('[SyncPanel] Failed to refresh organizations:', error);
-    } finally {
-      setRefreshingOrganizations(false);
-    }
-  };
+  const handleRefreshOrganizations = () => refreshOrganizationDirectory();
   useEffect(() => {
     setPersonalSyncProfiles(config.personalSyncProfiles ?? {});
   }, [config.personalSyncProfiles, setPersonalSyncProfiles]);
@@ -138,6 +89,13 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
 
   const enabledProjects = config.enabledProjects ?? [];
   const enabledProjectCount = enabledProjects.length;
+
+  // One stored account is the common case, and it has nothing to choose between.
+  // The row then drops every comparison affordance (avatar, sync-account
+  // highlight and badge, per-account grouping) and reads as a plain
+  // "Signed in as ..." line. Nothing is removed — the multi-account chrome comes
+  // back the moment a second account exists.
+  const isSingleAccount = allAccounts.length === 1;
 
   // Derive whether sync is effectively active (has projects selected)
   const isSyncActive = config.enabled && enabledProjectCount > 0;
@@ -174,43 +132,6 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
     }
     loadProjects();
   }, []);
-
-  // Load connected devices when sync is enabled
-  const loadDevices = async () => {
-    if (!config.enabled || !effectiveServerUrl) {
-      setConnectedDevices([]);
-      return;
-    }
-
-    setDevicesLoading(true);
-    setDevicesError(null);
-    try {
-      const result = await window.electronAPI.invoke('sync:get-devices');
-      if (result.success) {
-        setConnectedDevices(result.devices || []);
-      } else {
-        setDevicesError(result.error || 'Failed to load devices');
-        setConnectedDevices([]);
-      }
-    } catch (error) {
-      console.error('Failed to load devices:', error);
-      setDevicesError('Failed to load devices');
-      setConnectedDevices([]);
-    } finally {
-      setDevicesLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (config.enabled && effectiveServerUrl) {
-      loadDevices();
-      const interval = setInterval(loadDevices, 30000);
-      return () => clearInterval(interval);
-    } else {
-      setConnectedDevices([]);
-      return undefined;
-    }
-  }, [config.enabled, effectiveServerUrl]);
 
   // Single write path for the project multi-select: one checkbox and
   // "Select all" go through the same helper and the same one-shot IPC, so a
@@ -466,7 +387,9 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
         <p className="provider-panel-description text-[13px] leading-relaxed text-[var(--nim-text-muted)]">{heading[1]}</p>
       </div>
 
-      {section === 'mobile' && config.personalSyncProfiles && Object.keys(config.personalSyncProfiles).length > 0 && (
+      {/* Purely informational: which retained profile belongs to which login.
+          With a single account there is no "which", so the card is noise. */}
+      {section === 'mobile' && allAccounts.length > 1 && config.personalSyncProfiles && Object.keys(config.personalSyncProfiles).length > 0 && (
         <section className="personal-sync-profile-groups mb-4 rounded-lg border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] p-3" data-testid="personal-sync-profile-groups">
           <h4 className="m-0 mb-2 text-sm font-semibold">Projects by personal account</h4>
           <div className="flex flex-col gap-2">
@@ -528,10 +451,18 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
 
       {/* Account Section */}
       <div className={`sync-account-section provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0 ${sectionClass('accounts')}`}>
+        {allAccounts.length === 0 && organizationDirectoryState.status !== 'signed-out' && !organizationDirectoryState.complete && (
+          <div className="sync-account-directory-status mb-3 text-sm text-nim-muted" role="status">
+            {refreshingOrganizations ? 'Loading accounts and organizations…' : organizationDirectoryState.error}
+            {!refreshingOrganizations && <button type="button" className="ml-2" onClick={handleRefreshOrganizations}>Retry</button>}
+          </div>
+        )}
         {allAccounts.length > 0 ? (
-          <div className="sync-account-list flex flex-col gap-2">
+          <div className="sync-account-list flex flex-col gap-2" data-single-account={isSingleAccount || undefined}>
             <div className="sync-account-list-header flex items-center justify-between">
-              <h4 className="m-0 text-[13px] font-semibold text-[var(--nim-text)]">Accounts and organizations</h4>
+              <h4 className="m-0 text-[13px] font-semibold text-[var(--nim-text)]">
+                {isSingleAccount ? 'Account and organizations' : 'Accounts and organizations'}
+              </h4>
               <button
                 type="button"
                 onClick={handleRefreshOrganizations}
@@ -544,39 +475,56 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
             </div>
             {allAccounts.map((account, accountIndex) => {
               const isSyncAccount = account.isSyncAccount || account.personalOrgId === config.personalOrgId;
+              // "This is the one sync uses" only says something when there is
+              // another account it could have been.
+              const showsSyncAccountEmphasis = isSyncAccount && !isSingleAccount;
+              const isExpired = account.sessionStatus === 'expired';
 
               return (
                 <article
                   key={account.personalOrgId}
                   className={`sync-account-row flex flex-col rounded-lg border p-2.5 ${
-                    isSyncAccount
+                    showsSyncAccountEmphasis
                       ? 'border-[var(--nim-primary)] bg-[color-mix(in_srgb,var(--nim-primary)_8%,transparent)]'
                       : 'border-[var(--nim-border)] bg-[var(--nim-bg-secondary)]'
                   }`}
                   data-testid="sync-account-row"
                 >
                   <div className="sync-account-identity flex items-center gap-3">
-                    <div className={`sync-account-avatar flex size-9 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${
-                      isSyncAccount
-                        ? 'bg-[var(--nim-primary)] text-[var(--nim-on-primary)]'
-                        : 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)]'
-                    }`}>
-                      {(account.email?.[0] || '?').toUpperCase()}
-                    </div>
+                    {!isSingleAccount && (
+                      <div className={`sync-account-avatar flex size-9 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${
+                        isSyncAccount
+                          ? 'bg-[var(--nim-primary)] text-[var(--nim-on-primary)]'
+                          : 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)]'
+                      }`}>
+                        {(account.email?.[0] || '?').toUpperCase()}
+                      </div>
+                    )}
                     <div className="sync-account-summary min-w-0 flex-1 select-text">
-                      <div className="truncate text-[13px] font-medium text-[var(--nim-text)]">{account.email}</div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--nim-text-muted)]">
-                        {isSyncAccount && (
-                          <span className="rounded-full bg-[var(--nim-primary)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--nim-on-primary)]">
-                            Used for sync
-                          </span>
-                        )}
-                        {account.sessionStatus === 'expired' && (
-                          <span className="rounded-full bg-[var(--nim-warning-bg)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--nim-warning)]">
-                            Session expired
-                          </span>
+                      <div className="truncate text-[13px] text-[var(--nim-text)]">
+                        {isSingleAccount ? (
+                          <>
+                            <span className="text-[var(--nim-text-muted)]">Signed in as </span>
+                            <span className="font-medium">{account.email}</span>
+                          </>
+                        ) : (
+                          <span className="font-medium">{account.email}</span>
                         )}
                       </div>
+                      {(showsSyncAccountEmphasis || isExpired) && (
+                        <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--nim-text-muted)]">
+                          {showsSyncAccountEmphasis && (
+                            <span className="rounded-full bg-[var(--nim-primary)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--nim-on-primary)]">
+                              Used for sync
+                            </span>
+                          )}
+                          {isExpired && (
+                            <span className="rounded-full bg-[var(--nim-warning-bg)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--nim-warning)]">
+                              Session expired
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                     <div className="sync-account-actions flex shrink-0 items-center gap-1.5">
                       {account.sessionStatus === 'expired' && (
@@ -612,18 +560,35 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
                       </button>
                     </div>
                   </div>
-                  <AccountOrgList group={accountOrganizationGroups[accountIndex]} />
+                  {/* Indented under its login only when there is more than one
+                      login to attribute organizations to. */}
+                  <AccountOrgList group={accountOrganizationGroups[accountIndex]} indented={!isSingleAccount} />
                 </article>
               );
             })}
-            <button
-              type="button"
-              onClick={handleAddAccount}
-              className="sync-add-account-button flex items-center justify-center gap-2 rounded-lg border border-dashed border-[var(--nim-border)] bg-transparent px-3 py-2 text-xs text-[var(--nim-text-muted)] transition-colors hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
-            >
-              <MaterialSymbol icon="person_add" size={16} />
-              Add account
-            </button>
+            {/* Settings is the only place an account can be added. With one
+                account that stays a quiet text action rather than a call to
+                action for a feature most people never need. */}
+            {isSingleAccount ? (
+              <button
+                type="button"
+                onClick={handleAddAccount}
+                className="sync-add-account-button self-start border-none bg-transparent p-0 text-[11px] text-[var(--nim-text-muted)] underline-offset-2 hover:text-[var(--nim-text)] hover:underline"
+                data-testid="sync-add-account"
+              >
+                Add another account
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleAddAccount}
+                className="sync-add-account-button flex items-center justify-center gap-2 rounded-lg border border-dashed border-[var(--nim-border)] bg-transparent px-3 py-2 text-xs text-[var(--nim-text-muted)] transition-colors hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
+                data-testid="sync-add-account"
+              >
+                <MaterialSymbol icon="person_add" size={16} />
+                Add account
+              </button>
+            )}
           </div>
         ) : isStytchAvailable ? (
           <AccountLoginForm mode="first-sign-in" />
@@ -844,49 +809,7 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
         </div>
       </div>
 
-      {/* Paired Devices */}
-      <div className={`sync-devices-section provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0 ${sectionClass('devices')}`}>
-        <h4 className="provider-panel-section-title text-[15px] font-semibold mb-3 text-[var(--nim-text)]">
-          Paired devices
-          <button
-            onClick={loadDevices}
-            disabled={devicesLoading}
-            className={`ml-2 px-1.5 py-0.5 text-[10px] bg-nim-secondary border border-nim rounded text-nim-faint ${
-              devicesLoading ? 'cursor-wait' : 'cursor-pointer hover:bg-nim-hover'
-            }`}
-          >
-            Refresh
-          </button>
-        </h4>
-        <div className="mt-2">
-          {connectedDevices.length === 0 && !devicesLoading && (
-            <div className="text-[12px] text-nim-faint px-2.5 py-2">
-              No paired devices. Use &quot;Pair Device&quot; to connect a mobile device.
-            </div>
-          )}
-          {connectedDevices.map((device) => (
-            <div
-              key={device.deviceId}
-              className="flex items-center gap-2.5 px-2.5 py-2 bg-nim-secondary rounded-md mb-1.5 last:mb-0"
-            >
-              <div className={`w-2 h-2 rounded-full ${device.isOnline ? 'bg-green-500' : 'bg-neutral-500'}`} />
-              <div className="flex-1">
-                <div className="text-[13px] text-nim">
-                  {device.name}
-                </div>
-                <div className="text-[11px] text-nim-faint">
-                  {device.platform}
-                  {device.isOnline
-                    ? ` - connected ${formatRelativeTime(device.connectedAt)}`
-                    : device.lastSeenAt
-                      ? ` - last seen ${formatRelativeTime(device.lastSeenAt)}`
-                      : ''}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      {section === 'devices' && <DeviceInventoryPanel key={`${config.personalOrgId ?? ''}:${stytchAuth.user?.user_id ?? ''}`} enabled={config.enabled && !!effectiveServerUrl} />}
 
       {/* Encryption footer */}
       <div className={`sync-mobile-section provider-panel-section py-4 ${sectionClass('mobile')}`}>

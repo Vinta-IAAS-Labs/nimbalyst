@@ -6,7 +6,27 @@
  */
 
 import { BasePlugin } from '@revolist/revogrid';
-import type { PluginProviders, DimensionRows, BeforeSaveDataDetails, AfterEditEvent, BeforeRangeSaveDataDetails } from '@revolist/revogrid';
+import type {
+  PluginProviders,
+  DimensionCols,
+  DimensionRows,
+  BeforeSaveDataDetails,
+  AfterEditEvent,
+  BeforeRangeSaveDataDetails,
+  RangeArea,
+} from '@revolist/revogrid';
+
+/** Old cell values captured at a `before*` event, keyed row index -> prop. */
+type RangeValues = Record<number, Record<string, unknown>>;
+
+/**
+ * `AfterEditEvent` is a union. A single-cell save carries prop/rowIndex; a range
+ * apply (multi-cell delete, autofill, paste) carries data/models over a rect.
+ * Only the range half has the range keys.
+ */
+function isRangeSaveDetails(detail: AfterEditEvent): detail is BeforeRangeSaveDataDetails {
+  return 'newRange' in detail || 'oldRange' in detail;
+}
 
 interface CellChange {
   rowIndex: number;
@@ -15,6 +35,7 @@ interface CellChange {
   oldValue: unknown;
   newValue: unknown;
   rowType: DimensionRows;
+  colType: DimensionCols;
 }
 
 export interface SelectionState {
@@ -61,16 +82,39 @@ export class UndoRedoPlugin extends BasePlugin {
   private batchTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   // Track the value before edit starts
-  private pendingOldValue: { rowIndex: number; colIndex: number; prop: string; value: unknown; rowType: DimensionRows } | null = null;
+  private pendingOldValue: {
+    rowIndex: number;
+    colIndex: number;
+    prop: string;
+    value: unknown;
+    rowType: DimensionRows;
+    colType: DimensionCols;
+  } | null = null;
 
   // Track selection state before changes
   private selectionBeforeChange: SelectionState | null = null;
+
+  // Values captured on `beforecut`. RevoGrid's own clearregion listener is bound
+  // at target on revogr-clipboard and runs before this plugin's bubbled one, so
+  // by the time `clearregion` arrives the cells are already blank -- `beforecut`
+  // is the last point where the originals can still be read.
+  private pendingCut: { changes: CellChange[]; selection: SelectionState | null } | null = null;
+
+  // Values captured on `beforerangeedit`, for the same reason: revo-grid's
+  // onRangeEdit calls setRangeData() before emitting `afteredit`, and
+  // `detail.models` holds live row references, so both are already mutated by
+  // the time the after-event lands.
+  private pendingRange: { range: RangeArea; rowType: DimensionRows; values: RangeValues } | null =
+    null;
 
   // Flag to prevent recording changes caused by undo/redo itself
   private isUndoRedoOperation = false;
 
   // Callback for state change notifications (canUndo/canRedo changed)
   private onStateChange?: () => void;
+
+  // Callback after undo/redo has finished applying source values
+  private onDataChange?: () => void | Promise<void>;
 
   // Callback to restore selection after undo/redo
   private onRestoreSelection?: (selection: SelectionState) => void;
@@ -81,22 +125,59 @@ export class UndoRedoPlugin extends BasePlugin {
     options?: {
       onStateChange?: () => void;
       onRestoreSelection?: (selection: SelectionState) => void;
+      onDataChange?: () => void | Promise<void>;
     }
   ) {
     super(revogrid, providers);
 
     this.onStateChange = options?.onStateChange;
     this.onRestoreSelection = options?.onRestoreSelection;
+    this.onDataChange = options?.onDataChange;
 
     // Listen for cell edit events
     this.addEventListener('beforeedit', this.handleBeforeEdit.bind(this));
     this.addEventListener('afteredit', this.handleAfterEdit.bind(this));
 
-    // Listen for range edits (paste operations)
+    // Listen for range edits (paste, autofill, multi-cell delete)
     this.addEventListener('beforerangeedit', this.handleBeforeRangeEdit.bind(this));
 
-    // Listen for clear operations
+    // Listen for cut/clear operations. `beforecut` captures the values;
+    // `clearregion` is only the signal that the cut actually went through.
+    this.addEventListener('beforecut', this.handleBeforeCut.bind(this));
     this.addEventListener('clearregion', this.handleClearRegion.bind(this));
+  }
+
+  /**
+   * Resolve a column index to its prop via the column provider rather than an
+   * index-to-letter guess -- `String.fromCharCode(65 + i)` stops being correct
+   * at column Z.
+   */
+  private columnProp(colIndex: number, colType: DimensionCols = 'rgCol'): string | null {
+    const prop = this.providers?.column?.getColumn(colIndex, colType)?.prop;
+    return prop === undefined || prop === null ? null : String(prop);
+  }
+
+  private forEachCellInRange(
+    range: RangeArea,
+    visit: (rowIndex: number, colIndex: number, prop: string) => void
+  ): void {
+    for (let rowIndex = range.y; rowIndex <= range.y1; rowIndex++) {
+      for (let colIndex = range.x; colIndex <= range.x1; colIndex++) {
+        const prop = this.columnProp(colIndex);
+        if (prop !== null) visit(rowIndex, colIndex, prop);
+      }
+    }
+  }
+
+  /** Read the current value of every cell in a range straight from the store. */
+  private readRangeValues(range: RangeArea, rowType: DimensionRows): RangeValues {
+    const values: RangeValues = {};
+    this.forEachCellInRange(range, (rowIndex, _colIndex, prop) => {
+      const model = this.providers?.data?.getModel(rowIndex, rowType);
+      if (!model) return;
+      (values[rowIndex] ??= {})[prop] = model[prop];
+    });
+    return values;
   }
 
   /**
@@ -134,6 +215,7 @@ export class UndoRedoPlugin extends BasePlugin {
     const prop = String(detail.prop ?? '');
     const model = detail.model;
     const type = detail.type;
+    const colType = detail.colType;
 
     // Capture selection state before the edit
     if (this.selectionBeforeChange === null) {
@@ -150,6 +232,7 @@ export class UndoRedoPlugin extends BasePlugin {
       prop,
       value: oldValue,
       rowType,
+      colType,
     };
   }
 
@@ -159,13 +242,22 @@ export class UndoRedoPlugin extends BasePlugin {
   private handleAfterEdit(e: CustomEvent<AfterEditEvent>): void {
     if (this.isUndoRedoOperation || !e.detail) return;
 
-    // AfterEditEvent can be BeforeSaveDataDetails or BeforeRangeSaveDataDetails
+    // A range apply carries no rowIndex/colIndex/prop. Casting it to the
+    // single-cell shape collapsed every range edit to (0, 0, '') and recorded
+    // one bogus change against A1, so undoing a range delete wrote into the
+    // wrong cell.
+    if (isRangeSaveDetails(e.detail)) {
+      this.recordRangeEdit(e.detail);
+      return;
+    }
+
     const detail = e.detail as BeforeSaveDataDetails;
     const rowIndex = detail.rowIndex ?? 0;
     const colIndex = detail.colIndex ?? 0;
     const prop = String(detail.prop ?? '');
     const val = detail.val;
     const type = detail.type;
+    const colType = detail.colType;
     const rowType: DimensionRows = (type as DimensionRows) || 'rgRow';
 
     // Get the old value from our pending capture
@@ -190,77 +282,110 @@ export class UndoRedoPlugin extends BasePlugin {
       oldValue,
       newValue: val,
       rowType,
+      colType,
     });
   }
 
   /**
-   * Handle range edits (paste operations)
-   * RevoGrid fires this before applying pasted data
+   * Snapshot the pre-edit values of a range (paste, autofill, multi-cell
+   * delete). This has to happen here: revo-grid's `onRangeEdit` applies the
+   * data before emitting `afteredit`, so the originals are gone by then.
    */
   private handleBeforeRangeEdit(e: CustomEvent<BeforeRangeSaveDataDetails>): void {
+    this.pendingRange = null;
     if (this.isUndoRedoOperation || !e.detail) return;
 
-    // Range edits contain multiple cell changes
-    // We'll capture these in the afteredit events that follow
-    // For now, just ensure we commit any pending batch before the range edit
     this.commitBatch();
+
+    const range = e.detail.newRange ?? e.detail.oldRange;
+    if (!range) return;
+
+    const rowType: DimensionRows = (e.detail.type as DimensionRows) || 'rgRow';
+    this.pendingRange = { range, rowType, values: this.readRangeValues(range, rowType) };
+  }
+
+  /** Pair the `beforerangeedit` snapshot against the applied values. */
+  private recordRangeEdit(detail: BeforeRangeSaveDataDetails): void {
+    const pending = this.pendingRange;
+    this.pendingRange = null;
+    if (!pending) return;
+
+    this.forEachCellInRange(pending.range, (rowIndex, colIndex, prop) => {
+      const oldValue = pending.values[rowIndex]?.[prop];
+      const newValue = detail.data?.[rowIndex]?.[prop];
+      if (oldValue === newValue) return;
+
+      this.recordChange({
+        rowIndex,
+        colIndex,
+        prop,
+        oldValue,
+        newValue,
+        rowType: pending.rowType,
+        colType: 'rgCol',
+      });
+    });
   }
 
   /**
-   * Handle clear region events (delete key, cut operations)
+   * Snapshot the selected range before a cut clears it.
+   *
+   * `clearregion` is typed `EventEmitter<DataTransfer>` and carries the raw
+   * clipboard object -- no range and no cell data -- so the values have to come
+   * from the grid, and they have to be read now, while the cells still hold
+   * them.
    */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private handleClearRegion(e: CustomEvent<any>): void {
-    if (this.isUndoRedoOperation || !e.detail) return;
+  private handleBeforeCut(): void {
+    this.pendingCut = null;
+    if (this.isUndoRedoOperation) return;
 
-    // The data contains the old values before clearing
-    // We need to record these for undo
-    const { data, range, type } = e.detail;
-    const rowType: DimensionRows = (type as DimensionRows) || 'rgRow';
+    const range = this.providers?.selection?.selectedRange;
+    if (!range) return;
 
-    // Capture selection before the clear
-    const selectionBefore = this.captureSelectionState();
-
-    // Commit any pending changes first
-    this.commitBatch();
-
+    const rowType: DimensionRows = 'rgRow';
+    const values = this.readRangeValues(range, rowType);
     const changes: CellChange[] = [];
 
-    // Record each cell in the cleared range
-    for (let rowOffset = 0; rowOffset <= range.y1 - range.y; rowOffset++) {
-      const rowData = data[rowOffset];
-      if (!rowData) continue;
-
-      for (let colOffset = 0; colOffset <= range.x1 - range.x; colOffset++) {
-        // Column props are A, B, C, etc.
-        const colIndex = range.x + colOffset;
-        const prop = String.fromCharCode(65 + colIndex); // A = 65
-
-        const oldValue = rowData[prop];
-        if (oldValue !== '' && oldValue !== undefined) {
-          changes.push({
-            rowIndex: range.y + rowOffset,
-            colIndex,
-            prop,
-            oldValue,
-            newValue: '',
-            rowType,
-          });
-        }
-      }
-    }
+    this.forEachCellInRange(range, (rowIndex, colIndex, prop) => {
+      const oldValue = values[rowIndex]?.[prop];
+      if (oldValue === '' || oldValue === undefined) return;
+      changes.push({
+        rowIndex,
+        colIndex,
+        prop,
+        oldValue,
+        newValue: '',
+        rowType,
+        colType: 'rgCol',
+      });
+    });
 
     if (changes.length > 0) {
-      this.undoStack.push({
-        changes,
-        timestamp: Date.now(),
-        selectionBefore,
-        selectionAfter: selectionBefore, // Selection stays the same after clear
-      });
-      this.redoStack = [];
-      this.trimUndoStack();
-      this.notifyStateChange();
+      this.pendingCut = { changes, selection: this.captureSelectionState() };
     }
+  }
+
+  /**
+   * A cut went through. RevoGrid aborts before emitting this when the grid is
+   * readonly or `beforecut` was default-prevented, so the snapshot is consumed
+   * exactly once and a stale one is never replayed.
+   */
+  private handleClearRegion(): void {
+    const pending = this.pendingCut;
+    this.pendingCut = null;
+    if (this.isUndoRedoOperation || !pending) return;
+
+    this.commitBatch();
+
+    this.undoStack.push({
+      changes: pending.changes,
+      timestamp: Date.now(),
+      selectionBefore: pending.selection,
+      selectionAfter: pending.selection, // Selection stays the same after clear
+    });
+    this.redoStack = [];
+    this.trimUndoStack();
+    this.notifyStateChange();
   }
 
   /**
@@ -329,50 +454,30 @@ export class UndoRedoPlugin extends BasePlugin {
 
   /**
    * Undo the last change
-   * @returns true if undo was performed, false if nothing to undo
+   * @returns true after every write and recalculation succeeds, otherwise false
    */
-  public undo(): boolean {
+  public async undo(): Promise<boolean> {
     // Commit any pending changes first
     this.commitBatch();
 
-    const entry = this.undoStack.pop();
-    if (!entry) return false;
+    const entry = this.undoStack[this.undoStack.length - 1];
+    if (!entry || this.isUndoRedoOperation) return false;
 
     this.isUndoRedoOperation = true;
 
     try {
-      // Revert changes in reverse order
-      for (const change of [...entry.changes].reverse()) {
-        this.revogrid.setDataAt({
-          row: change.rowIndex,
-          col: change.colIndex,
-          val: change.oldValue,
-          rowType: change.rowType,
-          colType: 'rgCol',
-        });
-      }
+      const succeeded = await this.applyEntry(entry, 'undo');
+      if (!succeeded) return false;
 
-      // Restore selection to before state
-      if (entry.selectionBefore && this.onRestoreSelection) {
-        this.onRestoreSelection(entry.selectionBefore);
-      } else if (entry.changes.length > 0) {
-        // Fallback: focus on the first changed cell
-        const firstChange = entry.changes[0];
-        this.revogrid.setCellsFocus(
-          { x: firstChange.colIndex, y: firstChange.rowIndex },
-          { x: firstChange.colIndex, y: firstChange.rowIndex },
-          undefined,
-          firstChange.rowType
-        );
-      }
-
-      // Move to redo stack
+      // Commit the history transition only after writes and recalculation have landed.
+      this.undoStack.pop();
       this.redoStack.push({
         ...entry,
         timestamp: Date.now(),
       });
 
       this.notifyStateChange();
+      this.restoreEntrySelection(entry, 'undo');
       return true;
     } finally {
       this.isUndoRedoOperation = false;
@@ -381,50 +486,97 @@ export class UndoRedoPlugin extends BasePlugin {
 
   /**
    * Redo the last undone change
-   * @returns true if redo was performed, false if nothing to redo
+   * @returns true after every write and recalculation succeeds, otherwise false
    */
-  public redo(): boolean {
-    const entry = this.redoStack.pop();
-    if (!entry) return false;
+  public async redo(): Promise<boolean> {
+    const entry = this.redoStack[this.redoStack.length - 1];
+    if (!entry || this.isUndoRedoOperation) return false;
 
     this.isUndoRedoOperation = true;
 
     try {
-      // Re-apply changes in original order
-      for (const change of entry.changes) {
-        this.revogrid.setDataAt({
-          row: change.rowIndex,
-          col: change.colIndex,
-          val: change.newValue,
-          rowType: change.rowType,
-          colType: 'rgCol',
-        });
-      }
+      const succeeded = await this.applyEntry(entry, 'redo');
+      if (!succeeded) return false;
 
-      // Restore selection to after state
-      if (entry.selectionAfter && this.onRestoreSelection) {
-        this.onRestoreSelection(entry.selectionAfter);
-      } else if (entry.changes.length > 0) {
-        // Fallback: focus on the last changed cell
-        const lastChange = entry.changes[entry.changes.length - 1];
-        this.revogrid.setCellsFocus(
-          { x: lastChange.colIndex, y: lastChange.rowIndex },
-          { x: lastChange.colIndex, y: lastChange.rowIndex },
-          undefined,
-          lastChange.rowType
-        );
-      }
-
-      // Move back to undo stack
+      // Commit the history transition only after writes and recalculation have landed.
+      this.redoStack.pop();
       this.undoStack.push({
         ...entry,
         timestamp: Date.now(),
       });
 
       this.notifyStateChange();
+      this.restoreEntrySelection(entry, 'redo');
       return true;
     } finally {
       this.isUndoRedoOperation = false;
+    }
+  }
+
+  private async applyEntry(entry: UndoEntry, direction: 'undo' | 'redo'): Promise<boolean> {
+    const changes = direction === 'undo' ? [...entry.changes].reverse() : entry.changes;
+    const applied: CellChange[] = [];
+
+    try {
+      for (const change of changes) {
+        await this.revogrid.setDataAt({
+          row: change.rowIndex,
+          col: change.colIndex,
+          val: direction === 'undo' ? change.oldValue : change.newValue,
+          rowType: change.rowType,
+          colType: change.colType,
+        });
+        applied.push(change);
+      }
+      await this.onDataChange?.();
+      return true;
+    } catch (error) {
+      console.error(`[CSV] Failed to apply ${direction}:`, error);
+      await this.rollbackAppliedChanges(applied, direction);
+      return false;
+    }
+  }
+
+  private async rollbackAppliedChanges(
+    applied: CellChange[],
+    direction: 'undo' | 'redo'
+  ): Promise<void> {
+    try {
+      for (const change of [...applied].reverse()) {
+        await this.revogrid.setDataAt({
+          row: change.rowIndex,
+          col: change.colIndex,
+          val: direction === 'undo' ? change.newValue : change.oldValue,
+          rowType: change.rowType,
+          colType: change.colType,
+        });
+      }
+      await this.onDataChange?.();
+    } catch (rollbackError) {
+      console.error('[CSV] Failed to roll back partial undo/redo:', rollbackError);
+    }
+  }
+
+  private restoreEntrySelection(entry: UndoEntry, direction: 'undo' | 'redo'): void {
+    try {
+      const selection = direction === 'undo' ? entry.selectionBefore : entry.selectionAfter;
+      if (selection && this.onRestoreSelection) {
+        this.onRestoreSelection(selection);
+        return;
+      }
+      if (entry.changes.length === 0) return;
+
+      const change = direction === 'undo'
+        ? entry.changes[0]
+        : entry.changes[entry.changes.length - 1];
+      this.revogrid.setCellsFocus(
+        { x: change.colIndex, y: change.rowIndex },
+        { x: change.colIndex, y: change.rowIndex },
+        change.colType,
+        change.rowType
+      );
+    } catch (error) {
+      console.error(`[CSV] Failed to restore selection after ${direction}:`, error);
     }
   }
 
@@ -450,6 +602,8 @@ export class UndoRedoPlugin extends BasePlugin {
     this.redoStack = [];
     this.pendingChanges = [];
     this.pendingOldValue = null;
+    this.pendingCut = null;
+    this.pendingRange = null;
     if (this.batchTimeoutId !== null) {
       clearTimeout(this.batchTimeoutId);
       this.batchTimeoutId = null;
@@ -469,6 +623,7 @@ export class UndoRedoPlugin extends BasePlugin {
       oldValue: unknown;
       newValue: unknown;
       rowType?: DimensionRows;
+      colType?: DimensionCols;
     }>,
     selectionBefore?: SelectionState | null
   ): void {
@@ -481,6 +636,7 @@ export class UndoRedoPlugin extends BasePlugin {
       .map(c => ({
         ...c,
         rowType: c.rowType || 'rgRow',
+        colType: c.colType || 'rgCol',
       }));
 
     if (normalizedChanges.length > 0) {

@@ -50,7 +50,6 @@ const EXTERNALS_MAP: Record<string, string> = {
   '@nimbalyst/editor-context': '@nimbalyst/editor-context',
   '@nimbalyst/runtime/ui/icons/MaterialSymbol': '@nimbalyst/runtime/ui/icons/MaterialSymbol',
   '@nimbalyst/screenshot-service': '@nimbalyst/screenshot-service',
-  '@nimbalyst/datamodel-platform-service': '@nimbalyst/datamodel-platform-service',
 
   // Shared libraries
   'pdfjs-dist': 'pdfjs-dist',
@@ -235,7 +234,7 @@ function generateCommonExports(externalKey: string): string {
     exports = ['MaterialSymbol'];
   } else if (externalKey === '@nimbalyst/runtime') {
     exports = [
-      'MaterialSymbol', 'useDocumentPath', 'useEditorLifecycle',
+      'MaterialSymbol', 'useDocumentPath', 'useEditorLifecycle', 'screenshotService',
       'useCollaborativeEditor', 'COLLAB_INIT_ORIGIN',
       'setTranscriptMarkdownContributions', 'clearTranscriptMarkdownContributions',
       'MarkdownEditor', 'MonacoEditor', 'MonacoCodeEditor',
@@ -244,8 +243,6 @@ function generateCommonExports(externalKey: string): string {
     ];
   } else if (externalKey === '@nimbalyst/screenshot-service') {
     exports = ['screenshotService'];
-  } else if (externalKey === '@nimbalyst/datamodel-platform-service') {
-    exports = ['DataModelPlatformServiceImpl', 'getInstance'];
   } else if (externalKey === 'pdfjs-dist') {
     exports = ['getDocument', 'GlobalWorkerOptions', 'version'];
   } else if (externalKey === 'virtua') {

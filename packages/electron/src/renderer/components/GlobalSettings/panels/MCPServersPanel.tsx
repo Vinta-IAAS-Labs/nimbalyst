@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { usePostHog } from 'posthog-js/react';
 import { useAtomValue } from 'jotai';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { ErrorBoundary } from '../../ErrorBoundary';
 import { useTheme } from '../../../hooks/useTheme';
 import { enabledProvidersAtom } from '../../../store/atoms/appSettings';
@@ -10,6 +10,9 @@ import {
   buildMCPOAuthAnalyticsProperties,
   MCPOAuthTriggerResult,
 } from './mcpOAuthAnalytics';
+import { withStaticClientId } from './mcpStaticClientId';
+import { requestConfirmation } from '../../../dialogs/requestConfirmation';
+import { errorNotificationService } from '../../../services/ErrorNotificationService';
 
 interface MCPServerConfig {
   command?: string;
@@ -681,6 +684,14 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
   const [testMessage, setTestMessage] = useState<string>('');
   const [testHelpUrl, setTestHelpUrl] = useState<string | null>(null);
   const [canRetryAfterCacheClear, setCanRetryAfterCacheClear] = useState(false);
+  // Set when authorization failed because the provider refuses dynamic client
+  // registration -- the one failure a client id can actually fix.
+  const [needsStaticClientId, setNeedsStaticClientId] = useState(false);
+  // For jumping from that error straight to the field that fixes it. The
+  // <details> only exists in the template layout; custom configs render the
+  // fields already expanded, so a missing ref there is expected.
+  const advancedDetailsRef = useRef<HTMLDetailsElement>(null);
+  const clientIdInputRef = useRef<HTMLInputElement>(null);
 
   // Stream MCP test progress messages from the central listener
   // (store/listeners/mcpListeners.ts) into local state. Only apply while a
@@ -1102,6 +1113,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
 
     setOauthAction('authorizing');
     setCanRetryAfterCacheClear(false);
+    setNeedsStaticClientId(false);
     try {
       const result = await window.electronAPI.invoke(
         'mcp-config:trigger-oauth',
@@ -1119,6 +1131,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
         setCanRetryAfterCacheClear(
           result.canRetryAfterCacheClear === true || result.isStalePortError === true
         );
+        setNeedsStaticClientId(result.errorType === 'dynamic_registration_unsupported');
         await checkOAuthStatus(config);
       }
       captureOAuthResult(result);
@@ -1139,6 +1152,22 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
   };
 
   /**
+   * Jump from the "provider does not support dynamic client registration" error
+   * to the one field that fixes it. Templates keep the fields behind a collapsed
+   * <details>; custom configs render them expanded and have no such element.
+   */
+  const revealClientIdField = () => {
+    if (advancedDetailsRef.current) {
+      advancedDetailsRef.current.open = true;
+    }
+    // The field may have just been revealed, so wait for paint before focusing.
+    requestAnimationFrame(() => {
+      clientIdInputRef.current?.scrollIntoView({ block: 'center' });
+      clientIdInputRef.current?.focus();
+    });
+  };
+
+  /**
    * Revoke OAuth authorization
    */
   const handleRevoke = async () => {
@@ -1154,7 +1183,13 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
     const serverUrl = getOAuthServerUrl(config);
     if (!serverUrl) return;
 
-    if (!confirm('Revoke authorization? You will need to re-authorize to use this server.')) {
+    const ok = await requestConfirmation({
+      title: 'Revoke authorization',
+      message: 'Revoke authorization? You will need to re-authorize to use this server.',
+      confirmLabel: 'Revoke',
+      destructive: true,
+    });
+    if (!ok) {
       return;
     }
 
@@ -1225,6 +1260,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
         setCanRetryAfterCacheClear(
           result.canRetryAfterCacheClear === true || result.isStalePortError === true
         );
+        setNeedsStaticClientId(result.errorType === 'dynamic_registration_unsupported');
         await checkOAuthStatus(config);
       }
       captureOAuthResult(result, true);
@@ -1376,7 +1412,13 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
   const handleDelete = async () => {
     if (!selectedServer) return;
 
-    if (!confirm(`Delete MCP server "${selectedServer.name}"?`)) {
+    const ok = await requestConfirmation({
+      title: 'Delete MCP server',
+      message: `Delete MCP server "${selectedServer.name}"?`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) {
       return;
     }
 
@@ -1399,7 +1441,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
         : await window.electronAPI.invoke('mcp-config:write-user', config);
 
       if (!result.success) {
-        alert(`Failed to delete: ${result.error}`);
+        errorNotificationService.showError('Failed to delete MCP server', `Failed to delete: ${result.error}`);
         isLocalChangeRef.current = false;
         return;
       }
@@ -1418,7 +1460,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to delete server';
       console.error('Failed to delete server:', errorMsg);
-      alert(`Error: ${errorMsg}`);
+      errorNotificationService.showError('Failed to delete MCP server', `Error: ${errorMsg}`);
       isLocalChangeRef.current = false;
     }
   };
@@ -1468,7 +1510,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to toggle server providers';
       console.error('Failed to toggle server providers:', errorMsg);
-      alert(`Error: ${errorMsg}`);
+      errorNotificationService.showError('Failed to update MCP server', `Error: ${errorMsg}`);
       isLocalChangeRef.current = false;
     }
   };
@@ -1513,6 +1555,10 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
 
   const removeHeader = (index: number) => {
     setFormHeaders(formHeaders.filter((_, i) => i !== index));
+  };
+
+  const updateStaticClientId = (value: string) => {
+    setFormOAuth((current) => withStaticClientId(current, value));
   };
 
   /**
@@ -1942,6 +1988,16 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
                     {oauthAction === 'clearing-cache' ? 'Clearing...' : 'Clear Auth Cache & Retry'}
                   </button>
                 )}
+                {needsStaticClientId && (
+                  <button
+                    type="button"
+                    className="mcp-add-client-id-button block mt-3 px-3 py-1.5 text-[0.8125rem] font-medium text-white bg-[var(--nim-primary)] border-none rounded cursor-pointer transition-all duration-150 hover:brightness-90"
+                    onClick={revealClientIdField}
+                    aria-label="Go to the OAuth client ID field"
+                  >
+                    Add a Client ID
+                  </button>
+                )}
                 {testHelpUrl && (
                   <button
                     type="button"
@@ -2053,7 +2109,7 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
 
         {/* Advanced Configuration (collapsed for templates) */}
         {selectedTemplate ? (
-          <details className="mcp-advanced-section mt-6 border border-[var(--nim-border)] rounded-lg overflow-hidden [&[open]>summary::after]:rotate-45">
+          <details ref={advancedDetailsRef} className="mcp-advanced-section mt-6 border border-[var(--nim-border)] rounded-lg overflow-hidden [&[open]>summary::after]:rotate-45">
             <summary className="p-4 cursor-pointer flex items-center justify-between font-medium text-sm bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] list-none [&::-webkit-details-marker]:hidden after:content-[''] after:w-1.5 after:h-1.5 after:border-r-2 after:border-b-2 after:border-[var(--nim-text-faint)] after:-rotate-45 after:transition-transform after:duration-200">
               Advanced Configuration
               <span className="mcp-advanced-hint text-xs text-[var(--nim-text-faint)] font-normal mr-2">Pre-configured, typically no changes needed</span>
@@ -2290,6 +2346,34 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
           </div>
         )}
 
+        {/* Pre-registered OAuth client (remote transports only).
+            Never gated on `readonly`: a template can pre-fill plumbing, but only
+            the user can supply a client id their provider issued them. */}
+        {(formType === 'http' || formType === 'sse') && (
+          <div className="mcp-form-group mb-6">
+            <label
+              htmlFor="mcp-oauth-client-id"
+              className="block mb-2 font-medium text-sm text-[var(--nim-text)]"
+            >
+              OAuth Client ID
+            </label>
+            <input
+              id="mcp-oauth-client-id"
+              ref={clientIdInputRef}
+              type="text"
+              value={formOAuth?.staticClientInfo?.client_id ?? ''}
+              onChange={(e) => updateStaticClientId(e.target.value)}
+              onBlur={isExistingServer ? autoSave : undefined}
+              placeholder="Only needed if the provider issued you one"
+              className="mcp-oauth-client-id w-full px-3 py-2 border border-[var(--nim-border)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] text-sm"
+            />
+            <div className="mcp-form-hint mt-1 text-xs text-[var(--nim-text-faint)]">
+              Leave this empty unless authorization fails because the provider does not support
+              dynamic client registration. Then paste the client ID the provider issued you.
+            </div>
+          </div>
+        )}
+
         {/* Additional env vars (not in required section) */}
         {!readonly && (
           <div className="mcp-form-group mb-6">
@@ -2422,6 +2506,18 @@ function MCPServersPanelInner({ scope = 'user', workspacePath }: MCPServersPanel
                     <span key={id} className="w-9 text-center text-[10px] font-medium text-[var(--nim-text-faint)]">{PROVIDER_LABELS[id]}</span>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/*
+              NIM-2372: the Claude column is no longer a Nimbalyst-private switch.
+              Turning a server off writes Claude Code's own `disabledMcpServers`
+              for this project, which its CLI reads too. Say so rather than
+              letting the user discover it in a terminal.
+            */}
+            {servers.length > 0 && visibleMcpProviders.includes(MCP_PROVIDER_IDS.CLAUDE_AGENT) && (
+              <div className="mcp-claude-scope-note px-4 py-2 border-b border-[var(--nim-border)] text-[0.6875rem] leading-snug text-[var(--nim-text-faint)] select-text">
+                Turning a server off for Claude also turns it off for the <code>claude</code> CLI in this project — Nimbalyst writes Claude Code&apos;s own disabled-server list instead of overriding its configuration.
               </div>
             )}
 

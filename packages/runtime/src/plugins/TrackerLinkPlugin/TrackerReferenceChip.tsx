@@ -3,13 +3,15 @@
  *
  * Shows the item's type, reference key, LIVE title, workflow state, and owner,
  * resolved from the canonical runtime tracker store. Clicking opens a hover-card
- * preview popover (floating-ui) with a "Go to item" action.
+ * preview popover (floating-ui) with a "Go to item" action. Inside a typed
+ * page's body (see `trackerReferenceSource.ts`) hovering opens it too, and the
+ * card offers the named relations allowed between the two types.
  *
  * When the key can't be resolved, it degrades to a muted chip showing just the
  * key — it never throws and never blocks rendering.
  */
 
-import type { JSX } from 'react';
+import type { JSX, MouseEvent as ReactMouseEvent } from 'react';
 import * as React from 'react';
 import {
   useFloating,
@@ -19,10 +21,28 @@ import {
   autoUpdate,
   FloatingPortal,
   useClick,
+  useHover,
+  safePolygon,
   useDismiss,
   useRole,
   useInteractions,
 } from '@floating-ui/react';
+import { windowControlsClearance } from '../../ui/floating/windowControlsClearance';
+import {
+  globalRegistry,
+  resolveKnownStatusCategory,
+  type StatusCategory,
+} from '@nimbalyst/tracker-schema';
+import { LexicalComposerContext } from '@lexical/react/LexicalComposerContext';
+import { $getNodeByKey } from 'lexical';
+
+import { $isTrackerReferenceNode } from './TrackerReferenceNodeCore';
+import {
+  TrackerReferenceRelationMenu,
+  trackerReferenceRelationLabel,
+  trackerReferenceRelationOptions,
+} from './TrackerReferenceRelationMenu';
+import { useTrackerReferenceSource } from './trackerReferenceSource';
 
 import {
   useResolvedTrackerReference,
@@ -110,24 +130,20 @@ const STATUS_TONES: Record<
   },
 };
 
+/**
+ * Overrides for statuses whose tone the lifecycle category cannot express.
+ *
+ * `in-review` and `blocked` are both `started`, but a reviewer and a blockage
+ * are not the same news, so they keep their own colours. Everything the category
+ * DOES express -- finished, abandoned, not begun -- is deliberately absent:
+ * listing `done` here but not `completed` is precisely how a plan's closing
+ * status ended up rendering as neutral.
+ */
 const STATUS_TONE_BY_VALUE: Record<string, StatusTone> = {
-  'to-do': 'to-do',
-  draft: 'to-do',
-  'ready-for-development': 'to-do',
-  'in-progress': 'in-progress',
-  'in-development': 'in-progress',
   'in-review': 'in-review',
-  done: 'completed',
-  completed: 'completed',
-  implemented: 'completed',
-  decided: 'completed',
   blocked: 'blocked',
-  rejected: 'blocked',
   proposed: 'informational',
   'in-discussion': 'informational',
-  superseded: 'neutral',
-  "won't-fix": 'neutral',
-  'wont-fix': 'neutral',
 };
 
 // Transcript markdown can remount a link renderer during routine message
@@ -136,11 +152,31 @@ const STATUS_TONE_BY_VALUE: Record<string, StatusTone> = {
 // leaking across messages or duplicate references.
 const previewOpenKeysByHost = new WeakMap<HTMLElement, Set<string>>();
 
+/** Tone for a status the type's schema categorises. */
+const TONE_BY_CATEGORY: Record<StatusCategory, StatusTone> = {
+  backlog: 'to-do',
+  unstarted: 'to-do',
+  started: 'in-progress',
+  done: 'completed',
+  cancelled: 'neutral',
+};
+
 function getStatusPresentation(
   normalizedStatus: string | undefined,
+  type: string | undefined,
 ): StatusPresentation | null {
   if (!normalizedStatus) return null;
-  const tone = STATUS_TONE_BY_VALUE[normalizedStatus] ?? 'neutral';
+  // The per-value table still wins where it says something the category cannot:
+  // `in-review` and `blocked` are both `started`, but they deserve their own
+  // colours. Everything else derives from the schema, so a type that closes on
+  // `completed` or `implemented` reads as finished without being listed here.
+  //
+  // Deliberately the KNOWN category, not the resolved one: a status this install
+  // has never heard of stays neutral. Painting it as in-progress would state
+  // something about it that nobody has said.
+  const category = resolveKnownStatusCategory(type ?? '', normalizedStatus);
+  const tone = STATUS_TONE_BY_VALUE[normalizedStatus]
+    ?? (category ? TONE_BY_CATEGORY[category] : 'neutral');
   return {
     ...STATUS_TONES[tone],
     label: displayLabel(normalizedStatus),
@@ -208,19 +244,36 @@ function MetadataBadge({
 export interface TrackerReferenceChipProps {
   referenceKey: string;
   nodeKey?: string;
+  /** Predicate id of the relation the link states; null for a plain link. */
+  relation?: string | null;
   /** Stable per-renderer identity used to preserve an open transcript card. */
   previewStateKey?: string;
   /** Compact chips omit the live title while retaining preview and navigation. */
   variant?: 'default' | 'compact';
+  /** Host-provided label while this renderer has no local tracker record. */
+  unresolvedLabel?: string;
+  /**
+   * Host navigation override.
+   *
+   * Dedicated windows without a local tracker store use this to hand the
+   * reference back to the desktop router. Receiving `null` is intentional:
+   * the host can still route the stable reference key to the owning workspace.
+   */
+  onNavigate?: (resolved: ResolvedTrackerReference | null) => void;
 }
 
 export function TrackerReferenceChip({
   referenceKey,
   nodeKey,
+  relation = null,
   previewStateKey,
   variant = 'default',
+  unresolvedLabel,
+  onNavigate,
 }: TrackerReferenceChipProps): JSX.Element {
   const resolved = useResolvedTrackerReference(referenceKey);
+  const source = useTrackerReferenceSource();
+  const editor = React.useContext(LexicalComposerContext)?.[0] ?? null;
   const [open, setOpen] = React.useState(false);
   const referenceHostRef = React.useRef<HTMLElement | null>(null);
   const openStateKey = previewStateKey ?? nodeKey ?? referenceKey;
@@ -245,15 +298,23 @@ export function TrackerReferenceChip({
     open,
     onOpenChange: handleOpenChange,
     placement: 'bottom-start',
-    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
+    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
     whileElementsMounted: autoUpdate,
   });
 
   const click = useClick(context);
+  // Hover only inside a typed page, where the card is where a link's relation
+  // is chosen; elsewhere the preview stays click-to-open.
+  const hover = useHover(context, {
+    enabled: source !== null,
+    delay: { open: 350, close: 150 },
+    handleClose: safePolygon(),
+  });
   const dismiss = useDismiss(context);
   const role = useRole(context, { role: 'dialog' });
   const { getReferenceProps, getFloatingProps } = useInteractions([
     click,
+    hover,
     dismiss,
     role,
   ]);
@@ -275,9 +336,9 @@ export function TrackerReferenceChip({
   );
 
   const normalizedStatus = normalizeStatus(resolved?.status);
-  const statusPresentation = getStatusPresentation(normalizedStatus);
+  const statusPresentation = getStatusPresentation(normalizedStatus, resolved?.type);
   const isCompleted = statusPresentation?.tone === 'completed';
-  const label = resolved?.issueKey ?? referenceKey;
+  const label = resolved?.issueKey ?? unresolvedLabel ?? referenceKey;
   const title = resolved?.title;
   const typeColor = resolved?.type ? getTypeColor(resolved.type) : undefined;
   const typeIcon = resolved?.type ? getTypeIcon(resolved.type) : undefined;
@@ -292,7 +353,32 @@ export function TrackerReferenceChip({
     ? `${label}${resolved.status ? ` · ${resolved.status}` : ''}${
         resolved.title ? ` — ${resolved.title}` : ''
       }`
-    : `${label} (not resolved)`;
+    : `${label} (not resolved locally)`;
+  const relationLabel = relation
+    ? trackerReferenceRelationLabel(globalRegistry, relation)
+    : undefined;
+
+  let relationMenu: JSX.Element | null = null;
+  if (open && source && resolved?.type && resolved.id !== source.itemId) {
+    const canChoose = Boolean(editor && nodeKey && editor.isEditable());
+    relationMenu = (
+      <TrackerReferenceRelationMenu
+        options={trackerReferenceRelationOptions(globalRegistry, source.type, resolved.type)}
+        relation={relation}
+        relationLabel={relationLabel}
+        onChoose={
+          canChoose && editor && nodeKey
+            ? next => {
+                editor.update(() => {
+                  const node = $getNodeByKey(nodeKey);
+                  if ($isTrackerReferenceNode(node)) node.setRelation(next);
+                });
+              }
+            : undefined
+        }
+      />
+    );
+  }
 
   return (
     <>
@@ -307,7 +393,8 @@ export function TrackerReferenceChip({
         data-completed={isCompleted ? 'true' : 'false'}
         data-type={resolved?.type}
         data-owner={resolved?.owner}
-        title={tooltip}
+        data-relation={relation ?? undefined}
+        title={relationLabel ? `${relationLabel}: ${tooltip}` : tooltip}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -434,12 +521,17 @@ export function TrackerReferenceChip({
             <TrackerReferencePreview
               referenceKey={referenceKey}
               resolved={resolved}
-              onGoTo={() => {
-                if (resolved) {
-                  navigateToTrackerReference(resolved);
-                }
-                handleOpenChange(false);
-              }}
+              displayLabel={label}
+              relationMenu={relationMenu}
+              onGoTo={
+                resolved || onNavigate
+                  ? (event: ReactMouseEvent) => {
+                      if (onNavigate) onNavigate(resolved);
+                      else if (resolved) navigateToTrackerReference(resolved, { fromPage: true, newTab: event.metaKey || event.ctrlKey });
+                      handleOpenChange(false);
+                    }
+                  : undefined
+              }
             />
           </div>
         </FloatingPortal>
@@ -451,12 +543,16 @@ export function TrackerReferenceChip({
 interface TrackerReferencePreviewProps {
   referenceKey: string;
   resolved: ResolvedTrackerReference | null;
-  onGoTo: () => void;
+  displayLabel: string;
+  relationMenu?: JSX.Element | null;
+  onGoTo?: (event: ReactMouseEvent) => void;
 }
 
 function TrackerReferencePreview({
   referenceKey,
   resolved,
+  displayLabel: unresolvedDisplayLabel,
+  relationMenu,
   onGoTo,
 }: TrackerReferencePreviewProps): JSX.Element {
   const typeColor = resolved?.type
@@ -595,34 +691,54 @@ function TrackerReferencePreview({
                 : 'Update time unavailable'}
               {resolved.owner ? ` · ${resolved.owner}` : ''}
             </div>
-            <button
-              type="button"
-              onClick={onGoTo}
-              style={{
-                marginLeft: 'auto',
-                flexShrink: 0,
-                fontSize: '11px',
-                fontWeight: 600,
-                padding: '5px 10px',
-                borderRadius: '6px',
-                border: '1px solid var(--nim-border)',
-                background: 'var(--nim-bg-secondary)',
-                color: 'var(--nim-text)',
-                cursor: 'pointer',
-              }}
-            >
-              Go to item
-            </button>
+            {onGoTo ? <GoToItemButton onClick={onGoTo} /> : null}
           </div>
+          {relationMenu}
         </>
       ) : (
         <div style={{ color: 'var(--nim-text-muted)' }}>
           <div style={{ fontWeight: 600, marginBottom: '4px' }}>
-            {referenceKey}
+            {unresolvedDisplayLabel}
           </div>
           <div>This tracker item couldn’t be resolved in this workspace.</div>
+          {onGoTo ? (
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                marginTop: '10px',
+                paddingTop: '10px',
+                borderTop: '1px solid var(--nim-border)',
+              }}
+            >
+              <GoToItemButton onClick={onGoTo} />
+            </div>
+          ) : null}
         </div>
       )}
     </div>
+  );
+}
+
+function GoToItemButton({ onClick }: { onClick: (event: ReactMouseEvent) => void }): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        marginLeft: 'auto',
+        flexShrink: 0,
+        fontSize: '11px',
+        fontWeight: 600,
+        padding: '5px 10px',
+        borderRadius: '6px',
+        border: '1px solid var(--nim-border)',
+        background: 'var(--nim-bg-secondary)',
+        color: 'var(--nim-text)',
+        cursor: 'pointer',
+      }}
+    >
+      Go to item
+    </button>
   );
 }

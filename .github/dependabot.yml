@@ -1,0 +1,23 @@
+version: 2
+
+# Security updates only. `open-pull-requests-limit: 0` is GitHub's documented
+# mechanism for disabling routine *version* updates for an ecosystem while
+# leaving Dependabot *security* updates active. Without an entry here, security
+# PRs are opened ungrouped -- one per advisory per manifest -- which in a
+# 13-workspace monorepo is the PR volume that gets a bot ignored.
+updates:
+  # Root pnpm workspace (Dependabot's `npm` ecosystem also handles pnpm). One
+  # pnpm-lock.yaml covers every project listed in pnpm-workspace.yaml,
+  # including @nimbalyst/memory-engine, which used to sit outside the npm
+  # workspaces and needed its own entry, and packages/browser-extension and
+  # packages/cloudflare-sandbox, which used to keep separate npm lockfiles.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - '*'

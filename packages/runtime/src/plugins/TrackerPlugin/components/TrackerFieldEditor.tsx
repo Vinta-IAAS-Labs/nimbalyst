@@ -5,14 +5,35 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
-import type { FieldDefinition, UrlFieldValue } from '../models/TrackerDataModel';
+import type { FieldDefinition, UrlFieldValue } from '@nimbalyst/tracker-schema';
 import { CustomSelect } from './CustomSelect';
 import { UserAvatar } from './UserAvatar';
 import { getInitials, stringToColor } from './trackerColumns';
+import { formatLocalDateOnly, parseDate } from '../models/dateUtils';
 import { RelationshipFieldEditor, type RelationshipCandidate } from './RelationshipFieldEditor';
+import type { CitationInspectorHost } from './CitationInspector';
+
+/**
+ * Lazy on purpose. The citation editor and its inspector pull `@floating-ui/react`
+ * (about 24 KB gzip), and this module is eager in the web console's `trackers-ui`
+ * entry. A `citation` field only exists on schemas that opted into the knowledge
+ * kinds, so making every tracker surface pay for the popover at load is the
+ * wrong trade -- the collab bundle's eager-graph check caught it as a static
+ * import that should not have been one.
+ */
+const CitationFieldEditor = React.lazy(() =>
+  import('./CitationFieldEditor').then((module) => ({ default: module.CitationFieldEditor })),
+);
+
+/** Lazy for the same reason: only a type that carries labels has a `label-ref` field. */
+const LabelRefPicker = React.lazy(() =>
+  import('./LabelRefPicker').then((module) => ({ default: module.LabelRefPicker })),
+);
 
 /** Team member info for user picker dropdown */
 export interface TeamMemberOption {
+  /** Stable organization member id, when the roster provider exposes it. */
+  memberId?: string;
   email: string;
   name?: string;
 }
@@ -29,6 +50,19 @@ export interface TrackerFieldEditorProps {
   relationshipCandidates?: RelationshipCandidate[];
   /** Open a related tracker item (relationship pill click). */
   onOpenRelationship?: (itemId: string) => void;
+  /**
+   * Item lookup and exact-revision read for `citation` fields. Injected rather
+   * than imported because the data source lives in a package that depends on
+   * this one. Absent on a host with no citation support: the field then renders
+   * read-only chips with no inspector rather than pretending to have resolved
+   * the evidence.
+   */
+  citationHost?: CitationInspectorHost;
+  /**
+   * Render the field-name label above the control. Surfaces that already name
+   * the field (the chip popover header) turn this off to avoid saying it twice.
+   */
+  showLabel?: boolean;
 }
 
 const labelClasses = "text-[11px] font-medium text-[var(--nim-text-muted)] uppercase tracking-[0.5px]";
@@ -48,18 +82,17 @@ function formatFieldLabel(name: string): string {
 /**
  * Format a datetime value for read-only display.
  * Shows relative date (e.g. "Mar 14, 2026") with full timestamp on hover.
+ *
+ * Parses through `parseDate` rather than `new Date`: a `date` field holds a
+ * calendar day (`YYYY-MM-DD`), and bare `new Date` reads that as UTC midnight,
+ * which renders as the previous day anywhere west of Greenwich (nimbalyst#1135).
  */
 export function formatDateTimeDisplay(value: any): { display: string; title: string } {
   if (!value) return { display: '--', title: '' };
 
-  let date: Date;
-  if (value instanceof Date) {
-    date = value;
-  } else {
-    date = new Date(String(value));
-  }
+  const date = parseDate(value);
 
-  if (isNaN(date.getTime())) return { display: String(value), title: '' };
+  if (!date) return { display: String(value), title: '' };
 
   const display = date.toLocaleDateString(undefined, {
     month: 'short',
@@ -89,11 +122,18 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
   teamMembers,
   relationshipCandidates,
   onOpenRelationship,
+  citationHost,
+  showLabel = true,
 }) => {
   const fieldId = `field-${field.name}`;
-  const label = formatFieldLabel(field.name);
+  // A field a label brought carries its property's own label.
+  const label = (field as { displayLabel?: string }).displayLabel || formatFieldLabel(field.name);
   // Field type is authoritative from the schema definition
   const effectiveType = field.type;
+
+  const renderLabel = (htmlFor?: string): React.ReactNode => showLabel
+    ? <label htmlFor={htmlFor} className={labelClasses}>{label}</label>
+    : null;
 
   const wrapperClasses = layout === 'horizontal'
     ? "flex flex-row items-center gap-2 min-w-[120px]"
@@ -104,7 +144,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     const { display, title } = formatDateTimeDisplay(value);
     return (
       <div className={wrapperClasses}>
-        <label className={labelClasses}>{label}</label>
+        {renderLabel()}
         <span
           className="text-[13px] text-[var(--nim-text-muted)] py-1.5"
           title={title}
@@ -119,7 +159,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'select':
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <CustomSelect
             value={value || field.default || ''}
             options={field.options || []}
@@ -136,7 +176,9 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
         return (
           <div className={`${wrapperClasses} status-bar-field-slider`}>
             <div className="slider-header flex justify-between items-center gap-2 mb-1 w-full">
-              <label htmlFor={fieldId} className={`${labelClasses} flex-1 mb-0`}>{label}</label>
+              {showLabel && (
+                <label htmlFor={fieldId} className={`${labelClasses} flex-1 mb-0`}>{label}</label>
+              )}
               <input
                 type="number"
                 className="w-[60px] py-1 px-2 border border-[var(--nim-border)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] text-[13px] font-semibold font-inherit text-center transition-colors duration-200 focus:outline-none focus:border-[var(--nim-primary)] focus:shadow-[0_0_0_2px_rgba(59,130,246,0.1)]"
@@ -166,7 +208,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
 
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <input
             id={fieldId}
             type="number"
@@ -184,14 +226,11 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'datetime': {
       let dateValue = value || '';
       if (value instanceof Date && !isNaN(value.getTime())) {
-        const y = value.getFullYear();
-        const m = String(value.getMonth() + 1).padStart(2, '0');
-        const d = String(value.getDate()).padStart(2, '0');
-        dateValue = `${y}-${m}-${d}`;
+        dateValue = formatLocalDateOnly(value);
       }
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <input
             id={fieldId}
             type="date"
@@ -206,7 +245,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'text':
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <textarea
             id={fieldId}
             className={`${inputClasses} min-h-[80px] resize-y`}
@@ -220,7 +259,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'user':
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <UserFieldInput
             value={value || ''}
             onChange={onChange}
@@ -233,7 +272,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'string':
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <input
             id={fieldId}
             type="text"
@@ -246,9 +285,29 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
       );
 
     case 'array':
+      if (
+        field.itemType === 'object'
+        || (Array.isArray(value) && value.some((entry) => entry !== null && typeof entry === 'object'))
+      ) {
+        const displayValue = Array.isArray(value) && value.length > 0
+          ? value.map((entry) => (
+              entry !== null && typeof entry === 'object'
+                ? JSON.stringify(entry)
+                : String(entry)
+            )).join(', ')
+          : '--';
+        return (
+          <div className={wrapperClasses}>
+            {renderLabel()}
+            <span className="text-[13px] text-[var(--nim-text-muted)] py-1.5">
+              {displayValue}
+            </span>
+          </div>
+        );
+      }
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <TagChipsInput
             value={Array.isArray(value) ? value : []}
             onChange={onChange}
@@ -259,7 +318,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'url':
       return (
         <div className={wrapperClasses}>
-          <label htmlFor={fieldId} className={labelClasses}>{label}</label>
+          {renderLabel(fieldId)}
           <UrlFieldInput
             id={fieldId}
             value={value}
@@ -289,7 +348,7 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
     case 'reference':
       return (
         <div className={wrapperClasses}>
-          <label className={labelClasses}>{label}</label>
+          {renderLabel()}
           <RelationshipFieldEditor
             field={field}
             value={value}
@@ -298,6 +357,36 @@ export const TrackerFieldEditor: React.FC<TrackerFieldEditorProps> = ({
             onOpenItem={onOpenRelationship}
             readOnly={field.readOnly}
           />
+        </div>
+      );
+
+    case 'citation':
+      return (
+        <div className={wrapperClasses}>
+          {renderLabel()}
+          <React.Suspense fallback={<span className="citation-field-loading text-[12px] text-[var(--nim-text-muted)]">Loading citations...</span>}>
+            <CitationFieldEditor
+              field={field}
+              value={value}
+              onChange={onChange}
+              // A host with no citation support still renders the chips, so the
+              // evidence is visible; it just cannot resolve or pin anything.
+              host={citationHost ?? { lookupItem: () => null }}
+              candidates={relationshipCandidates}
+              onOpenItem={onOpenRelationship}
+              readOnly={field.readOnly || !citationHost}
+            />
+          </React.Suspense>
+        </div>
+      );
+
+    case 'label-ref':
+      return (
+        <div className={wrapperClasses}>
+          {renderLabel()}
+          <React.Suspense fallback={null}>
+            <LabelRefPicker value={value} onChange={onChange} readOnly={field.readOnly} />
+          </React.Suspense>
         </div>
       );
 

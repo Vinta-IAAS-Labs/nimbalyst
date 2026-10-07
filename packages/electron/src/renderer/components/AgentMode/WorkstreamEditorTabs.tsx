@@ -14,9 +14,10 @@ import React, { useCallback, useRef, forwardRef, useImperativeHandle, useEffect 
 import { useAtomValue, useSetAtom } from 'jotai';
 import { store } from '@nimbalyst/runtime/store';
 import { TabsProvider, useTabs, useTabsActions, useTabNavigationShortcuts } from '../../contexts/TabsContext';
+import { useNavigationDialogs } from '../../dialogs/useNavigationDialogs';
 import { TabManager } from '../TabManager/TabManager';
 import { TabContent } from '../TabContent/TabContent';
-import { setSessionTabCountAtom } from '../../store';
+import { setSessionTabCountAtom } from '../../store/atoms/sessionEditors';
 import {
   workstreamStateAtom,
   workstreamStatesLoadedAtom,
@@ -28,10 +29,25 @@ import {
   type WorkstreamResource,
 } from '../../store/atoms/workstreamState';
 import { fileDeletedAtomFamily } from '../../store/atoms/fileWatch';
+import {
+  FEEDBACK_REQUEST_OPEN_EVENT,
+  feedbackRequestResourceForTab,
+  feedbackRequestTabUri,
+  isFeedbackRequestTab,
+} from '../FeedbackRequest/feedbackRequestTab';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { FilePlacementControl, FilePlacementNotice } from './FilePlacementControl';
+import { agentFilePlacementAtom } from '../../store/atoms/agentFilePlacement';
+import { revealWorkstreamEditorAtom } from '../../store/atoms/agentFileViewer';
 import { shouldSkipResourceMirror } from './workstreamTabsMirror';
+import {
+  revealEditorPosition,
+  type EditorRevealPosition,
+} from '../TabEditor/editorRevealCommand';
 
 export interface WorkstreamEditorTabsRef {
-  openFile: (filePath: string) => void;
+  /** `location` scrolls the editor to a line once it mounts. */
+  openFile: (filePath: string, location?: EditorRevealPosition) => void;
   /** Open (or focus) a tracker item as a workstream resource tab. */
   openTracker: (trackerItemId: string) => void;
   hasTabs: () => boolean;
@@ -48,6 +64,7 @@ interface WorkstreamEditorTabsProps {
   isActive?: boolean;
   onSwitchToAgentMode?: (planDocumentPath?: string, sessionId?: string) => void;
   onOpenSessionInChat?: (sessionId: string) => void;
+  onBeforeMove?: () => void;
   onTabDoubleClick?: (tabId: string) => void; // Double-click a tab (e.g. maximize editor)
 }
 
@@ -62,12 +79,16 @@ interface WorkstreamEditorTabsInnerProps {
   isActive: boolean;
   onSwitchToAgentMode?: (planDocumentPath?: string, sessionId?: string) => void;
   onOpenSessionInChat?: (sessionId: string) => void;
+  onBeforeMove?: () => void;
   onTabDoubleClick?: (tabId: string) => void;
 }
 
 const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, WorkstreamEditorTabsInnerProps>(
-  function WorkstreamEditorTabsInner({ workstreamId, workspacePath, basePath, isActive, onSwitchToAgentMode, onOpenSessionInChat, onTabDoubleClick }, ref) {
+  function WorkstreamEditorTabsInner({ workstreamId, workspacePath, basePath, isActive, onSwitchToAgentMode, onOpenSessionInChat, onTabDoubleClick, onBeforeMove }, ref) {
     const { tabs, activeTabId } = useTabs();
+    const filePlacement = useAtomValue(agentFilePlacementAtom);
+    const revealEditor = useSetAtom(revealWorkstreamEditorAtom);
+    const { openQuickOpen } = useNavigationDialogs();
     const tabsActions = useTabsActions();
     useTabNavigationShortcuts(isActive);
     const setTabCount = useSetAtom(setSessionTabCountAtom);
@@ -103,8 +124,8 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       // console.log('[WorkstreamEditorTabs] Starting restore for workstream:', workstreamId);
 
       // Restore from workstream state (unified source of truth). Project ALL
-      // typed resources into the live TabsContext: files use their path as the
-      // tab key, trackers use their `tracker://<id>` resource id. The active
+      // typed resources into the live TabsContext keyed by resource id: a file
+      // path, a `tracker://<id>`, or a feedback request's tab uri. The active
       // resource id maps directly to the restored tab's path (resource id).
       const { openResources, activeResourceId } = workstreamState;
       // console.log('[WorkstreamEditorTabs] Restoring resources:', openResources.length, 'active:', activeResourceId);
@@ -112,9 +133,7 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       if (openResources.length > 0) {
         pendingSeedCountRef.current = openResources.length;
         for (const tab of openResources) {
-          const r = tab.resource;
-          const tabKey = r.kind === 'tracker' ? trackerResourceId(r.trackerItemId) : r.filePath;
-          tabsActions.addTab(tabKey);
+          tabsActions.addTab(tab.resource.resourceId);
         }
 
         // Switch to the active resource (resource id == tab filePath key).
@@ -133,6 +152,7 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
 
     // Sync tab count to Jotai atom and persist tabs when they change
     useEffect(() => {
+      if (restoreStateRef.current === 'pending') return;
       // console.log('[WorkstreamEditorTabs] Persist effect running, tabs:', tabs.length, 'restoreState:', restoreStateRef.current);
 
       if (tabs.length !== prevTabCountRef.current) {
@@ -154,14 +174,16 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       }
 
       // Always sync to workstream state atom (even during restore). This
-      // component projects BOTH file and tracker tabs into TabsContext, so it
-      // owns the whole ordered resource set. Map each live tab back to a typed
-      // resource, preserving order; the active resource id is the active tab's
-      // key (file path or tracker://<id>).
+      // component projects every kind of tab into TabsContext, so it owns the
+      // whole ordered resource set. Map each live tab back to a typed resource,
+      // preserving order; the active resource id is the active tab's key (file
+      // path, tracker://<id>, or a feedback request's tab uri). Typing the
+      // feedback request rather than letting it fall through as a file is what
+      // keeps the tab uri out of the workstream's "current file".
       const resources: WorkstreamResource[] = tabs.map((t) =>
         t.kind === 'tracker' && t.trackerItemId
           ? trackerResource(t.trackerItemId)
-          : fileResource(t.filePath)
+          : (feedbackRequestResourceForTab(t.filePath) ?? fileResource(t.filePath))
       );
       const activeResourceId = activeTabId
         ? tabs.find((t) => t.id === activeTabId)?.filePath || null
@@ -185,6 +207,8 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
         if (!detail || detail.workstreamId !== workstreamId) return;
         const trackerItemId = detail.trackerItemId;
         if (typeof trackerItemId !== 'string') return;
+        e.preventDefault();
+        revealEditor(workstreamId);
         const key = trackerResourceId(trackerItemId);
         const existing = tabsActions.findTabByPath(key);
         if (existing) {
@@ -195,7 +219,31 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       };
       window.addEventListener('nimbalyst:workstream-open-tracker', handler);
       return () => window.removeEventListener('nimbalyst:workstream-open-tracker', handler);
-    }, [workstreamId, tabsActions]);
+    }, [workstreamId, tabsActions, revealEditor]);
+
+    // Same imperative open for a feedback request's results, and for the same
+    // reason: the author comes back to a request long after the turn that sent
+    // it, so it is a tab rather than a message. An open that arrives while this
+    // strip is unmounted takes the other path — it seeds the workstream's
+    // resources and the restore above projects it.
+    useEffect(() => {
+      const handler = (e: Event) => {
+        const detail = (e as CustomEvent).detail;
+        if (!detail || detail.workstreamId !== workstreamId) return;
+        if (typeof detail.orgId !== 'string' || typeof detail.requestId !== 'string') return;
+        e.preventDefault();
+        revealEditor(workstreamId);
+        const key = feedbackRequestTabUri({
+          orgId: detail.orgId,
+          requestId: detail.requestId,
+        });
+        const existing = tabsActions.findTabByPath(key);
+        if (existing) tabsActions.switchTab(existing.id);
+        else tabsActions.addTab(key);
+      };
+      window.addEventListener(FEEDBACK_REQUEST_OPEN_EVENT, handler);
+      return () => window.removeEventListener(FEEDBACK_REQUEST_OPEN_EVENT, handler);
+    }, [workstreamId, tabsActions, revealEditor]);
 
 
     // Subscribe to file-deletion atoms for every currently-open tab path so
@@ -208,8 +256,9 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       for (const tab of tabs) {
         const filePath = tab.filePath;
         if (!filePath) continue;
-        // Tracker tabs are not files on disk — no deletion watch.
+        // Tracker and feedback-request tabs are not files on disk — no deletion watch.
         if (tab.kind === 'tracker' || isTrackerResourceId(filePath)) continue;
+        if (isFeedbackRequestTab(filePath)) continue;
         const deletedAtom = fileDeletedAtomFamily(filePath);
         const initial = store.get(deletedAtom);
         const unsub = store.sub(deletedAtom, () => {
@@ -227,34 +276,45 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       };
     }, [tabs, tabsActions]);
 
-    // Expose current document path and workspace path to window for plugins (e.g., MockupPlatformService)
+    // Expose current document path and workspace path to window for plugins (e.g., EmbedFrame)
     // This mirrors what EditorMode does, but for workstream editor tabs
     // basePath can be either workspacePath (main project) or worktreePath (for worktree sessions)
     useEffect(() => {
+      if (!isActive) return;
       const activeTab = activeTabId ? tabs.find(t => t.id === activeTabId) : undefined;
-      // Only expose a real file path to plugins; tracker tabs have none.
-      const activeFilePath = activeTab && activeTab.kind !== 'tracker' ? (activeTab.filePath || null) : null;
+      // Only expose a real file path to plugins; tracker and feedback-request
+      // tabs have none.
+      const activeFilePath = activeTab
+        && activeTab.kind !== 'tracker'
+        && !isFeedbackRequestTab(activeTab.filePath)
+        ? (activeTab.filePath || null)
+        : null;
       (window as any).__currentDocumentPath = activeFilePath;
       (window as any).__workspacePath = basePath;
       // Also set the legacy property for compatibility
       (window as any).workspacePath = basePath;
-    }, [activeTabId, tabs, basePath]);
+    }, [activeTabId, tabs, basePath, isActive]);
 
     // Expose methods via ref
     useImperativeHandle(
       ref,
       () => ({
-        openFile: (filePath: string) => {
+        openFile: (filePath: string, location?: EditorRevealPosition) => {
           // Check if tab already exists
           const existing = tabsActions.findTabByPath(filePath);
           if (existing) {
             tabsActions.switchTab(existing.id);
-            return;
+          } else {
+            // Add new tab
+            tabsActions.addTab(filePath);
+            // Workstream state will be synced via the tabs useEffect
           }
 
-          // Add new tab
-          tabsActions.addTab(filePath);
-          // Workstream state will be synced via the tabs useEffect
+          // Queued either way: the registry replays it when the editor for this
+          // path registers, so an already-open tab and a fresh one behave alike.
+          if (location) {
+            revealEditorPosition(filePath, location);
+          }
         },
         openTracker: (trackerItemId: string) => {
           // Tracker tabs use `tracker://<id>` as their tab key so path-based
@@ -271,8 +331,10 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
         getActiveFilePath: () => {
           if (!activeTabId) return null;
           const activeTab = tabs.find((t) => t.id === activeTabId);
-          // Tracker tabs are not files; file consumers should see null.
+          // Tracker and feedback-request tabs are not files; file consumers
+          // should see null.
           if (!activeTab || activeTab.kind === 'tracker') return null;
+          if (isFeedbackRequestTab(activeTab.filePath)) return null;
           return activeTab.filePath || null;
         },
         closeActiveTab: () => {
@@ -301,14 +363,26 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
       // No-op for now - files are opened via file clicks
     }, []);
 
-    // Don't render anything if no tabs
-    if (tabs.length === 0) {
-      return null;
-    }
+    const handleOpenFile = () => {
+      openQuickOpen({
+        workspacePath: basePath,
+        onFileSelect: (filePath) => {
+          tabsActions.addTab(filePath);
+          revealEditor(workstreamId);
+        },
+        onSessionSelect: (sessionId) => onOpenSessionInChat?.(sessionId),
+        onPromptSelect: (sessionId) => onOpenSessionInChat?.(sessionId),
+      });
+    };
 
     return (
-      <div className="workstream-editor-tabs flex flex-col h-full overflow-hidden">
-        <div className="workstream-editor-header shrink-0">
+      <div className="workstream-editor-tabs relative flex flex-col h-full overflow-hidden">
+        {filePlacement === 'right' && <div className="workstream-file-viewer-heading flex items-center gap-2 px-3 h-8 shrink-0 border-b border-nim text-xs text-nim-muted">
+          <MaterialSymbol icon="description" size={16} /> File viewer
+          {tabs.length > 0 && <button type="button" className="ml-auto cursor-pointer hover:text-nim" title="Maximize or restore file viewer" onClick={() => onTabDoubleClick?.(activeTabId ?? '')}><MaterialSymbol icon="fullscreen" size={16} /></button>}
+        </div>}
+        <div className="workstream-editor-header flex items-center shrink-0 border-b border-nim">
+          <div className="flex-1 min-w-0">
           <TabManager
             onTabClose={handleTabClose}
             onNewTab={handleNewTab}
@@ -318,8 +392,15 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
           >
             <></>
           </TabManager>
+          </div>
+          <FilePlacementControl workstreamId={workstreamId} onBeforeMove={onBeforeMove} />
         </div>
-        <div className="workstream-editor-tabs-content flex-1 min-h-0 overflow-hidden">
+        {tabs.length === 0 && <div className="workstream-file-viewer-empty flex-1 flex flex-col items-center justify-center gap-3 p-4 text-center text-sm text-nim-muted">
+          <span>Open a file to view it here</span>
+          <button type="button" className="rounded border border-nim px-3 py-1.5 cursor-pointer hover:bg-nim-hover text-nim" onClick={handleOpenFile}>Open file…</button>
+        </div>}
+        <FilePlacementNotice />
+        <div className="workstream-editor-tabs-content flex-1 min-h-0 overflow-hidden" style={{ display: tabs.length ? undefined : 'none' }}>
           <TabContent
             workspaceId={basePath}
             workstreamId={workstreamId}
@@ -343,14 +424,14 @@ const WorkstreamEditorTabsInner = forwardRef<WorkstreamEditorTabsRef, Workstream
  * the workstreamState atom (workstreamStates workspace-state key).
  */
 export const WorkstreamEditorTabs = forwardRef<WorkstreamEditorTabsRef, WorkstreamEditorTabsProps>(
-  function WorkstreamEditorTabs({ workstreamId, workspacePath, basePath, isActive = true, onSwitchToAgentMode, onOpenSessionInChat, onTabDoubleClick }, ref) {
+  function WorkstreamEditorTabs({ workstreamId, workspacePath, basePath, isActive = true, onSwitchToAgentMode, onOpenSessionInChat, onTabDoubleClick, onBeforeMove }, ref) {
     const innerRef = useRef<WorkstreamEditorTabsRef>(null);
     // Use basePath if provided, otherwise fall back to workspacePath
     const effectiveBasePath = basePath || workspacePath;
 
     // Forward ref to inner component
     useImperativeHandle(ref, () => ({
-      openFile: (filePath: string) => innerRef.current?.openFile(filePath),
+      openFile: (filePath: string, location?: EditorRevealPosition) => innerRef.current?.openFile(filePath, location),
       openTracker: (trackerItemId: string) => innerRef.current?.openTracker(trackerItemId),
       hasTabs: () => innerRef.current?.hasTabs() ?? false,
       getActiveFilePath: () => innerRef.current?.getActiveFilePath() ?? null,
@@ -369,6 +450,7 @@ export const WorkstreamEditorTabs = forwardRef<WorkstreamEditorTabsRef, Workstre
           onSwitchToAgentMode={onSwitchToAgentMode}
           onOpenSessionInChat={onOpenSessionInChat}
           onTabDoubleClick={onTabDoubleClick}
+          onBeforeMove={onBeforeMove}
         />
       </TabsProvider>
     );

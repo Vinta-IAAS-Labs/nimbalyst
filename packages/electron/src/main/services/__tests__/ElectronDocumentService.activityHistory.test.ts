@@ -30,8 +30,14 @@ vi.mock('../../utils/store', () => ({
   isAnalyticsEnabled: () => true,
 }));
 
-vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () => ({
-  globalRegistry: { get: vi.fn(() => undefined) },
+vi.mock('../../../../../tracker-schema/src/TrackerDataModel', () => ({
+  globalRegistry: {
+    get: vi.fn(() => undefined),
+    // The policy resolver reads by explicit workspace (NIM-3702). Returning
+    // undefined here keeps these rows on the builtin/caller policy path.
+    getForWorkspace: vi.fn(() => undefined),
+    hasWorkspaceLayer: () => true,
+  },
 }));
 
 import { ElectronDocumentService } from '../ElectronDocumentService';
@@ -56,7 +62,7 @@ function nativeRow(data: Record<string, unknown>) {
 }
 
 function installStatefulTrackerRow(initialData: Record<string, unknown>) {
-  const state: { row: ReturnType<typeof nativeRow> & { content?: string | null } } = {
+  const state: { row: ReturnType<typeof nativeRow> & { content?: unknown } } = {
     row: nativeRow(initialData),
   };
   mockQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
@@ -135,6 +141,40 @@ describe('direct UI tracker activity history', () => {
       action: 'updated',
       field: 'content',
     });
+  });
+
+  it('does not persist an identical body as a content edit', async () => {
+    const content = { root: { type: 'root', children: [] } };
+    const state = installStatefulTrackerRow({
+      title: 'Example bug',
+      status: 'to-do',
+      activity: [],
+    });
+    state.row.content = JSON.stringify(content);
+    state.row.body_version = 4;
+
+    await service.updateTrackerItemContent('bug-1', content);
+
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(state.row.body_version).toBe(4);
+    expect(JSON.parse(state.row.data).activity).toEqual([]);
+  });
+
+  it('does not persist an identical body returned as decoded JSONB', async () => {
+    const content = '# Existing tracker body';
+    const state = installStatefulTrackerRow({
+      title: 'Example bug',
+      status: 'to-do',
+      activity: [],
+    });
+    state.row.content = content;
+    state.row.body_version = 7;
+
+    await service.updateTrackerItemContent('bug-1', content);
+
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(state.row.body_version).toBe(7);
+    expect(JSON.parse(state.row.data).activity).toEqual([]);
   });
 
   it('records attributed before/after history for archive changes', async () => {

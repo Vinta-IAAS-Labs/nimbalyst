@@ -1,10 +1,13 @@
+// @vitest-environment node
+
 import { describe, expect, it, vi } from 'vitest';
 
 // SettingsControlService imports from many other modules (electron, store,
 // StytchAuthService, WindowManager). For these invariants we only need the
 // exported constants, so stub the heavy modules to keep the test fast.
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
+  app: (await import('../../../../test-stubs/privateUserData')).testApp,
   BrowserWindow: { getAllWindows: () => [] },
 }));
 
@@ -45,6 +48,9 @@ vi.mock('../SessionNamingService', () => ({
   },
 }));
 
+const setTrackerIssueKeyPrefix = vi.hoisted(() => vi.fn().mockResolvedValue({ success: true }));
+vi.mock('../TrackerSyncManager', () => ({ setTrackerIssueKeyPrefix }));
+
 vi.mock('../../theme/ThemeManager', () => ({
   updateNativeTheme: vi.fn(),
   updateWindowTitleBars: vi.fn(),
@@ -79,6 +85,31 @@ import {
   DENIED_APP_KEYS,
   SettingsControlService,
 } from '../SettingsControlService';
+import { getWorkspaceState, type WorkspaceState } from '../../utils/store';
+
+describe('SettingsControlService permission diagnostics', () => {
+  it.each([
+    [{ permissionMode: 'bypass-all', allowAllUsesClassifier: true }, 'Agent-verified', true],
+    [{ permissionMode: 'bypass-all', allowAllUsesClassifier: false }, 'Allow everything', false],
+    [{ permissionMode: 'bypass-all' }, 'Allow everything', false],
+    [{ permissionMode: 'allow-all', allowAllUsesClassifier: true }, 'Allow edits only', true],
+    [{ permissionMode: 'ask', allowAllUsesClassifier: true }, 'Ask every time', true],
+    [{ permissionMode: null, allowAllUsesClassifier: true }, 'Untrusted', true],
+    [undefined, 'Untrusted', false],
+  ] as const)('distinguishes the workspace policy for %j', (agentPermissions, agentTrustLabel, allowAllUsesClassifier) => {
+    vi.mocked(getWorkspaceState).mockReturnValueOnce({ agentPermissions } as WorkspaceState);
+
+    expect(SettingsControlService.getInstance().getOverview('/workspace').workspace).toMatchObject({
+      agentPermissionMode: agentPermissions?.permissionMode ?? null,
+      allowAllUsesClassifier,
+      agentTrustLabel,
+    });
+  });
+
+  it('does not invent workspace permissions without a workspace', () => {
+    expect(SettingsControlService.getInstance().getOverview(undefined)).not.toHaveProperty('workspace');
+  });
+});
 
 describe('SettingsControlService allowlist invariants', () => {
   it('does not include any DENIED_APP_KEYS in ALLOWED_APP_KEYS', () => {
@@ -116,6 +147,7 @@ describe('SettingsControlService allowlist invariants', () => {
         'sessionSync',
         'settingsAgentToolsDisabled',
         'spellcheckEnabled',
+        'spellcheckLanguages',
         'theme',
         'voiceMode',
       ].sort(),
@@ -124,7 +156,7 @@ describe('SettingsControlService allowlist invariants', () => {
 
   it('only allows curated workspace-level keys', () => {
     expect([...ALLOWED_WORKSPACE_KEYS].sort()).toEqual(
-      ['agentPermissions', 'issueKeyPrefix', 'trackerSyncPolicies'].sort(),
+      ['agentPermissions', 'issueKeyPrefix'].sort(),
     );
   });
 });
@@ -153,5 +185,24 @@ describe('SettingsControlService.setExtensionEnabled', () => {
       'com.nimbalyst.github-issues-importer',
       expect.anything(),
     );
+  });
+});
+
+describe('SettingsControlService.setIssueKeyPrefix', () => {
+  it('returns the server conflict message instead of persisting a taken prefix', async () => {
+    setTrackerIssueKeyPrefix.mockResolvedValueOnce({
+      success: false,
+      error: 'Prefix NIM is already used by project "Nimbalyst Core". Try NIMA.',
+      suggestedPrefix: 'NIMA',
+    });
+    const result = await SettingsControlService.getInstance().setIssueKeyPrefix('session-prefix', {
+      workspacePath: '/workspace',
+      prefix: 'NIM',
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      message: 'Prefix NIM is already used by project "Nimbalyst Core". Try NIMA.',
+    });
   });
 });

@@ -3,6 +3,7 @@
  */
 
 import { BaseAIProvider } from '../AIProvider';
+import { AgentCapabilities, BUILTIN_AGENT_CAPABILITIES } from '../agentCapabilities';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import {
@@ -205,7 +206,13 @@ export class LMStudioProvider extends BaseAIProvider {
     // Log the input message
     // CRITICAL: Must await to ensure user message is persisted before proceeding
     if (sessionId) {
-      await this.logAgentMessage(sessionId, 'lmstudio', 'input', message);
+      await this.logAgentMessage(
+        sessionId,
+        'lmstudio',
+        'input',
+        message,
+        this.withPromptProvenanceMetadata(documentContext),
+      );
     }
 
     // Use the centralized tool system (OpenAI-compatible format)
@@ -771,6 +778,10 @@ export class LMStudioProvider extends BaseAIProvider {
       resumeSession: false,
       supportsFileTools: false  // Files should be attached to messages, not accessed via tools
     };
+  }
+
+  getAgentCapabilities(): AgentCapabilities {
+    return BUILTIN_AGENT_CAPABILITIES.lmstudio;
   }
 
   destroy(): void {

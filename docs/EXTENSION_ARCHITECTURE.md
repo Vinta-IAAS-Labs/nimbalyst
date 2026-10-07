@@ -640,13 +640,87 @@ All types are exported from `@nimbalyst/extension-sdk`:
 | `ChatCompletionStreamOptions` | Extends options with `onChunk` callback |
 | `ChatCompletionStreamHandle` | Stream control: `abort()`, `result` promise |
 
+## Backend Modules: Tool Callers and Owned AI Sessions
+
+A privileged backend module (`contributions.backendModules`) can start and drive AI agent sessions, learn which session called one of its MCP tools, and expose tools only to its own panel. Types live in `@nimbalyst/extension-sdk` (`packages/extension-sdk/src/types/backendSessions.ts`). Built-in extensions are auto-granted; others see the permissions in the first-use consent prompt.
+
+### Tool call context
+
+A backend method invoked as an MCP tool receives `ctx.call: BackendToolCallContext`:
+
+```typescript
+methods: {
+  crew_flag: async (params, ctx) => {
+    ctx.call?.sessionId;     // calling AI session, or null (panel, voice)
+    ctx.call?.sessionOwner;  // { extensionId, key } only if THIS extension owns that session, else null
+    ctx.call?.caller;        // 'agent' | 'panel' | 'voice'
+  },
+}
+```
+
+The host resolves the context; the module cannot supply it. `ctx.call` is absent for plain RPC calls.
+
+### Panel-only tools
+
+Register a tool with `panelOnly: true` to reach it from the extension's own renderer via `callBackendTool` without offering it to agents. Panel-only tools are left out of the MCP tool list and the voice agent's tools, and an agent that names one gets `Unknown tool`.
+
+### Tool audience
+
+Backend tools default to `audience: 'all'`: every session in the workspace lists them, so an enabled extension's tools cost context in sessions that never use them. Register a tool with `audience: 'owned-sessions'` to list it only to sessions this extension owns (`metadata.sessionOwner.extensionId`, inherited by spawned descendants). The filter runs per session in the extension endpoint's ListTools (`filterBackendToolsForSession` in `mcp/tools/backendToolHandler.ts`); a call from any other session, or from voice, gets `Unknown tool`, and voice never lists it. The extension's own panel can still call it. The `nimbalyst-<ext>` endpoint itself is still configured for every session; with only owned-session tools it lists nothing to the rest.
+
+### Owned sessions (`ctx.services.sessions`)
+
+Requires the `ai-sessions` permission (declared in the module's `permissions`). A session is owned when its `metadata.sessionOwner` is `{ extensionId, key }`. The host writes the owner in the same insert as the row. Sessions an owned session spawns (`spawn_session`, `create_session`, a child created under it in the UI) inherit the owner, but not its `sessionDirective`.
+
+| Method | Notes |
+| --- | --- |
+| `create({ ownerKey, name, provider, model, prompt?, effortLevel?, directive?, workstreamId?, createdBySessionId?, ownerMetadata?, routeChildUpdatesToOwner? })` | `directive` is stored as `metadata.sessionDirective` (appended to the system prompt, frozen at the first turn). It is rejected for providers that never read it: the chat providers (`claude`, `openai`, `lmstudio`), `claude-code-cli`, and extension-contributed agents (`providerAppliesSessionDirective` in `runtime/src/ai/server/agentCapabilities.ts`). `prompt` is queued and dispatched immediately. |
+| `createWorkstream({ ownerKey, name })` | An ordinary `session_type='workstream'` container, owned. |
+| `sendPrompt(sessionId, prompt)` | Queued through the normal prompt queue; delivered when the session is idle. |
+| `getStatus` / `getResult` | Status, pending prompt, queued count; last assistant text and context fill. |
+| `listOwned({ key? })` | Roster with `hasPendingPrompt` and `queuedPromptCount` (unread signals). |
+| `getUsage({ key?, since })` | Session-granular: lifetime usage of owned sessions active at or after `since`. Each entry and the totals carry `inputTokens` (uncached), `outputTokens`, `cacheReadInputTokens`, `cacheCreationInputTokens`, `allTokens` (the sum of those four), `totalTokens` (historical per-provider meaning, see below), and `costUSD`. |
+| `updateOwnerMetadata(sessionId, patch)` | The `metadata.ownerMetadata` bag. Only the owner can write it: the session store drops `sessionOwner` and `ownerMetadata` from every ordinary metadata write, and a re-create of an owned row keeps its owner. |
+| `notifyUser({ sessionId, title, body, urgency })` | Same delivery as the `notify_user` tool; `critical` also pushes to the phone. |
+| `onSettled(handler)` | `completed` (queue empty), `error`, `waiting`, `interrupted`, with the session's lifetime `tokenUsage`. A failed turn delivers `error` only, not a trailing `completed`. Delivered while the module is running or still activating; settles while it is stopped are not replayed (poll `listOwned`). |
+
+Scoping is enforced by the host: every call runs as the calling module's extension in its bound workspace. The owner's extension id is never taken from the module, and any op on a session another extension owns (or an unowned one, or one in another workspace) is rejected.
+
+`routeChildUpdatesToOwner: true` changes what happens when an owned child settles. The parent that spawned it gets no `[Child Session Update]` prompt and is not re-driven. The owner gets `onSettled` instead. All three parent re-drive paths consult one check, `isParentNotificationSuppressed` in `services/extensionSessions/sessionOwnership.ts`: meta-agent child updates, the queue driver's post-settle wake, and the direct-takeover cleanup.
+
+Usage limits: the host persists only each session's lifetime `metadata.tokenUsage`, not per-turn history. Canonical transcript events, including `turn_ended`, are in-memory only. For an exact time window, diff consecutive `onSettled` `tokenUsage` snapshots and keep the ledger in the module's `dataDir`.
+
+Budget over `allTokens`. Cache reads dominate an agent turn, and `totalTokens` leaves them out (Claude Code, OpenCode) or folds them into input (Codex), so it undercounts real work and is not comparable across providers. The cache split is reported by Claude Code, Claude chat, Codex app-server, and OpenCode; every other provider stores 0 cache and leaves any cached tokens inside `inputTokens`. Sessions recorded before the cache fields existed read them as 0. Per-provider details: `services/ai/tokenUsageAccumulation.ts`.
+
+Lifecycle: granted backend modules start when their workspace opens, except modules that back an `aiAgentProvider`, which start on first use. They stop when the workspace has no window and no unfinished turn, so a scheduler in a module runs only while its project is open.
+
+## Panel Host: Backend Tools, Transcript Embed, Gutter Badge
+
+A panel (`contributions.panels`) receives `host: PanelHost` (`packages/extension-sdk/src/types/panel.ts`, implemented in `renderer/extensions/panels/PanelHostImpl.ts`). Three members connect it to the rest of the app:
+
+| Member | What it does |
+| --- | --- |
+| `host.callBackendTool(toolName, args?)` | Calls a tool this extension's own backend module registered, including `panelOnly` tools, and returns its parsed JSON result. The host adds the extension id and workspace; main refuses tools registered by another extension's module. |
+| `host.components?.SessionTranscript` | The full agent transcript for one session (`{ sessionId, collapseTranscript?, className? }`), with composer, queue, and interactive prompts. The composer sends to that `sessionId`, never to the window's active session. Present only when the manifest declares `permissions.ai: true`, because it lets the panel read any session in the workspace and prompt it. |
+| `host.setGutterBadge(value, { tone? })` | Badges the panel's existing gutter button: `null` clears, `0` is a dot, a positive number is a count; `tone: 'warning'` switches color. The host keeps the value after a fullscreen panel unmounts and clears it when the extension is disabled or unloaded. The backend module can keep it current while the panel is unmounted (next section); whichever writes last wins. |
+
+Extension panels share one renderer trust domain, so the host-stamped caller extension id is attribution, not authentication: panel-only tools hide controls from agents, they are not a security boundary against other installed extensions.
+
+`PanelExport.gutterButton` is declared in the SDK but not rendered by the gutter; use `setGutterBadge` on the default button instead.
+
+### Gutter badge from the backend (`ctx.services.panels`)
+
+`ctx.services.panels.setGutterBadge(panelId, value, { tone? })` sets the same badge from a backend module, so an event the module sees while the panel is closed (a new flag, a budget crossing) reaches the gutter. `panelId` is the bare id from the extension's own `contributions.panels`; the host prefixes the extension id from the module's runtime and rejects any id the manifest does not declare, so a module cannot badge another extension's panel. No permission is required, for the same reason the panel's own call needs none.
+
+Main broadcasts the badge with the module's workspace (`extension-panels:gutter-badge`, `main/extensions/backendPanelBadges.ts`). The renderer listener (`store/listeners/panelGutterBadgeListeners.ts`) shows it only while that workspace is active, re-applies each workspace's value when the project rail switches, and on mount replays the badges main holds, so a badge set before the window loaded is not lost. Badges a module set are cleared when that module stops or crashes.
+
 ## Extension Development
 
 When working on extensions in `packages/extensions/`:
 - Use `mcp__nimbalyst-extension-dev__extension_reload` to rebuild and reload extensions
 - Use `mcp__nimbalyst-extension-dev__extension_get_logs` to check for errors
 - Use `mcp__nimbalyst-extension-dev__extension_get_status` to verify extension state
-- **Never use manual `npm run build`** - always use the MCP tools for extension builds
+- **Never run a manual `pnpm run build` or `npm run build`** - always use the MCP tools for extension builds
 
 ## Marketplace Screenshots
 
@@ -841,6 +915,28 @@ The hook reads `isEmpty` / `seedFromFile` off the codec — an editor can no lon
 **Codec hosts.** A codec host is any environment that can load extension bundles and therefore holds a complete registry. The Electron renderer is the first; the web console and mobile WKWebView implement the same contract as collaborative documents and trackers reach those surfaces. Main is a *client* of that contract — it keeps orchestration (enumeration, the authenticated socket to each DocumentRoom, org-key unwrap, JWT handling) and delegates only the `Y.Doc <-> file bytes` step.
 
 Because a `Y.Doc` cannot cross a process boundary, the seam is state-based: the client sends the document's encoded state plus the file content, the host rebuilds a working doc, runs the codec, and returns a minimal delta the client applies. Concurrent peer edits during the round trip still merge. The request/response shape lives in `packages/collab-adapters/src/conversionHost.ts` and is deliberately free of Electron types; `scripts/check-main-bundle-graph.mjs` enforces that no editor/renderer module re-enters the main bundle.
+
+### Browser codec hosts
+
+The web console is the second codec host named above. It runs a single browser tab rather than a full extension environment: no marketplace resolution, no filesystem, no AI panel wired the way the desktop renderer wires one. What it can do for an extension editor, and what it cannot, is defined once as data — `packages/collab-bundle/src/editor/browserEditorCapabilities.ts` — and that file is the source of truth, not this section. `browserExtensionHost.ts` builds every member of `EditorHost` from the same table, and hands the identical table to the extension as `EditorHost.capabilities`, so an author can check `host.capabilities.supports(capability)` before calling rather than discover a gap from a thrown error.
+
+**Collaboration is the primary contract here, not an optional extra.** `collaboration`, `presence`, `dirtyState`, `theme`, `readOnly`, `visibility`, `initialContent` and `editorApi` are real: this host exists specifically to run a document whose state lives in a Y.Doc, so those come first rather than being the collaboration add-on they are on desktop.
+
+**Some gaps are static, others are resolved per mount.** `sourceMode`, `diffMode`, `findCommand`, `workspace`, `persistentStorage`, `secretStorage`, `configuration`, `localFileSave`, `fileChangeNotifications` and `projectFileSystem` are unavailable in every browser mount — nothing on a web page could ever provide a Monaco source-mode toggle, a native Find accelerator, or compare-and-swap disk access, so these are unconditionally gap-listed. `history`, `menuItems`, `aiContext`, `binaryContent` and `externalLinks` are conditional: `mountExtensionEditor` resolves each per mount from whether the embedding page supplied the matching hook (`onOpenHistory`, `onMenuItemsChange`, and so on). An editor that only branches on the static list will find these missing intermittently, not consistently — call `supports()` at the point of use, not once at startup.
+
+**`saveContent()` rejects instead of resolving.** A collaborative document is persisted by the server from the Y.Doc; there is no local file for the browser host to write to. Resolving the call anyway would tell the editor its content had just been written to a file that does not exist, and the editor would clear its dirty state on the strength of that lie. The host throws `BrowserEditorCapabilityError` instead, so an editor that still carries its desktop local-save path finds out immediately rather than silently believing a save that never happened. The same reasoning applies to `onSaveRequested`: the host never asks a collaborative document to save, so subscribing reports the gap rather than registering a listener that will never fire.
+
+**`permissions: { filesystem: true }` is declared-but-ungranted.** The manifest field stays valid and the extension still loads — refusing to load would exclude essentially every editor extension shipping today, since that permission covers the extension's *services* (`context.services.filesystem`, AI tools that read workspace files) rather than its editor contribution specifically, and most editor extensions declare it for those services regardless of what their editor needs. The browser host just grants nothing in return: `host.fs` is omitted, `saveContent` rejects, and `localFileSave` / `projectFileSystem` sit in the gap list. A manifest is written once and consumed by hosts with different powers — the declaration belongs to the extension, the grant belongs to the host, and nothing here is a quiet, silent grant.
+
+**What a desktop-collaborative extension needs to add for this host: nothing.** An editor that already ships `collaboration.supported: true`, a registered `CollabCodec`, and `useCollaborativeEditor(host, { codec, bind })` runs unmodified — `mountExtensionEditor` builds the `EditorHost` and `CollaborationContext` around the same Y.Doc/awareness pair the hook already expects, and mounts the component directly. What does not carry over automatically is any code path gated on a capability this host does not grant; that path needs a `supports()` check, or it will throw here instead of degrading the way it does when the same gap is merely optional on desktop.
+
+**Bundle resolution is pinned, not dynamic, today.** The console loads one extension bundle, chosen and built into the console at console-build time rather than fetched from the marketplace registry at runtime. There is no mechanism yet for an extension to register itself into the browser host by publishing a version, and how that will work once more than one extension ships to the console is not decided.
+
+**The capability table is an API contract, not a sandbox — and that is load-bearing for the previous paragraph.** A browser bundle is imported into the console's own realm: one `window`, one origin, one module graph, shared with the code that holds the team JWT. Nothing in `browserEditorCapabilities.ts` prevents bundle code from calling `fetch`, reading `localStorage`, or reaching that JWT through a closure. `supports()` answering `false` means "the host will not do this for you", never "you cannot do this". The same goes for the manifest permission block: `permissions.filesystem` is answered `declared: true, granted: false` because a browser tab has no disk, not because the host is confining anyone. `ai` and `network` are not in the browser's narrowed permission type at all — a browser host cannot mediate either, and declaring a field nothing enforces reads as a gate that does not exist.
+
+This is safe today for a reason that lives outside the capability table: the one bundle the console loads is first-party, pinned at build time from a workspace package, and shipped by the console's own production build — which refuses dirty `file:` dependencies and records source provenance. The bundle is exactly as trusted as the console.
+
+**So the isolation boundary is a precondition on dynamic resolution, not a follow-up to it.** Before the console loads a bundle it did not build — a marketplace fetch, a publisher-supplied URL, a version named by the server or influenced by a document — the extension needs to run behind a real boundary: an iframe or Worker, with the Y.Doc and the `EditorHost` reached over `postMessage`. Widening `EditorHostCapability`, or adding permission fields, does not approximate this and should not be mistaken for progress toward it.
 
 ### yJS as a peer dependency
 

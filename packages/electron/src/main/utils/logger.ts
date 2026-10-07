@@ -1,7 +1,8 @@
 import log from 'electron-log/main';
-import Store from 'electron-store';
+import Store from './privateSettingsStore';
 import { app, ipcMain } from 'electron';
 import { formatLogArgs } from './formatLogArgs';
+import { createConsoleStallGuard } from './consoleStallGuard';
 
 // Initialize electron-log for IPC communication with renderer.
 // electron-log registers an IPC handler for '__ELECTRON_LOG__' when initialize() is called.
@@ -259,6 +260,13 @@ const store = new Store<{ loggerConfig: LoggerConfig }>({
 // Load configuration from store or use defaults
 let config: LoggerConfig = store.get('loggerConfig', defaultConfig);
 
+// Under vitest, `app.getPath('userData')` is the mocked '/mock/path', so the
+// file transport tries to mkdir a directory that will never exist and emits an
+// ENOENT plus a ~15-frame electron-log stack trace on the first log call in
+// every test file. Both transports are pure noise in a test run -- nothing
+// asserts on them -- so keep them off entirely.
+const IS_TEST = !!process.env.VITEST;
+
 // Configure electron-log
 function configureLogger() {
   // Set log file location
@@ -266,17 +274,45 @@ function configureLogger() {
     const path = app.getPath('userData');
     return `${path}/logs/main.log`;
   };
-  
+
   // Set file size limit (10MB)
   log.transports.file.maxSize = 10 * 1024 * 1024;
-  
+
   // Enable/disable transports based on config
-  log.transports.file.level = config.fileLogging ? config.globalLevel : false;
-  log.transports.console.level = config.consoleLogging ? config.globalLevel : false;
-  
+  log.transports.file.level = !IS_TEST && config.fileLogging ? config.globalLevel : false;
+  log.transports.console.level = !IS_TEST && config.consoleLogging ? config.globalLevel : false;
+
   // Clean, readable format
   log.transports.console.format = '[{h}:{i}:{s}] {scope}: {text}';
   log.transports.file.format = '[{y}-{m}-{d} {h}:{i}:{s}.{ms}] {scope}: {text}';
+
+  installConsoleStallGuard();
+}
+
+/**
+ * Every terminal-bound write shares one guard, because they share one TTY.
+ * See `consoleStallGuard.ts` for why a log line can block the main thread.
+ *
+ * Deliberately NOT applied to `log.transports.file` -- the file transport is
+ * what makes dropping a terminal line lossless.
+ */
+const terminalGuard = createConsoleStallGuard({
+  writeNotice: (text) => process.stderr.write(`${text}\n`),
+});
+
+export function getConsoleStallStats() {
+  return terminalGuard.stats();
+}
+
+/** Wraps electron-log's console transport so its writes cannot block unbounded. */
+let consoleTransportGuarded = false;
+function installConsoleStallGuard(): void {
+  if (consoleTransportGuarded) return;
+  consoleTransportGuarded = true;
+  const originalWriteFn = log.transports.console.writeFn;
+  log.transports.console.writeFn = (payload) => {
+    terminalGuard.run(() => originalWriteFn(payload));
+  };
 }
 
 // Create a scoped logger for a component
@@ -425,30 +461,33 @@ export function overrideConsole() {
     debug: console.debug.bind(console)
   };
 
-  // Override console methods to log to both file and original console (stdout)
+  // Override console methods to log to both file and original console (stdout).
+  // The re-emission goes through the shared terminal guard: it is a synchronous
+  // TTY write in dev, and an unguarded one has blocked the main thread for
+  // 12.6s. See `consoleStallGuard.ts`.
   console.log = (...args: any[]) => {
     logger.main.info(formatLogArgs(args));
-    originalConsole.log(...args); // Also log to stdout
+    terminalGuard.run(() => originalConsole.log(...args)); // Also log to stdout
   };
 
   console.error = (...args: any[]) => {
     logger.main.error(formatLogArgs(args));
-    originalConsole.error(...args); // Also log to stderr
+    terminalGuard.run(() => originalConsole.error(...args)); // Also log to stderr
   };
 
   console.warn = (...args: any[]) => {
     logger.main.warn(formatLogArgs(args));
-    originalConsole.warn(...args); // Also log to stderr
+    terminalGuard.run(() => originalConsole.warn(...args)); // Also log to stderr
   };
 
   console.info = (...args: any[]) => {
     logger.main.info(formatLogArgs(args));
-    originalConsole.info(...args); // Also log to stdout
+    terminalGuard.run(() => originalConsole.info(...args)); // Also log to stdout
   };
 
   console.debug = (...args: any[]) => {
     logger.main.debug(formatLogArgs(args));
-    originalConsole.debug(...args); // Also log to stdout
+    terminalGuard.run(() => originalConsole.debug(...args)); // Also log to stdout
   };
 
   return originalConsole;

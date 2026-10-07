@@ -17,6 +17,7 @@ import type {
   TurnEndedPayload,
   AssistantMessagePayload,
 } from './types';
+import { isBackgroundedToolAck, isInteractiveWidgetTool } from '../interactivePromptTools';
 
 // ---------------------------------------------------------------------------
 // View model types
@@ -34,16 +35,45 @@ export interface ToolCallDiffResult {
   linesAdded?: number;
   linesRemoved?: number;
   debugInfo?: string; // how this file was linked to the tool call
+  historySource?: 'history-post-edit' | 'history-disk-fallback';
+}
+
+export type ToolCallDiffOmissionReason =
+  | 'input-too-large'
+  | 'time-limit'
+  | 'edit-distance-limit';
+
+export interface ToolCallDiffLoadResult {
+  state: 'ready' | 'partial' | 'none' | 'failed';
+  diffs: ToolCallDiffResult[];
+  omissions: Array<{
+    filePath: string;
+    reason: ToolCallDiffOmissionReason;
+    inputBytes?: { before: number; after: number };
+    limitBytes?: number;
+  }>;
+  errorCode?: 'snapshot-read-failed' | 'worker-failed' | 'queue-full';
 }
 
 export interface TranscriptViewMessage {
   id: number;
+  /** Matches the canonical event's ephemeral runtime store generation. */
+  transcriptGeneration?: number;
   sequence: number;
   createdAt: Date;
   type: TranscriptEventType;
   text?: string;
   mode?: 'agent' | 'planning' | 'auto';
   attachments?: UserMessagePayload['attachments'];
+  /** user_message only: who sent the prompt, when the raw row recorded it. */
+  promptActor?: UserMessagePayload['promptActor'];
+  /** user_message only: automated origin such as `interactive-question`. */
+  promptOrigin?: string;
+  /**
+   * user_message only: shown before main persisted it. A send that then fails
+   * leaves this row behind, so it must not close open questions.
+   */
+  optimistic?: boolean;
   toolCall?: {
     toolName: string;
     toolDisplayName: string;
@@ -208,6 +238,7 @@ function projectEvent(
 ): TranscriptViewMessage {
   const base: TranscriptViewMessage = {
     id: event.id,
+    ...(event.transcriptGeneration !== undefined ? { transcriptGeneration: event.transcriptGeneration } : {}),
     sequence: event.sequence,
     createdAt: event.createdAt,
     type: event.eventType,
@@ -222,6 +253,8 @@ function projectEvent(
       if (p.attachments) {
         base.attachments = p.attachments;
       }
+      if (p.promptActor) base.promptActor = p.promptActor;
+      if (p.promptOrigin) base.promptOrigin = p.promptOrigin;
       break;
     }
     case 'assistant_message': {
@@ -247,16 +280,23 @@ function projectEvent(
     case 'tool_call': {
       const p = event.payload as unknown as ToolCallPayload;
       const progressEvents = progressByParent.get(event.id) ?? [];
+      // #1341: the harness's "moved to the background" acknowledgement is not
+      // an answer. Every interactive widget reads pending vs answered off this
+      // `result`, so suppressing it here keeps a still-waiting prompt
+      // answerable no matter which path wrote the acknowledgement -- including
+      // transcripts persisted before the parser learned to drop it.
+      const isStrandedPromptAck =
+        isInteractiveWidgetTool(p.toolName) && isBackgroundedToolAck(p.result);
       base.toolCall = {
         toolName: p.toolName,
         toolDisplayName: p.toolDisplayName,
-        status: p.status,
+        status: isStrandedPromptAck ? 'running' : p.status,
         description: p.description,
         arguments: p.arguments,
         targetFilePath: p.targetFilePath,
         mcpServer: p.mcpServer,
         mcpTool: p.mcpTool,
-        result: p.result,
+        result: isStrandedPromptAck ? undefined : p.result,
         isError: p.isError,
         exitCode: p.exitCode,
         durationMs: p.durationMs,

@@ -24,9 +24,18 @@ export interface PendingDocRegistration {
   metadataVersion?: 2;
   fileExtension?: string;
   editorId?: string;
+  /** A typed-page parent; absent means a page. */
+  parentKind?: 'page' | 'item';
+  sortOrder?: number | null;
 }
 
-/** The minimal provider surface the queue needs to flush a registration. */
+/**
+ * The minimal provider surface the queue needs to flush a registration.
+ *
+ * The resolved value is deliberately unconstrained: `TeamSync.registerDocument`
+ * resolves an ack flag, but a queue flush is a best-effort catch-up with no
+ * caller waiting on the room, so it only cares that the send didn't throw.
+ */
 export interface DocRegistrationSink {
   registerDocument(
     documentId: string,
@@ -34,7 +43,9 @@ export interface DocRegistrationSink {
     documentType: string,
     parentFolderId: string | null,
     metadata?: { metadataVersion: 2; fileExtension: string; editorId: string },
-  ): Promise<void>;
+    ackTimeoutMs?: number,
+    placement?: { parentKind?: 'page' | 'item'; sortOrder?: number | null },
+  ): Promise<unknown>;
 }
 
 export interface FlushResult {
@@ -84,19 +95,22 @@ export class PendingDocRegistrationQueue {
     const failed: PendingDocRegistration[] = [];
     for (const registration of pending) {
       try {
-        await sink.registerDocument(
-          registration.documentId,
-          registration.title,
-          registration.documentType,
-          registration.parentFolderId,
-          registration.metadataVersion === 2 && registration.fileExtension && registration.editorId
-            ? {
-                metadataVersion: 2,
-                fileExtension: registration.fileExtension,
-                editorId: registration.editorId,
-              }
-            : undefined,
-        );
+        const placement = {
+          ...(registration.parentKind ? { parentKind: registration.parentKind } : {}),
+          ...(registration.sortOrder !== undefined ? { sortOrder: registration.sortOrder } : {}),
+        };
+        const metadata = registration.metadataVersion === 2 && registration.fileExtension && registration.editorId
+          ? {
+              metadataVersion: 2 as const,
+              fileExtension: registration.fileExtension,
+              editorId: registration.editorId,
+            }
+          : undefined;
+        const { documentId, title, documentType, parentFolderId } = registration;
+        // A page under a typed page keeps its parent kind (default ack timeout).
+        await (Object.keys(placement).length > 0
+          ? sink.registerDocument(documentId, title, documentType, parentFolderId, metadata, undefined, placement)
+          : sink.registerDocument(documentId, title, documentType, parentFolderId, metadata));
         flushed++;
       } catch (err) {
         console.warn('[pendingDocRegistrations] flush failed for', registration.documentId, err);

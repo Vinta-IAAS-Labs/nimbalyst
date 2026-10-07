@@ -16,9 +16,9 @@ const { mockSafeHandle, mockWatch, mockWindowSend } = vi.hoisted(() => ({
   mockWindowSend: vi.fn(),
 }));
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/tmp'),
+    getPath: (await import('../../../../test-stubs/privateUserData')).testApp.getPath,
     isPackaged: false,
     getName: vi.fn(() => 'Nimbalyst'),
     getVersion: vi.fn(() => '0.0.0-test'),
@@ -56,6 +56,22 @@ vi.mock('../../database/initialize', () => ({
   getDatabase: () => null,
 }));
 
+// Schema projection only needs a team-name lookup here. Loading TeamService
+// pulls in the runtime and sync/auth graph, timing out setup under suite load.
+vi.mock('../TeamService', () => ({
+  findTeamForWorkspace: vi.fn(async () => null),
+}));
+// Watcher attribution is not exercised by these direct schema operations.
+vi.mock('../TrackerIdentityService', () => ({
+  getCurrentIdentity: vi.fn(() => ({})),
+}));
+
+/** The destructive-change guard rail's opt-in, on every schema write path. */
+interface TestSchemaWriteOptions {
+  confirmDestructive?: boolean;
+  actorRole?: 'admin' | 'member';
+}
+
 interface TrackerSchemaServiceModule {
   initTrackerSchemaService: (workspacePath?: string | null) => void;
   updateTrackerSchemaWorkspace: (workspacePath: string | null) => void;
@@ -66,7 +82,11 @@ interface TrackerSchemaServiceModule {
   upsertWorkspaceTrackerSchema: (
     workspacePath: string,
     schema: string,
-    options?: { fileName?: string; overwrite?: boolean; allowBuiltinOverride?: boolean },
+    options?: TestSchemaWriteOptions & {
+      fileName?: string;
+      overwrite?: boolean;
+      allowBuiltinOverride?: boolean;
+    },
   ) => Promise<{ model: { type: string }; filePath: string; backupPath?: string }>;
   customizeWorkspaceTrackerSchema: (
     workspacePath: string,
@@ -75,6 +95,7 @@ interface TrackerSchemaServiceModule {
   resetWorkspaceTrackerSchemaOverride: (
     workspacePath: string,
     type: string,
+    options?: TestSchemaWriteOptions,
   ) => Promise<{ reset: boolean; filePath?: string }>;
   getWorkspaceTrackerSchemaOverride: (
     workspacePath: string,
@@ -87,7 +108,7 @@ interface TrackerSchemaServiceModule {
   upsertWorkspaceTrackerSchemaPatch: (
     workspacePath: string,
     patch: unknown,
-    options?: { overwrite?: boolean },
+    options?: TestSchemaWriteOptions & { overwrite?: boolean },
   ) => Promise<{ model: { type: string; fields: any[] }; filePath: string; backupPath?: string }>;
   TrackerTypeExistsError: new (...args: any[]) => Error;
 }
@@ -112,9 +133,8 @@ modes:
   inline: true
   fullDocument: false
 
-sync:
-  mode: local
-  scope: project
+sharing: personal
+draftByDefault: false
 
 idPrefix: ${type.slice(0, 3)}
 idFormat: ulid
@@ -138,6 +158,35 @@ function buildSyncedModel(type: string, displayName: string): string {
       { name: 'title', type: 'string', required: true },
     ],
     roles: { title: 'title' },
+  });
+}
+
+// A base with a select, and a subtype that only adds a field, for the
+// "base narrows a select" probe a frozen resolved copy fails.
+const techYaml = `type: tech
+displayName: Tech
+displayNamePlural: Techs
+icon: memory
+color: "#7c3aed"
+modes:
+  inline: true
+idPrefix: tec
+fields:
+  - name: title
+    type: string
+    required: true
+  - name: status
+    type: select
+    options: [adopted, trial, retiring]
+roles:
+  title: title
+`;
+
+function narrowTechStatus(registry: { get(type: string): any; register(model: any): void }): void {
+  const tech = registry.get('tech');
+  registry.register({
+    ...tech,
+    fields: tech.fields.map((f: any) => (f.name === 'status' ? { ...f, options: f.options.slice(0, 2) } : f)),
   });
 }
 
@@ -232,7 +281,9 @@ describe('tracker_define_type clobber guard (NIM-760)', () => {
     const result = await service.upsertWorkspaceTrackerSchema(
       workspacePath,
       buildCustomYaml('marketing', 'Marketing REPLACED'),
-      { overwrite: true },
+      // Replacing a definition wholesale drops the fields it had, so it is a
+      // destructive change and states its confirmation like any other.
+      { overwrite: true, confirmDestructive: true },
     );
 
     expect(result.backupPath).toBeDefined();
@@ -354,6 +405,28 @@ describe('TrackerSchemaService builtin override via patch', () => {
     expect(path.basename(override.filePath!)).toBe('bug.patch.yaml');
   });
 
+  it('opens an existing patch override instead of throwing on it (NIM-3065)', async () => {
+    // A patch has no `displayName` by design, and this path used to run the
+    // full-model parser over it: the throw meant the IPC handler never returned
+    // a filePath, so the Settings "Edit schema override" pencil silently did
+    // nothing for every overridden builtin.
+    await fs.writeFile(
+      path.join(trackersDir, 'bug.patch.yaml'),
+      `type: bug\nfields:\n  - name: status\n    options:\n      set:\n        - value: wont-fix\n          label: Wont Fix\n          icon: block\n`,
+      'utf-8',
+    );
+    service.updateTrackerSchemaWorkspace(null);
+    service.updateTrackerSchemaWorkspace(workspacePath);
+
+    const opened = await service.customizeWorkspaceTrackerSchema(workspacePath, 'bug');
+
+    expect(opened.created).toBe(false);
+    expect(path.basename(opened.filePath)).toBe('bug.patch.yaml');
+    // Resolved against the builtin seed, so it is a usable model, not the delta.
+    expect(opened.model.type).toBe('bug');
+    expect(opened.model.displayName).toBeTruthy();
+  });
+
   it('resets a patch override back to the builtin default', async () => {
     await service.upsertWorkspaceTrackerSchemaPatch(workspacePath, {
       type: 'task',
@@ -361,7 +434,9 @@ describe('TrackerSchemaService builtin override via patch', () => {
     });
     expect(statusOptionValues(service, 'task')).toContain('archived');
 
-    const reset = await service.resetWorkspaceTrackerSchemaOverride(workspacePath, 'task');
+    const reset = await service.resetWorkspaceTrackerSchemaOverride(workspacePath, 'task', {
+      confirmDestructive: true,
+    });
     expect(reset.reset).toBe(true);
 
     // Builtin restored: the patched option is gone.
@@ -405,7 +480,9 @@ describe('TrackerSchemaService reset propagates a tombstone', () => {
       fields: [{ name: 'status', options: { set: [{ value: 'archived', label: 'Archived' }] } }],
     });
 
-    const reset = await service.resetWorkspaceTrackerSchemaOverride(workspacePath, 'task');
+    const reset = await service.resetWorkspaceTrackerSchemaOverride(workspacePath, 'task', {
+      confirmDestructive: true,
+    });
     expect(reset.reset).toBe(true);
     // The tombstone is what propagates the reset (pending delete → pushed → peers
     // restore the builtin). Without it the stale override row keeps syncing.
@@ -464,11 +541,31 @@ describe('TrackerSchemaService remote schema sync apply', () => {
     expect(result).toEqual({ applied: true, deleted: false });
     expect(applyRemoteMock).toHaveBeenCalledWith(workspacePath, {
       type: 'remoteEpic',
-      model,
+      model: JSON.stringify({ ...JSON.parse(model), sharing: 'team', draftByDefault: false }),
       syncId: 42,
     });
     expect(service.getTrackerSchema('remoteEpic')?.type).toBe('remoteEpic');
     expect(mockWindowSend).toHaveBeenCalledWith('tracker-schema:changed', expect.any(Array));
+  });
+
+  it('projects and mirrors a synced subtype as declared, even from a payload with no declaration', async () => {
+    await fs.writeFile(path.join(workspacePath, '.nimbalyst', 'trackers', 'tech.yaml'), techYaml, 'utf-8');
+    service.ensureWorkspaceTrackerSchemasLoaded(workspacePath);
+    const { globalRegistry } = await import('@nimbalyst/tracker-schema');
+    const tech = globalRegistry.get('tech')!;
+    // The shape the live mirror holds: the resolved copy, inherited fields and all.
+    const resolved = { ...tech, type: 'lib', extends: 'tech', displayName: 'Lib', idPrefix: 'lib',
+      fields: [...tech.fields, { name: 'npmPackage', type: 'string' }] };
+
+    await service.applyRemoteWorkspaceTrackerSchemaDef(workspacePath, { type: 'lib', model: JSON.stringify(resolved), syncId: 9 });
+
+    const stored = JSON.parse(applyRemoteMock.mock.calls[0][1].model);
+    expect(stored.declaredForm.fields.map((f: any) => f.name)).toEqual(['npmPackage']);
+    const file = await fs.readFile(path.join(workspacePath, '.nimbalyst', 'trackers', 'lib.yaml'), 'utf-8');
+    expect(file).toContain('extends: tech');
+    expect(file).not.toContain('name: status');
+    narrowTechStatus(globalRegistry);
+    expect(service.getTrackerSchema('lib')).toBeDefined();
   });
 
   it('rejects malformed remote schema JSON before it reaches the DB mirror', async () => {
@@ -481,6 +578,40 @@ describe('TrackerSchemaService remote schema sync apply', () => {
     expect(result).toEqual({ applied: false, reason: 'invalid' });
     expect(applyRemoteMock).not.toHaveBeenCalled();
     expect(service.getTrackerSchema('remoteEpic')).toBeUndefined();
+  });
+
+  it('does not let a remote team schema replace a personal workspace tracker', async () => {
+    await fs.writeFile(
+      path.join(workspacePath, '.nimbalyst', 'trackers', 'remoteEpic.yaml'),
+      buildCustomYaml('remoteEpic', 'Personal Epic'),
+      'utf-8',
+    );
+    const { updateWorkspaceState } = await import('../../utils/store');
+    updateWorkspaceState(workspacePath, (draft) => {
+      const divergence = {
+        trackerType: 'remoteEpic',
+        legacySchemaMode: 'shared' as const,
+        legacyItemMode: 'local' as const,
+        sharing: 'personal' as const,
+        draftByDefault: false,
+        diverged: true,
+      };
+      draft.trackerSharingMigration = {
+        version: 1,
+        migratedAt: 1,
+        entries: [divergence],
+        divergences: [divergence],
+      };
+    });
+
+    const result = await service.applyRemoteWorkspaceTrackerSchemaDef(workspacePath, {
+      type: 'remoteEpic',
+      model: buildSyncedModel('remoteEpic', 'Remote Epic'),
+      syncId: 42,
+    });
+
+    expect(result).toEqual({ applied: false, reason: 'personal' });
+    expect(applyRemoteMock).not.toHaveBeenCalled();
   });
 
   it('applies a remote tombstone to the active registry', async () => {
@@ -516,7 +647,8 @@ describe('TrackerSchemaService remote schema sync apply', () => {
       modes: { inline: true, fullDocument: false },
       idPrefix: 'tsk',
       idFormat: 'ulid',
-      sync: { mode: 'shared', scope: 'project' },
+      sharing: 'team',
+      draftByDefault: false,
       fields: [
         { name: 'title', type: 'string', required: true },
         {
@@ -553,5 +685,104 @@ describe('TrackerSchemaService remote schema sync apply', () => {
     const restored = service.getTrackerSchema('task') as unknown as { fields: any[] };
     const restoredValues = restored.fields.find((f) => f.name === 'status')?.options?.map((o: any) => o.value);
     expect(restoredValues).not.toContain('archived');
+  });
+});
+
+describe('TrackerSchemaService derived types (extends)', () => {
+  let workspacePath: string;
+  let trackersDir: string;
+  let service: TrackerSchemaServiceModule & {
+    encodeTrackerSchemaDefForPush: <T extends { type: string; model: string | null }>(def: T) => T;
+  };
+
+  // Sorts BEFORE its base on disk, so the loader cannot rely on file order.
+  const derivedYaml = `type: campaign
+extends: marketing
+displayName: Campaign
+displayNamePlural: Campaigns
+idPrefix: cmp
+fields:
+  - name: channel
+    type: string
+`;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), 'tracker-schema-derived-'));
+    trackersDir = path.join(workspacePath, '.nimbalyst', 'trackers');
+    await fs.mkdir(trackersDir, { recursive: true });
+    await fs.writeFile(path.join(trackersDir, 'marketing.yaml'), buildCustomYaml('marketing', 'Marketing'), 'utf-8');
+    service = (await import('../TrackerSchemaService')) as unknown as typeof service;
+  });
+
+  afterEach(async () => {
+    service.updateTrackerSchemaWorkspace(null);
+    await fs.rm(workspacePath, { recursive: true, force: true });
+  });
+
+  function fieldNames(type: string): string[] {
+    return ((service.getTrackerSchema(type) as unknown as { fields?: any[] })?.fields ?? []).map((f) => f.name);
+  }
+
+  it('loads a derived type file and syncs it with its extends', async () => {
+    await fs.writeFile(path.join(trackersDir, 'campaign.yaml'), derivedYaml, 'utf-8');
+    service.initTrackerSchemaService(workspacePath);
+
+    expect(fieldNames('campaign')).toEqual(expect.arrayContaining(['title', 'channel']));
+    const pushed = service.encodeTrackerSchemaDefForPush({ type: 'campaign', model: '{}' });
+    expect(pushed.model).toContain('"extends":"marketing"');
+  });
+
+  it('defines a derived type through the upsert the tool uses', async () => {
+    service.initTrackerSchemaService(workspacePath);
+
+    const { model, filePath } = await service.upsertWorkspaceTrackerSchema(workspacePath, derivedYaml);
+
+    expect(model.type).toBe('campaign');
+    expect(await fs.readFile(filePath, 'utf-8')).toContain('extends: marketing');
+    expect(fieldNames('campaign')).toEqual(expect.arrayContaining(['title', 'channel']));
+  });
+
+  it('keeps the declaration in force through a team write-through of the resolved model', async () => {
+    await fs.writeFile(path.join(trackersDir, 'tech.yaml'), techYaml, 'utf-8');
+    const libPath = path.join(trackersDir, 'lib.yaml');
+    await fs.writeFile(libPath, 'type: lib\nextends: tech\nfields:\n  - name: npmPackage\n    type: string\n', 'utf-8');
+    service.initTrackerSchemaService(workspacePath);
+    const { globalRegistry } = await import('@nimbalyst/tracker-schema');
+    const { writeThroughTeamTrackerSchemaEdit } = await import('../tracker/trackerSchemaProjection');
+
+    await writeThroughTeamTrackerSchemaEdit(workspacePath, libPath, { ...globalRegistry.get('lib')!, sharing: 'team' });
+
+    expect(globalRegistry.getDeclaredModel('lib')?.fields?.map((f) => f.name)).toEqual(['npmPackage']);
+    narrowTechStatus(globalRegistry);
+    expect(service.getTrackerSchema('lib')).toBeDefined();
+  });
+
+  it('loads a subtype saved before its base once the base file appears', async () => {
+    service.initTrackerSchemaService(workspacePath);
+    const reload = (service as unknown as { reloadWorkspaceSchema(ws: string, file: string): Promise<void> }).reloadWorkspaceSchema;
+    const libPath = path.join(trackersDir, 'lib.yaml');
+    await fs.writeFile(libPath, 'type: lib\nextends: tech\nfields:\n  - name: npmPackage\n    type: string\n', 'utf-8');
+    await reload(workspacePath, libPath);
+    expect(service.getTrackerSchema('lib')).toBeUndefined();
+
+    const techPath = path.join(trackersDir, 'tech.yaml');
+    await fs.writeFile(techPath, techYaml, 'utf-8');
+    await reload(workspacePath, techPath);
+
+    expect(fieldNames('lib')).toEqual(expect.arrayContaining(['title', 'status', 'npmPackage']));
+  });
+
+  it('loads a derived type for a workspace that is not the active one', async () => {
+    await fs.writeFile(path.join(trackersDir, 'campaign.yaml'), derivedYaml, 'utf-8');
+    service.initTrackerSchemaService();
+    service.updateTrackerSchemaWorkspace(await fs.mkdtemp(path.join(os.tmpdir(), 'tracker-schema-other-')));
+
+    service.ensureWorkspaceTrackerSchemasLoaded(workspacePath);
+
+    const { globalRegistry } = await import('@nimbalyst/tracker-schema');
+    const layered = globalRegistry.getForWorkspace(workspacePath, 'campaign');
+    expect(layered?.fields.map((f) => f.name)).toEqual(expect.arrayContaining(['title', 'channel']));
   });
 });

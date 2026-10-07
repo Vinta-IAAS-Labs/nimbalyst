@@ -6,14 +6,22 @@ Prepare a git commit following these steps:
 
 1. Run `git status` and `git diff` to see changes
 2. Review recent commits (`git log --oneline -5`) to match the style
-3. Draft a concise commit message:
+3. Update `CHANGELOG.md` — this is the **only** point at which it should be edited
+  - Add the entry now, as part of preparing this commit; never during implementation
+  - One user-facing sentence in the right `[Unreleased]` subsection, matching the surrounding voice
+  - Internal-only changes (refactors, tests, docs, agent/config tweaks, dep bumps with no behavior change) get NO entry
+  - No entry for a bug introduced and fixed within the same unreleased cycle
+  - Editing an existing bullet beats adding a second one for the same feature
+  - If `CHANGELOG.md` already carries bullets from other sessions, do NOT sweep them in — commit only the code plus your own line, and say so
+4. Check `docs/FEATURE_INVENTORY.md` against the changes being committed, following the root `CLAUDE.md` feature-inventory rule. Include the relevant inventory update for added, significantly expanded, or removed notable capabilities; preserve other sessions' edits. Report "Feature inventory updated" with the section, or "No inventory impact" with a short reason. In a parallel batch, the integrating session owns this update.
+5. Draft a concise commit message:
   - Start with type prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
   - **Focus on IMPACT and WHY, not implementation details**
   - The title should describe the user-visible outcome or bug fixed
   - Use bullet points (dash prefix) only if there are multiple distinct changes
   - Keep each line under 72 characters
   - No emojis
-4. Run the `developer_git_commit_proposal` tool to propose the commit to the user
+6. Run the `developer_git_commit_proposal` tool to propose the commit to the user
   - Do NOT run `git add` - the widget handles staging when the user confirms
 
 **Commit Message Guidelines:**
@@ -29,8 +37,11 @@ Prepare a git commit following these steps:
   include the tracker reference on its own line in the proposed message
 - Prefer that system's canonical closing syntax, such as `Fixes #123`,
   `Closes ABC-123`, or similar
-- If the correct auto-close syntax is unclear, include a neutral reference
-  line (for example `Refs ABC-123`) rather than omitting the tracker
+- This applies to local Nimbalyst tracker items too, not just GitHub issues:
+  a session-linked item closes on `Fixes NIM-123` and the session is marked
+  complete. Omitting it strands the finished item in `in-review`
+- Use a neutral reference (`Refs ABC-123`) only when the commit does NOT
+  finish the item — a work-in-progress commit should not close it
 
 **Important:**
 - Do NOT add "Co-Authored-By" or any attribution lines

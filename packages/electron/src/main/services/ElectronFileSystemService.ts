@@ -21,7 +21,8 @@ import type {
 } from '@nimbalyst/runtime';
 import { logger } from '../utils/logger';
 import { SafePathValidator } from '../security/SafePathValidator';
-import { shouldExcludeFile, shouldExcludeDir, GLOB_EXCLUDE_PATTERNS } from '../utils/fileFilters';
+import { shouldExcludeFile, shouldExcludeDir, shouldExcludePath, GLOB_EXCLUDE_PATTERNS } from '../utils/fileFilters';
+import { getRipgrepPath } from './ripgrepPath';
 
 const execFileAsync = promisify(execFile);
 
@@ -97,7 +98,7 @@ export class ElectronFileSystemService implements FileSystemService {
         args: rgArgs
       });
 
-      const { stdout } = await execFileAsync('rg', rgArgs, {
+      const { stdout } = await execFileAsync(getRipgrepPath(), rgArgs, {
         maxBuffer: 10 * 1024 * 1024,
         timeout: 30000 // 30 second timeout
       });
@@ -191,7 +192,9 @@ export class ElectronFileSystemService implements FileSystemService {
               if (!options?.includeHidden && item.name.startsWith('.')) {
                 return false;
               }
-              if (item.isDirectory() && shouldExcludeDir(item.name)) {
+              if (item.isDirectory() && (
+                shouldExcludeDir(item.name) || shouldExcludePath(join(basePath, item.name))
+              )) {
                 return false;
               }
               return true;
@@ -263,7 +266,9 @@ export class ElectronFileSystemService implements FileSystemService {
       }
 
       this.logAccess(fullPath, 'read', true);
-      logger.ai.info('[FileSystemService] Reading file', {
+      // debug, not info: this fires on every single read, which floods both
+      // main.log and any test run that exercises the read path.
+      logger.ai.debug('[FileSystemService] Reading file', {
         path: SafePathValidator.getSafeLogPath(fullPath)
       });
 

@@ -52,6 +52,9 @@ export interface UserMessageDescriptor {
   inputType?: 'user' | 'system_message';
   attachments?: UserMessagePayload['attachments'];
   createdAt?: Date;
+  /** Stamped from the raw row's metadata by `stampPromptSource`, not by parsers. */
+  promptActor?: UserMessagePayload['promptActor'];
+  promptOrigin?: string;
 }
 
 export interface AssistantMessageDescriptor {
@@ -94,6 +97,12 @@ export interface SystemMessageDescriptor {
   deniedReason?: string;
   deniedReasonType?: PermissionDeniedReasonType | (string & {});
   deniedInput?: Record<string, unknown>;
+  isAttachmentStagingDenied?: boolean;
+  attachmentPath?: string;
+  attachmentFilename?: string;
+  attachmentStagingMode?: 'temp' | 'workspace' | 'custom';
+  attachmentDenyRule?: string;
+  attachmentDetection?: 'reactive' | 'preflight';
 }
 
 export interface ToolCallStartedDescriptor {

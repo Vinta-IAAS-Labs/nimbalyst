@@ -45,7 +45,7 @@
  * Provider sharing model
  * ----------------------
  * A `DocumentSyncProvider` owns its Y.Doc and emits onStatusChange /
- * onRemoteUpdate / onReviewStateChange callbacks set at construction
+ * onRemoteUpdate callbacks set at construction
  * time. The cache wires its own callbacks at construction and fans out
  * to a per-entry event bus; consumers subscribe to the bus via
  * `entry.on(...)`. This lets the cache support N simultaneous consumers
@@ -58,13 +58,23 @@
  * destroy it on release.
  */
 
-import { DocumentSyncProvider } from '@nimbalyst/runtime/sync';
+import {
+  DocumentSyncProvider,
+} from '@nimbalyst/runtime/sync';
+import {
+  COLLAB_CONNECTION_DIAGNOSTICS_COMPILED,
+  emitCollabConnectionEvent,
+  getCollabConnectionInstanceId,
+  setCollabConnectionDiagnosticContext,
+} from '@nimbalyst/runtime/sync/collabConnectionDiagnostics';
 import { CollabLexicalProvider } from '@nimbalyst/runtime/collab-lexical';
+import { MarkdownCollabContentAdapter } from '@nimbalyst/runtime/sync/MarkdownCollabContentAdapter';
 import type {
+  AwarenessState,
   DocumentSyncConfig,
   DocumentSyncStatus,
-  ReviewGateState,
 } from '@nimbalyst/runtime/sync';
+import type { TeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 
 // ============================================================================
 // Tunables
@@ -73,6 +83,12 @@ import type {
 const DEFAULT_LRU_CAP = 100;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_PREWARM_CONCURRENCY = 5;
+/**
+ * How long an agent body write waits for the server's `docUpdateAck`. Paired
+ * with `SERVER_ACK_TIMEOUT_MS` in the main process, whose own deadline is sized
+ * to outlast this one.
+ */
+const DEFAULT_SERVER_ACK_TIMEOUT_MS = 5_000;
 
 // ============================================================================
 // Types
@@ -83,28 +99,47 @@ const DEFAULT_PREWARM_CONCURRENCY = 5;
  * once per itemId on first acquire / prewarm. Construction is async
  * because the team-org / JWT resolution itself is async.
  *
- * The factory's `onStatusChange` / `onRemoteUpdate` / `onReviewStateChange`
- * callbacks are IGNORED -- the cache wires its own and dispatches to
+ * The factory's `onStatusChange` / `onRemoteUpdate` callbacks are IGNORED -- the cache wires its own and dispatches to
  * subscribers via the entry's event bus. Callers should pass `undefined`
  * (or stub no-ops) for these fields.
  */
-export type BodyDocConfigFactory = (itemId: string) => Promise<DocumentSyncConfig | null>;
+type TeamDocumentSyncConfig = Extract<DocumentSyncConfig, { teamMemberId: TeamMemberId }>;
+
+export type BodyDocConfig = TeamDocumentSyncConfig & {
+  userName?: string;
+  userEmail?: string;
+  /**
+   * Workspace this entry was created for. The cache is keyed on itemId alone
+   * but one window can hold several projects open, and not every tracker id is
+   * globally unique -- frontmatter-backed ids (`fm:plan:<relative path>`) are
+   * unique only within a workspace. Anything writing into an entry from outside
+   * the owning surface must check this first.
+   */
+  workspacePath?: string;
+};
+
+export type BodyDocConfigFactory = (itemId: string) => Promise<BodyDocConfig | null>;
+
+/** Result of an agent body write routed through a warm editor provider. */
+export type WarmBodyApplyOutcome =
+  /** This window holds no warm entry for the item; the caller may fall back. */
+  | 'no-entry'
+  /** The server persisted the write. The only outcome that is durable. */
+  | 'acknowledged'
+  /** The replica was mutated but no `docUpdateAck` arrived. Nobody may retry. */
+  | 'unacknowledged';
 
 export interface BodyDocEntryListener {
   onStatusChange?: (status: DocumentSyncStatus) => void;
   onRemoteUpdate?: (origin: string) => void;
-  /**
-   * Fires on every review-gate transition. `null` is delivered to new
-   * subscribers when the gate hasn't fired yet for this entry, so a
-   * late-mount detail panel can render a neutral initial state instead
-   * of waiting on the first server update.
-   */
-  onReviewStateChange?: (state: ReviewGateState | null) => void;
+  onAwarenessChange?: (states: Map<string, AwarenessState>) => void;
 }
 
 export interface BodyDocAcquisition {
   /** The shared sync provider. Read-only -- do NOT call destroy(). */
   readonly syncProvider: DocumentSyncProvider;
+  /** Stable room/user metadata retained across warm-cache re-acquisitions. */
+  readonly config: BodyDocConfig;
   /**
    * Construct a fresh `CollabLexicalProvider` bound to this entry's
    * Y.Doc. Each Lexical mount needs its own wrapper; the underlying
@@ -130,14 +165,17 @@ export interface BodyDocCacheOptions {
 
 interface CacheEntry {
   itemId: string;
+  config: BodyDocConfig;
   syncProvider: DocumentSyncProvider;
   refCount: number;
   /** Last status delivered to subscribers; new subscribers get this synchronously. */
   lastStatus: DocumentSyncStatus;
-  /** Last review-gate state; new subscribers get this synchronously. */
-  lastReviewState: ReviewGateState | null;
-  /** Listener fan-out for status / remote-update / review-state. */
+  /** Last remote awareness snapshot; new subscribers get a defensive copy. */
+  lastAwarenessStates: Map<string, AwarenessState>;
+  /** Listener fan-out for status / remote-update / awareness. */
   listeners: Set<BodyDocEntryListener>;
+  /** Cache-owned provider subscription, released only when the entry is destroyed. */
+  awarenessUnsubscribe: (() => void) | null;
   /** Set to a timer when refCount hits 0; cleared on next acquire. */
   idleTimer: ReturnType<typeof setTimeout> | null;
   /** Bumped on every acquire/release; used for LRU ordering. */
@@ -180,8 +218,15 @@ export class BodyDocCache {
     const entry = await this.ensureEntry(itemId, factory);
     if (!entry) return null;
 
+    const previousRefCount = entry.refCount;
     entry.refCount += 1;
     entry.lastTouchedAt = Date.now();
+    if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+      emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'acquire', {
+        fromRefCount: previousRefCount,
+        refCount: entry.refCount,
+      });
+    }
     this.clearIdleTimer(entry);
     // Pinning is done; safe to evict other unpinned entries now.
     this.maybeEvictForCap();
@@ -189,14 +234,17 @@ export class BodyDocCache {
     if (listener) {
       entry.listeners.add(listener);
       // Replay the latest known state so new subscribers don't miss an
-      // already-delivered status / review notification.
+      // already-delivered status notification.
       if (listener.onStatusChange) listener.onStatusChange(entry.lastStatus);
-      if (listener.onReviewStateChange) listener.onReviewStateChange(entry.lastReviewState);
+      if (listener.onAwarenessChange) {
+        listener.onAwarenessChange(new Map(entry.lastAwarenessStates));
+      }
     }
 
     let released = false;
     return {
       syncProvider: entry.syncProvider,
+      config: entry.config,
       makeCollabProvider: (options) => new CollabLexicalProvider(entry.syncProvider, options),
       release: () => {
         if (released) return;
@@ -248,13 +296,71 @@ export class BodyDocCache {
    */
   dispose(): void {
     for (const entry of this.entries.values()) {
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'destroy', {
+          reason: 'dispose',
+          refCount: entry.refCount,
+        });
+      }
       this.clearIdleTimer(entry);
+      try { entry.awarenessUnsubscribe?.(); } catch { /* ignore */ }
+      entry.awarenessUnsubscribe = null;
       try { entry.syncProvider.destroy(); } catch { /* ignore */ }
     }
     this.entries.clear();
     this.pending.clear();
     this.prewarmQueue.length = 0;
     this.prewarmInFlight = 0;
+  }
+
+  /**
+   * Replace a tracker body through the provider an open editor is already
+   * bound to, and wait for the server to acknowledge persisting it.
+   *
+   * `'no-entry'` means this window has no warm entry for the item in
+   * `workspacePath`, so the main process can fall back to its headless room
+   * peer. `'unacknowledged'` means the opposite: this window's replica has
+   * ALREADY been mutated, so nobody may retry the write -- a second
+   * `clear + insert` computed against a different view of the room merges into
+   * two copies of the body. The provider keeps the update queued and replays it
+   * on reconnect.
+   *
+   * The acknowledgment is not decoration. The caller of this write deletes the
+   * plan's markdown file from disk on the strength of it, so "the local Y.Doc
+   * now holds the body" is not a result worth reporting as success.
+   *
+   * The entry -- not the window's active project -- is the authority on whether
+   * we can serve the write. A window can hold several projects open and the
+   * editor for this item may belong to any of them; equally, an entry for a
+   * same-named item in a different project must never absorb the write (see
+   * `BodyDocConfig.workspacePath`). An entry created without a workspacePath
+   * is refused for the same reason.
+   */
+  async applyMarkdownToWarmEntry(
+    itemId: string,
+    markdown: string,
+    workspacePath: string,
+    ackTimeoutMs = DEFAULT_SERVER_ACK_TIMEOUT_MS,
+  ): Promise<WarmBodyApplyOutcome> {
+    const entry = this.entries.get(itemId);
+    if (!entry) return 'no-entry';
+    if (!entry.config.workspacePath || entry.config.workspacePath !== workspacePath) return 'no-entry';
+    try {
+      MarkdownCollabContentAdapter.applyFromFile(entry.syncProvider.getYDoc(), markdown);
+    } catch (err) {
+      // A failed conversion may still have partially mutated the replica, so
+      // this is not the same as having no entry: reporting it as such would
+      // invite a headless retry on top of the partial write.
+      console.error('[BodyDocCache] agent body write failed to convert for', itemId, err);
+      return 'unacknowledged';
+    }
+    entry.lastTouchedAt = Date.now();
+    try {
+      return (await entry.syncProvider.flushWithAck(ackTimeoutMs)) ? 'acknowledged' : 'unacknowledged';
+    } catch (err) {
+      console.error('[BodyDocCache] agent body write was never acknowledged for', itemId, err);
+      return 'unacknowledged';
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -266,10 +372,35 @@ export class BodyDocCache {
     factory: BodyDocConfigFactory,
   ): Promise<CacheEntry | null> {
     const existing = this.entries.get(itemId);
-    if (existing) return existing;
+    if (existing) {
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(existing.syncProvider, 'BodyDocCache', 'warm-hit', {
+          refCount: existing.refCount,
+          idleTimerActive: existing.idleTimer !== null,
+        });
+      }
+      return existing;
+    }
 
     const inflight = this.pending.get(itemId);
-    if (inflight) return inflight.catch(() => null);
+    if (inflight) {
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(this, 'BodyDocCache', 'pending-hit', {
+          cache: 'body-doc',
+          cacheKey: itemId,
+          itemId,
+        });
+      }
+      return inflight.catch(() => null);
+    }
+
+    if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+      emitCollabConnectionEvent(this, 'BodyDocCache', 'cold-construct-start', {
+        cache: 'body-doc',
+        cacheKey: itemId,
+        itemId,
+      });
+    }
 
     const promise = this.createEntry(itemId, factory).finally(() => {
       this.pending.delete(itemId);
@@ -295,11 +426,13 @@ export class BodyDocCache {
 
     const entry: CacheEntry = {
       itemId,
+      config,
       syncProvider: null as unknown as DocumentSyncProvider, // assigned below
       refCount: 0,
       lastStatus: 'disconnected',
-      lastReviewState: null,
+      lastAwarenessStates: new Map(),
       listeners: new Set(),
+      awarenessUnsubscribe: null,
       idleTimer: null,
       lastTouchedAt: Date.now(),
     };
@@ -309,6 +442,14 @@ export class BodyDocCache {
     // cache is the sole owner of the provider's lifecycle signals.
     const cacheConfig: DocumentSyncConfig = {
       ...config,
+      // Explicit even though the spread above already carries it: the
+      // renderer-sync-sockets checker (scripts/check-renderer-sync-sockets.mjs)
+      // only resolves one level of `{ ...other }` spread within the same file,
+      // and `config` arrives as a parameter from a factory defined elsewhere --
+      // so it can't see this field through the spread. Behavior-neutral
+      // (config.createWebSocket is always the same value at runtime); this
+      // just makes the invariant visible to the checker and to readers.
+      createWebSocket: config.createWebSocket,
       onStatusChange: (status) => {
         entry.lastStatus = status;
         for (const l of entry.listeners) {
@@ -324,17 +465,37 @@ export class BodyDocCache {
           }
         }
       },
-      onReviewStateChange: (state) => {
-        entry.lastReviewState = state;
-        for (const l of entry.listeners) {
-          try { l.onReviewStateChange?.(state); } catch (err) {
-            console.warn('[BodyDocCache] reviewState listener threw:', err);
-          }
-        }
-      },
     };
 
     entry.syncProvider = new DocumentSyncProvider(cacheConfig);
+    if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+      setCollabConnectionDiagnosticContext(entry.syncProvider, {
+        cache: 'body-doc',
+        cacheKey: itemId,
+        documentId: config.documentId,
+        itemId,
+        shared: true,
+      });
+      emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'cold-construct', {
+        refCount: entry.refCount,
+        syncProviderId: getCollabConnectionInstanceId(
+          entry.syncProvider,
+          'DocumentSyncProvider',
+        ),
+      });
+    }
+    if (typeof entry.syncProvider.onAwarenessChange === 'function') {
+      entry.awarenessUnsubscribe = entry.syncProvider.onAwarenessChange((states) => {
+        entry.lastAwarenessStates = new Map(states);
+        for (const listener of entry.listeners) {
+          try {
+            listener.onAwarenessChange?.(new Map(entry.lastAwarenessStates));
+          } catch (err) {
+            console.warn('[BodyDocCache] awareness listener threw:', err);
+          }
+        }
+      });
+    }
     this.entries.set(itemId, entry);
     // Do NOT evict here -- the caller (acquire/prewarm) has not had a
     // chance to bump refCount or otherwise mark the entry as "wanted".
@@ -344,15 +505,33 @@ export class BodyDocCache {
   }
 
   private releaseEntry(entry: CacheEntry): void {
+    const previousRefCount = entry.refCount;
     entry.refCount = Math.max(0, entry.refCount - 1);
     entry.lastTouchedAt = Date.now();
+    if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+      emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'release', {
+        fromRefCount: previousRefCount,
+        refCount: entry.refCount,
+      });
+    }
     if (entry.refCount === 0) {
       // Start the idle timer. On expiry the entry is destroyed.
       this.clearIdleTimer(entry);
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'idle-timer-start', {
+          refCount: entry.refCount,
+          timeoutMs: this.idleTimeoutMs,
+        });
+      }
       entry.idleTimer = setTimeout(() => {
         // Guard: a late acquire may have raced the timer.
         if (entry.refCount === 0) {
-          this.destroyEntry(entry);
+          if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+            emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'idle-timer-expire', {
+              refCount: entry.refCount,
+            });
+          }
+          this.destroyEntry(entry, 'idle-timeout');
         }
       }, this.idleTimeoutMs);
     }
@@ -360,13 +539,26 @@ export class BodyDocCache {
 
   private clearIdleTimer(entry: CacheEntry): void {
     if (entry.idleTimer !== null) {
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'idle-timer-cancel', {
+          refCount: entry.refCount,
+        });
+      }
       clearTimeout(entry.idleTimer);
       entry.idleTimer = null;
     }
   }
 
-  private destroyEntry(entry: CacheEntry): void {
+  private destroyEntry(entry: CacheEntry, reason = 'destroy'): void {
+    if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+      emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'destroy', {
+        reason,
+        refCount: entry.refCount,
+      });
+    }
     this.clearIdleTimer(entry);
+    try { entry.awarenessUnsubscribe?.(); } catch { /* ignore */ }
+    entry.awarenessUnsubscribe = null;
     try { entry.syncProvider.destroy(); } catch (err) {
       console.warn('[BodyDocCache] destroy threw for', entry.itemId, err);
     }
@@ -389,7 +581,14 @@ export class BodyDocCache {
         }
       }
       if (!oldest) return; // every entry pinned; soft cap exceeded
-      this.destroyEntry(oldest);
+      if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+        emitCollabConnectionEvent(oldest.syncProvider, 'BodyDocCache', 'lru-evict', {
+          refCount: oldest.refCount,
+          cacheSize: this.entries.size,
+          lruCap: this.lruCap,
+        });
+      }
+      this.destroyEntry(oldest, 'lru-cap');
     }
   }
 
@@ -409,8 +608,23 @@ export class BodyDocCache {
         // Start the idle timer right away so prewarm-only entries don't
         // pin the cache indefinitely.
         if (entry.refCount === 0 && entry.idleTimer === null) {
+          if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+            emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'idle-timer-start', {
+              refCount: entry.refCount,
+              timeoutMs: this.idleTimeoutMs,
+              source: 'prewarm',
+            });
+          }
           entry.idleTimer = setTimeout(() => {
-            if (entry.refCount === 0) this.destroyEntry(entry);
+            if (entry.refCount === 0) {
+              if (COLLAB_CONNECTION_DIAGNOSTICS_COMPILED) {
+                emitCollabConnectionEvent(entry.syncProvider, 'BodyDocCache', 'idle-timer-expire', {
+                  refCount: entry.refCount,
+                  source: 'prewarm',
+                });
+              }
+              this.destroyEntry(entry, 'idle-timeout');
+            }
           }, this.idleTimeoutMs);
         }
       }

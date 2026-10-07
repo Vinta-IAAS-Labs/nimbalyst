@@ -11,15 +11,16 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import { asTeamJwt, asTeamMemberId } from '../../auth/jwtScopes';
 import { TeamSyncProvider } from '../TeamSync';
 import type { TeamSyncConfig } from '../teamSyncTypes';
 
 function createProvider(overrides: Partial<TeamSyncConfig> = {}): TeamSyncProvider {
   const config: TeamSyncConfig = {
     serverUrl: 'ws://example.test',
-    getJwt: async () => 'token',
+    getJwt: async () => asTeamJwt('token'),
     orgId: 'org-1',
-    userId: 'user-1',
+    teamMemberId: asTeamMemberId('user-1'),
     ...overrides,
   };
   return new TeamSyncProvider(config);
@@ -43,7 +44,7 @@ describe('TeamSyncProvider pre-cutover content', () => {
           createdBy: 'user-1',
           createdAt: 1,
           updatedAt: 2,
-          projectId: null,
+          projectId: 'project-plain',
           lastWriterUserId: null,
           parentFolderId: null,
           trashedAt: null,
@@ -56,7 +57,7 @@ describe('TeamSyncProvider pre-cutover content', () => {
           createdBy: 'user-1',
           createdAt: 1,
           updatedAt: 2,
-          projectId: null,
+          projectId: 'project-legacy',
           lastWriterUserId: null,
           parentFolderId: null,
           trashedAt: null,
@@ -65,17 +66,42 @@ describe('TeamSyncProvider pre-cutover content', () => {
     });
 
     const documents = onDocumentsLoaded.mock.calls[0][0] as Array<{
-      documentId: string; title: string; decryptFailed?: boolean;
+      documentId: string; projectId?: string | null; title: string; decryptFailed?: boolean;
     }>;
     const plain = documents.find(d => d.documentId === 'doc-plain');
     const legacy = documents.find(d => d.documentId === 'doc-legacy');
 
-    expect(plain).toMatchObject({ title: 'Readable Title' });
+    expect(plain).toMatchObject({ title: 'Readable Title', projectId: 'project-plain' });
     expect(plain?.decryptFailed).toBeUndefined();
 
     expect(legacy?.decryptFailed).toBe(true);
+    expect(legacy?.projectId).toBe('project-legacy');
     expect(legacy?.title).not.toContain('c2hyZWRkZWQ');
 
+    provider.destroy();
+  });
+
+  it('keeps a known title when a broadcast for the same document carries an unreadable one', async () => {
+    const onDocumentChanged = vi.fn();
+    const provider = createProvider({ onDocumentChanged });
+    const row = {
+      documentType: 'markdown', createdBy: 'user-1', createdAt: 1, updatedAt: 2, projectId: 'p', parentFolderId: null,
+    };
+    const receive = (document: Record<string, unknown>) =>
+      (provider as any).handleMessage({ data: JSON.stringify({ type: 'docIndexBroadcast', document }) });
+
+    // A converted folder: never written.
+    await receive({ ...row, documentId: 'known', encryptedTitle: 'Specs', titleIv: '', hasContent: false });
+    // A body edit on an older server re-broadcast the at-rest ciphertext.
+    await receive({ ...row, documentId: 'known', encryptedTitle: 'Q2lwaGVy', titleIv: 'aXY=', updatedAt: 9 });
+    await receive({ ...row, documentId: 'unknown', encryptedTitle: 'Q2lwaGVy', titleIv: 'aXY=' });
+
+    expect(onDocumentChanged.mock.calls[0][0].hasContent).toBe(false);
+    // An older server sends no flag: a page, never a folder.
+    expect(onDocumentChanged.mock.calls[1][0].hasContent).toBeUndefined();
+    expect(onDocumentChanged.mock.calls[1][0]).toMatchObject({ documentId: 'known', title: 'Specs', updatedAt: 9 });
+    expect(onDocumentChanged.mock.calls[1][0].decryptFailed).toBeUndefined();
+    expect(onDocumentChanged.mock.calls[2][0]).toMatchObject({ documentId: 'unknown', title: '', decryptFailed: true });
     provider.destroy();
   });
 
@@ -97,7 +123,14 @@ describe('TeamSyncProvider pre-cutover content', () => {
     const provider = createProvider();
     const sent: Array<Record<string, unknown>> = [];
     (provider as unknown as { send: (m: Record<string, unknown>) => void }).send =
-      (message) => { sent.push(message); };
+      (message) => {
+        sent.push(message);
+        // Stand in for the server's `docIndexRegistered` ack, which
+        // `registerDocument` now waits on (NIM-2472).
+        if (message.type === 'docIndexRegister') {
+          (provider as any).resolveRegisterAck(message.documentId, true);
+        }
+      };
 
     await provider.registerDocument('doc-1', 'Notes.md', 'markdown', null);
     await provider.updateDocumentTitle('doc-1', 'Renamed.md');

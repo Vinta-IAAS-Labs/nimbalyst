@@ -4,14 +4,14 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { fireEvent, render, screen, cleanup } from '@testing-library/react';
 import { ContextUsageDisplay } from '../ContextUsageDisplay';
 
-vi.mock('@nimbalyst/runtime', async (importOriginal) => ({
-  ...await importOriginal<typeof import('@nimbalyst/runtime')>(),
+vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: () => null,
 }));
 vi.mock('../../../help', () => ({ getHelpContent: () => undefined }));
 
 // inputTokens > 0 makes the breakdown panel eligible (enableTooltip).
 const props = {
+  provider: 'claude-code',
   inputTokens: 80_000,
   outputTokens: 20_000,
   totalTokens: 100_000,
@@ -32,7 +32,7 @@ describe('ContextUsageDisplay - context meter opens on click, not hover (#429)',
     render(<ContextUsageDisplay {...props} />);
     const meter = screen.getByTestId('context-indicator');
     fireEvent.click(meter);
-    expect(screen.getByRole('tooltip')).toBeTruthy();
+    screen.getByRole('tooltip');
     fireEvent.click(meter);
     expect(screen.queryByRole('tooltip')).toBeNull();
   });
@@ -40,7 +40,7 @@ describe('ContextUsageDisplay - context meter opens on click, not hover (#429)',
   it('closes the panel on an outside click', () => {
     render(<ContextUsageDisplay {...props} />);
     fireEvent.click(screen.getByTestId('context-indicator'));
-    expect(screen.getByRole('tooltip')).toBeTruthy();
+    screen.getByRole('tooltip');
     fireEvent.mouseDown(document.body);
     expect(screen.queryByRole('tooltip')).toBeNull();
   });
@@ -48,7 +48,7 @@ describe('ContextUsageDisplay - context meter opens on click, not hover (#429)',
   it('closes the panel on Escape', () => {
     render(<ContextUsageDisplay {...props} />);
     fireEvent.click(screen.getByTestId('context-indicator'));
-    expect(screen.getByRole('tooltip')).toBeTruthy();
+    screen.getByRole('tooltip');
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('tooltip')).toBeNull();
   });
@@ -70,7 +70,7 @@ describe('ContextUsageDisplay - cumulative rows are labeled as session totals (#
     // the same quantity and contradict each other (#824: 76k vs 12,073).
     render(<ContextUsageDisplay {...props} />);
     fireEvent.click(screen.getByTestId('context-indicator'));
-    expect(screen.getByText('Session totals (cumulative)')).toBeTruthy();
+    screen.getByText('Session totals (cumulative)');
   });
 
   it('omits the session-totals label when there is no context window (header already says Token Usage)', () => {
@@ -79,6 +79,7 @@ describe('ContextUsageDisplay - cumulative rows are labeled as session totals (#
     // window-fill total renders, so there is no second quantity to label.
     render(
       <ContextUsageDisplay
+        provider="openai"
         inputTokens={80_000}
         outputTokens={20_000}
         totalTokens={100_000}
@@ -87,5 +88,39 @@ describe('ContextUsageDisplay - cumulative rows are labeled as session totals (#
     );
     fireEvent.click(screen.getByTestId('context-indicator'));
     expect(screen.queryByText('Session totals (cumulative)')).toBeNull();
+  });
+});
+
+describe('ContextUsageDisplay - measured provider support (#914)', () => {
+  it('does not render an indicator for a provider that reports no usage', () => {
+    render(
+      <ContextUsageDisplay
+        provider="copilot-cli"
+        inputTokens={0}
+        outputTokens={0}
+        totalTokens={0}
+        contextWindow={200_000}
+        currentContext={{ tokens: 0, contextWindow: 200_000 }}
+      />
+    );
+
+    expect(screen.queryByTestId('context-indicator')).toBeNull();
+  });
+
+  it('shows cumulative counts without inventing a percentage for count-only providers', () => {
+    // contextWindow is deliberately non-zero: a catalog window must not turn
+    // cumulative spend into a fill, whatever else is passed in.
+    render(
+      <ContextUsageDisplay
+        provider="grok-build"
+        inputTokens={80_000}
+        outputTokens={20_000}
+        totalTokens={100_000}
+        contextWindow={200_000}
+      />
+    );
+
+    // #914: never a fill percentage without a real denominator.
+    expect(screen.getByTestId('context-indicator').textContent).not.toMatch(/%|\//);
   });
 });

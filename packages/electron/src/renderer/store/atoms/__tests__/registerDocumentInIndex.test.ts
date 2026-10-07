@@ -1,21 +1,28 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
-import { activeWorkspacePathAtom } from '../openProjects';
-import { registerDocumentInIndex, sharedDocumentsAtom } from '../collabDocuments';
+import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import { activeCollabScopeAtom, registerDocumentInIndex, sharedDocumentsAtom } from '../collabDocuments';
 import { pendingDocRegistrations } from '../pendingDocRegistrations';
+import type { CollabScope } from '@nimbalyst/collab-client/core';
 
 const WS = '/workspace/register-test';
+const SCOPE: CollabScope = {
+  scopeKey: WS,
+  orgId: 'org-register',
+  indexConfig: { serverUrl: 'wss://example.test', teamMemberId: asTeamMemberId('user-register') },
+};
 
 afterEach(() => {
   pendingDocRegistrations.clear(WS);
-  store.set(activeWorkspacePathAtom, null);
+  store.set(activeCollabScopeAtom, null);
 });
 
 describe('registerDocumentInIndex (NIM-1565)', () => {
   it('queues the registration when no team-sync provider is connected', async () => {
-    store.set(activeWorkspacePathAtom, WS);
+    store.set(activeCollabScopeAtom, SCOPE);
 
-    await registerDocumentInIndex('doc-1', 'Folder/What is Next.md', 'markdown', 'folder-1', {
+    await registerDocumentInIndex(SCOPE, 'doc-1', 'Folder/What is Next.md', 'markdown', 'folder-1', {
       metadataVersion: 2,
       fileExtension: '.md',
       editorId: 'builtin.lexical',
@@ -43,5 +50,19 @@ describe('registerDocumentInIndex (NIM-1565)', () => {
       fileExtension: '.md',
       editorId: 'builtin.lexical',
     });
+  });
+
+  it('queues a page under a typed page with its parent kind and order, and flushes them to the provider', async () => {
+    store.set(activeCollabScopeAtom, SCOPE);
+    await registerDocumentInIndex(SCOPE, 'doc-2', 'Notes', 'markdown', 'mod_1', undefined, { parentKind: 'item', sortOrder: 2048 });
+
+    expect(pendingDocRegistrations.list(WS)).toEqual([expect.objectContaining({
+      documentId: 'doc-2', parentFolderId: 'mod_1', parentKind: 'item', sortOrder: 2048,
+    })]);
+    expect(store.get(sharedDocumentsAtom).find((d) => d.documentId === 'doc-2')).toMatchObject({ parentKind: 'item' });
+
+    const calls: unknown[][] = [];
+    await pendingDocRegistrations.flush(WS, { registerDocument: async (...args: unknown[]) => { calls.push(args); } });
+    expect(calls).toEqual([['doc-2', 'Notes', 'markdown', 'mod_1', undefined, undefined, { parentKind: 'item', sortOrder: 2048 }]]);
   });
 });

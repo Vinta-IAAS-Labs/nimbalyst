@@ -1,0 +1,266 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { useAtomValue, useSetAtom } from 'jotai';
+
+import { HelpTooltip } from '../../help';
+import { SidebarSection } from '../common/SidebarSection';
+import {
+  orgSidebarCollapsedSectionsAtom,
+  toggleOrgSidebarSectionAtom,
+} from './orgSidebarPreferences';
+import type { ConversationDirectoryEntry } from '../../../shared/conversationDirectory';
+
+export interface OrgProjectLocalState {
+  projectId: string;
+  teamProjectId: string;
+  name: string | null;
+  slug: string | null;
+  gitRemoteHash: string | null;
+  localStatus: 'open' | 'closed' | 'notLocal';
+  workspacePath: string | null;
+}
+
+export function useOrgProjectLocalStates(orgId: string): {
+  projects: OrgProjectLocalState[];
+  loading: boolean;
+  error: string | null;
+  reload: () => void;
+} {
+  const [projects, setProjects] = useState<OrgProjectLocalState[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void window.electronAPI.team.resolveOrgProjectsLocalState(orgId)
+      .then((result) => {
+        if (cancelled) return;
+        if (!result?.success) throw new Error(result?.error ?? 'Could not load projects');
+        setProjects(result.projects ?? []);
+      })
+      .catch((reason) => {
+        if (!cancelled) {
+          setProjects([]);
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [orgId, nonce]);
+
+  // Stable: the sidebar is memoized around this section, and a fresh `reload`
+  // closure on every render would invalidate it on every navigation.
+  const reload = useCallback(() => setNonce((value) => value + 1), []);
+
+  return { projects, loading, error, reload };
+}
+
+export function resolveConversationProjectWorkspace(
+  projects: readonly OrgProjectLocalState[],
+  entry: ConversationDirectoryEntry,
+): string | null {
+  const projectHint = (entry as ConversationDirectoryEntry & {
+    projectId?: string | null;
+    teamProjectId?: string | null;
+  }).projectId ?? (entry as ConversationDirectoryEntry & {
+    teamProjectId?: string | null;
+  }).teamProjectId ?? null;
+  if (!projectHint) return null;
+  const project = projects.find((candidate) => (
+    candidate.projectId === projectHint || candidate.teamProjectId === projectHint
+  ));
+  if (!project || project.localStatus === 'notLocal') return null;
+  return project.workspacePath;
+}
+
+export function OrgProjectsSidebarSection({
+  orgId,
+  projects,
+  loading,
+  error,
+  onReload,
+}: {
+  orgId: string;
+  projects: OrgProjectLocalState[];
+  loading: boolean;
+  error: string | null;
+  onReload: () => void;
+}) {
+  const [openError, setOpenError] = useState<string | null>(null);
+  const collapsed = useAtomValue(orgSidebarCollapsedSectionsAtom);
+  const toggleSection = useSetAtom(toggleOrgSidebarSectionAtom);
+
+  const openProject = useCallback((workspacePath: string | null) => {
+    if (!workspacePath) return;
+    void window.electronAPI.team.openProjectWorkspace(workspacePath).catch((reason) => {
+      console.error('[OrgProjectsSidebarSection] Failed to open project:', reason);
+    });
+  }, []);
+
+  /**
+   * A project with no git remote has nothing for this machine to match it by,
+   * so opening it means choosing the folder it lives in. The native panel
+   * allows creating one, which covers "I don't have a folder for this yet".
+   */
+  const openSharedProject = useCallback(async (project: OrgProjectLocalState) => {
+    setOpenError(null);
+    const selection = await window.electronAPI.invoke('dialog:openDirectory', {
+      title: `Choose a folder for ${project.name || project.slug || 'this project'}`,
+      buttonLabel: 'Open Project',
+    });
+    const directoryPath = selection?.filePaths?.[0];
+    if (!directoryPath) return;
+
+    const result = await window.electronAPI.team.openSharedProject({
+      orgId,
+      teamProjectId: project.teamProjectId,
+      directoryPath,
+    });
+    if (!result?.success) {
+      setOpenError(result?.error ?? 'Could not open that project');
+      return;
+    }
+    onReload();
+  }, [orgId, onReload]);
+
+  return (
+    // A section of the sidebar rather than a panel pinned under it: Projects
+    // scrolls and folds away with Rooms and Direct messages instead of
+    // permanently taking the bottom of the window.
+    <SidebarSection
+      sectionId="projects"
+      title="Projects"
+      testId="org-projects-sidebar-section"
+      className="org-projects-sidebar-section"
+      collapsed={collapsed.includes('projects')}
+      onToggleCollapsed={() => toggleSection('projects')}
+      actions={error && (
+        <button
+          type="button"
+          className="org-projects-sidebar-retry org-window-no-drag shrink-0 rounded px-1 text-[11px] text-nim-link hover:bg-nim-hover"
+          data-testid="org-projects-sidebar-retry"
+          onClick={onReload}
+        >
+          Retry
+        </button>
+      )}
+    >
+      <div className="org-projects-sidebar-list flex flex-col" data-testid="org-projects-sidebar-list" data-org-id={orgId}>
+        {loading && (
+          <div className="org-projects-sidebar-loading px-3 py-1 text-[11px] text-nim-muted">
+            Loading projects…
+          </div>
+        )}
+        {!loading && !error && projects.length === 0 && (
+          <div className="org-projects-sidebar-empty px-3 py-1 text-[11px] text-nim-muted">
+            No projects yet.
+          </div>
+        )}
+        {!loading && error && (
+          <div className="org-projects-sidebar-error px-3 py-1 text-[11px] text-nim-error">
+            Couldn't load projects.
+          </div>
+        )}
+        {!loading && !error && projects.map((project) => (
+          <ProjectRow
+            key={project.projectId}
+            project={project}
+            onOpen={openProject}
+            onOpenShared={openSharedProject}
+          />
+        ))}
+        {openError && (
+          <div
+            className="org-projects-sidebar-open-error px-3 py-1 text-[11px] text-nim-error"
+            data-testid="org-projects-sidebar-open-error"
+          >
+            {openError}
+          </div>
+        )}
+      </div>
+    </SidebarSection>
+  );
+}
+
+function ProjectRow({
+  project,
+  onOpen,
+  onOpenShared,
+}: {
+  project: OrgProjectLocalState;
+  onOpen: (workspacePath: string | null) => void;
+  onOpenShared: (project: OrgProjectLocalState) => void;
+}) {
+  const name = project.name || project.slug || 'Untitled project';
+  const isLocal = project.localStatus !== 'notLocal' && !!project.workspacePath;
+  // A project with no git remote can be attached to any folder on this machine.
+  // One backed by a remote cannot: cloning the repository is what connects it,
+  // and binding some other folder would give the project two answers.
+  const canAttachFolder = !isLocal && !project.gitRemoteHash;
+  const disabled = !isLocal && !canAttachFolder;
+  const label = project.localStatus === 'open'
+    ? 'Open locally'
+    : project.localStatus === 'closed'
+      ? 'Cloned locally'
+      : canAttachFolder
+        ? 'Choose a folder for this project'
+        : 'Not local';
+  const dotClass = project.localStatus === 'open'
+    ? 'bg-nim-success border-nim-success'
+    : project.localStatus === 'closed'
+      ? 'bg-transparent border-nim-success'
+      : 'bg-transparent border-nim-text-faint border-dashed';
+
+  const button = (
+    <button
+      type="button"
+      className={`org-projects-sidebar-row org-window-no-drag group mx-1.5 flex items-center gap-2 rounded-md px-2 py-1 text-left ${
+        disabled
+          ? 'cursor-not-allowed text-nim-disabled'
+          : 'text-nim-muted hover:bg-nim-hover hover:text-nim'
+      }`}
+      data-testid="org-projects-sidebar-row"
+      data-project-id={project.projectId}
+      data-local-status={project.localStatus}
+      disabled={disabled}
+      title={disabled
+        ? 'Clone this project’s repository, then open it to work in it here.'
+        : label}
+      onClick={() => (canAttachFolder ? onOpenShared(project) : onOpen(project.workspacePath))}
+    >
+      <span className={`org-projects-sidebar-dot size-2 shrink-0 rounded-full border ${dotClass}`} aria-hidden="true" />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[12.5px]">{name}</span>
+        {project.localStatus === 'notLocal' && (
+          <span className="block truncate text-[10px] text-nim-faint">
+            {canAttachFolder ? 'open locally…' : 'not local'}
+          </span>
+        )}
+      </span>
+      {/* Revealed on hover/focus: the affordance is the same on every row, so
+          showing it always was just noise down the list. */}
+      {!disabled && (
+        <MaterialSymbol
+          icon={canAttachFolder ? 'create_new_folder' : 'open_in_new'}
+          size={13}
+          className="org-projects-sidebar-open shrink-0 opacity-0 transition-opacity group-hover:opacity-70 group-focus-visible:opacity-70"
+        />
+      )}
+    </button>
+  );
+
+  if (!disabled) return button;
+
+  return (
+    <HelpTooltip testId={`org-project-not-local-${project.projectId}`}>
+      <span className="org-projects-sidebar-row-disabled block">
+        {button}
+      </span>
+    </HelpTooltip>
+  );
+}

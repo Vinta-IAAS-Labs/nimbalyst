@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAtomValue } from 'jotai';
-import { MaterialSymbol } from '@nimbalyst/runtime';
+import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { ExtensionErrorConsole } from './ExtensionErrorConsole';
 import { extensionDevToolsEnabledAtom } from '../../store/atoms/appSettings';
 import { HelpTooltip } from '../../help';
@@ -33,6 +33,22 @@ interface InstalledExtension {
   manifest: any;
   name: string;
   enabled: boolean;
+  staleBundleWarning?: string;
+}
+
+interface RebuildNotice {
+  kind: 'success' | 'error';
+  message: string;
+}
+
+function summarizeRebuildError(error: string | undefined): string {
+  if (!error) return 'The extension build failed. Open View Logs for details.';
+  const lines = error.split('\n').map(line => line.trim()).filter(Boolean);
+  const usefulLine = lines.find(line => /error|failed|timed out/i.test(line) && line !== 'Extension build failed:')
+    ?? lines[1]
+    ?? lines[0]
+    ?? 'The extension build failed. Open View Logs for details.';
+  return usefulLine.length > 180 ? `${usefulLine.slice(0, 177)}...` : usefulLine;
 }
 
 interface ExtensionDevIndicatorProps {
@@ -52,6 +68,8 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
   const [relativeTime, setRelativeTime] = useState<string>('');
   const [extensions, setExtensions] = useState<InstalledExtension[]>([]);
   const [rebuildingExtension, setRebuildingExtension] = useState<string | null>(null);
+  const [rebuildNotice, setRebuildNotice] = useState<RebuildNotice | null>(null);
+  const rebuildInProgress = useRef(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const rebuildSubmenuRef = useRef<HTMLDivElement>(null);
@@ -227,37 +245,40 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
     setConsoleOpen(true);
   };
 
-  const handleRebuildExtension = async (extension: InstalledExtension) => {
-    setRebuildingExtension(extension.id);
+  const handleRebuild = async (targets: InstalledExtension[], operation: string) => {
+    if (rebuildInProgress.current || targets.length === 0) return;
+    rebuildInProgress.current = true;
+    setRebuildingExtension(operation);
+    setRebuildNotice(null);
+    const failures: string[] = [];
     try {
-      const result = await window.electronAPI.extensions.devReload(extension.id, extension.path);
-      if (!result.success) {
-        console.error(`[ExtensionDevIndicator] Failed to rebuild ${extension.name}:`, result.error);
+      // Rebuild sequentially; one failed extension must not prevent the rest from installing.
+      for (const extension of targets) {
+        try {
+          const result = await window.electronAPI.extensions.devReload(extension.id, extension.path);
+          if (!result.success) throw new Error(summarizeRebuildError(result.error));
+          setExtensions(current => current.map(item => (
+            item.id === extension.id ? { ...item, staleBundleWarning: undefined } : item
+          )));
+        } catch (error) {
+          console.error(`[ExtensionDevIndicator] Failed to rebuild ${extension.name}:`, error);
+          failures.push(`${extension.name}: ${summarizeRebuildError(error instanceof Error ? error.message : String(error))}`);
+        }
       }
-    } catch (error) {
-      console.error(`[ExtensionDevIndicator] Failed to rebuild ${extension.name}:`, error);
+      setRebuildNotice(failures.length > 0
+        ? { kind: 'error', message: failures.join(' · ') }
+        : { kind: 'success', message: targets.length === 1
+          ? `${targets[0].name} rebuilt and reloaded.`
+          : `Rebuilt and reloaded ${targets.length} extensions.` });
     } finally {
+      rebuildInProgress.current = false;
       setRebuildingExtension(null);
+      if (operation === 'all' || operation === 'stale') setRebuildSubmenuOpen(false);
     }
   };
 
-  const handleRebuildAll = async () => {
-    setRebuildingExtension('all');
-    try {
-      for (const ext of extensions) {
-        const result = await window.electronAPI.extensions.devReload(ext.id, ext.path);
-        if (!result.success) {
-          console.error(`[ExtensionDevIndicator] Failed to rebuild ${ext.name}:`, result.error);
-        }
-      }
-    } catch (error) {
-      console.error('[ExtensionDevIndicator] Failed to rebuild extensions:', error);
-    } finally {
-      setRebuildingExtension(null);
-      setRebuildSubmenuOpen(false);
-      setMenuOpen(false);
-    }
-  };
+  const staleExtensions = extensions.filter(extension => extension.staleBundleWarning);
+  const staleExtensionCount = staleExtensions.length;
 
   return (
     <>
@@ -303,6 +324,55 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
             <div className="extension-dev-menu-uptime flex items-center gap-2 mx-3 mb-2 text-xs text-[var(--nim-text-faint)] [&_.material-symbols-outlined]:text-[var(--nim-text-faint)]">
               <MaterialSymbol icon="schedule" size={16} />
               <span>Started {relativeTime}</span>
+            </div>
+          )}
+
+          {staleExtensionCount > 0 && (
+            <div
+              className="extension-dev-stale-warning flex items-start gap-2 mx-3 mb-2 py-2 px-2.5 rounded-md bg-[color-mix(in_srgb,var(--nim-warning)_10%,transparent)] border border-[color-mix(in_srgb,var(--nim-warning)_30%,transparent)] text-xs text-[var(--nim-text-muted)]"
+              role="status"
+            >
+              <MaterialSymbol icon="warning" size={16} />
+              <div className="min-w-0 flex-1">
+                <span>{staleExtensionCount} stale extension bundle{staleExtensionCount === 1 ? '' : 's'} detected.</span>
+                <ul aria-label="Stale extensions" className="extension-dev-stale-list list-none m-0 mt-2 p-0 max-h-40 overflow-y-auto space-y-1">
+                  {staleExtensions.map(extension => (
+                    <li key={extension.id} className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 break-words">{extension.name}</span>
+                      <button
+                        className="extension-dev-reinstall shrink-0 bg-transparent border-none p-1 rounded text-[var(--nim-link)] hover:enabled:bg-[var(--nim-bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
+                        aria-label={`Reinstall ${extension.name}`}
+                        onClick={() => handleRebuild([extension], extension.id)}
+                        disabled={rebuildingExtension !== null}
+                      >
+                        {rebuildingExtension === extension.id ? 'Reinstalling...' : 'Reinstall'}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  className="extension-dev-reinstall-stale mt-2 w-full p-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] hover:enabled:bg-[var(--nim-bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
+                  data-testid="extension-dev-reinstall-stale"
+                  onClick={() => handleRebuild(staleExtensions, 'stale')}
+                  disabled={rebuildingExtension !== null}
+                >
+                  {rebuildingExtension === 'stale' ? 'Reinstalling stale extensions...' : 'Reinstall stale extensions'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {rebuildNotice && (
+            <div
+              className={`extension-dev-rebuild-notice flex items-start gap-2 mx-3 mb-2 py-2 px-2.5 rounded-md border text-xs ${
+                rebuildNotice.kind === 'error'
+                  ? 'bg-[color-mix(in_srgb,var(--nim-error)_10%,transparent)] border-[color-mix(in_srgb,var(--nim-error)_30%,transparent)] text-[var(--nim-error)]'
+                  : 'bg-[color-mix(in_srgb,var(--nim-success)_10%,transparent)] border-[color-mix(in_srgb,var(--nim-success)_30%,transparent)] text-[var(--nim-success)]'
+              }`}
+              role={rebuildNotice.kind === 'error' ? 'alert' : 'status'}
+            >
+              <MaterialSymbol icon={rebuildNotice.kind === 'error' ? 'error' : 'check_circle'} size={16} />
+              <span>{rebuildNotice.message}</span>
             </div>
           )}
 
@@ -363,7 +433,7 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
                   <div className="p-1 max-h-[calc(100vh-48px)] overflow-y-auto">
                     <button
                       className="extension-dev-menu-action flex items-center gap-2 w-full p-2 border-none bg-transparent text-[var(--nim-text)] text-[13px] font-inherit text-left rounded cursor-pointer transition-colors duration-100 hover:enabled:bg-[var(--nim-bg-hover)] disabled:text-[var(--nim-text-faint)] disabled:cursor-not-allowed [&_.material-symbols-outlined]:text-[var(--nim-text-muted)]"
-                      onClick={handleRebuildAll}
+                      onClick={() => handleRebuild(extensions, 'all')}
                       disabled={rebuildingExtension !== null}
                       role="menuitem"
                     >
@@ -379,11 +449,12 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
                       <button
                         key={ext.id}
                         className="extension-dev-menu-action flex items-center gap-2 w-full p-2 border-none bg-transparent text-[var(--nim-text)] text-[13px] font-inherit text-left rounded cursor-pointer transition-colors duration-100 hover:enabled:bg-[var(--nim-bg-hover)] disabled:text-[var(--nim-text-faint)] disabled:cursor-not-allowed [&_.material-symbols-outlined]:text-[var(--nim-text-muted)]"
-                        onClick={() => handleRebuildExtension(ext)}
+                        onClick={() => handleRebuild([ext], ext.id)}
                         disabled={rebuildingExtension !== null}
                         role="menuitem"
+                        title={ext.staleBundleWarning}
                       >
-                        <MaterialSymbol icon="extension" size={18} />
+                        <MaterialSymbol icon={ext.staleBundleWarning ? 'warning' : 'extension'} size={18} />
                         <span className="truncate">
                           {rebuildingExtension === ext.id ? 'Rebuilding...' : ext.name}
                         </span>

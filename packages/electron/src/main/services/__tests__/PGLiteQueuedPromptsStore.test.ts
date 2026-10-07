@@ -79,6 +79,7 @@ describe('PGLiteQueuedPromptsStore.sweepExecutingOnBoot', () => {
     const calls: { sql: string; params?: any[] }[] = [];
     const db: DbStub = {
       query: (async (sql: string, params?: any[]) => {
+        if (sql.includes("inboxDelivery' IS NOT NULL")) return { rows: [] };
         calls.push({ sql, params });
         // Pass 1: completed-update returns rows with delivery AND output evidence
         if (sql.includes("SET status = 'completed'")) {
@@ -143,6 +144,7 @@ describe('PGLiteQueuedPromptsStore.sweepExecutingOnBoot', () => {
     const calls: { sql: string; params?: any[] }[] = [];
     const db: DbStub = {
       query: (async (sql: string, params?: any[]) => {
+        if (sql.includes("inboxDelivery' IS NOT NULL")) return { rows: [] };
         calls.push({ sql, params });
         if (sql.includes("SET status = 'completed'")) {
           return { rows: [] };
@@ -250,6 +252,7 @@ describe('PGLiteQueuedPromptsStore.sweepExecutingForSession', () => {
     const calls: { sql: string; params?: any[] }[] = [];
     const db: DbStub = {
       query: (async (sql: string, params?: any[]) => {
+        if (sql.includes("inboxDelivery' IS NOT NULL")) return { rows: [] };
         calls.push({ sql, params });
         if (sql.includes("SET status = 'completed'")) {
           return { rows: [{ id: 'answered-1' }] };
@@ -308,5 +311,43 @@ describe('PGLiteQueuedPromptsStore.sweepExecutingForSession', () => {
       failed: 0,
       rolledBack: 0,
     });
+  });
+});
+
+describe('PGLiteQueuedPromptsStore boot re-drive helpers', () => {
+  it('listSessionIdsWithPending returns each session once, pending rows only', async () => {
+    const query = vi.fn(async (sql: string, params?: any[]) => {
+      expect(sql).toContain('DISTINCT session_id');
+      expect(sql).toContain("status = 'pending'");
+      expect(params).toBeUndefined();
+      return { rows: [{ session_id: 'session-a' }, { session_id: 'session-b' }] };
+    });
+    const db: DbStub = { query: query as any };
+
+    const store = createPGLiteQueuedPromptsStore(db);
+
+    expect(await store.listSessionIdsWithPending()).toEqual(['session-a', 'session-b']);
+  });
+
+  it('failAllPendingForSession fails only that session\'s pending rows', async () => {
+    const query = vi.fn(async (sql: string, params?: any[]) => {
+      expect(sql).toContain("SET status = 'failed'");
+      // Must not touch an executing row: that prompt is already in the
+      // conversation and failing it would contradict the boot sweep.
+      expect(sql).toContain("status = 'pending'");
+      expect(sql).toContain('session_id = $1');
+      expect(params).toEqual(['session-gone', 'Project folder is no longer available at /gone']);
+      return { rows: [{ id: 'p1' }, { id: 'p2' }] };
+    });
+    const db: DbStub = { query: query as any };
+
+    const store = createPGLiteQueuedPromptsStore(db);
+
+    expect(
+      await store.failAllPendingForSession(
+        'session-gone',
+        'Project folder is no longer available at /gone',
+      ),
+    ).toBe(2);
   });
 });

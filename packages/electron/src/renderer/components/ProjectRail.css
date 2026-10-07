@@ -9,12 +9,25 @@
   gap: 8px;
   background-color: var(--nim-bg-secondary, #1a1a1a);
   border-right: 1px solid var(--nim-border, rgba(255, 255, 255, 0.06));
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   -webkit-app-region: no-drag;
 }
 
+.project-rail-projects {
+  flex: 1;
+  min-height: 0;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .project-rail-item {
+  flex-shrink: 0;
   /*
    * --rail-item-accent is set inline per project (see ProjectRail.tsx:
    * style={{ '--rail-item-accent': accentColor }}). It comes from
@@ -124,6 +137,7 @@
 }
 
 .project-rail-divider {
+  flex-shrink: 0;
   width: 32px;
   height: 1px;
   background-color: var(--nim-border, rgba(255, 255, 255, 0.06));
@@ -131,6 +145,7 @@
 }
 
 .project-rail-add {
+  flex-shrink: 0;
   width: 40px;
   height: 40px;
   border-radius: 50%;
@@ -161,11 +176,8 @@
 
 .project-rail-context-menu {
   position: fixed;
-  /* The add menu is bottom-aligned to the `+` button and grows upward, so with a
-     few recent projects `shift()` clamps it against the top of the viewport and
-     its first item lands inside the title bar's drag region. Declared here as
-     well as globally (see index.css) because this is the surface issue #1052
-     reported: on Windows the OS ate the click on "Open folder…". */
+  /* Keep menus clickable even near the native title bar (#1052).
+     windowControlsClearance() also keeps them clear of OS window controls. */
   -webkit-app-region: no-drag;
   min-width: 180px;
   background-color: var(--nim-bg-secondary, #1a1a1a);
@@ -211,6 +223,7 @@
 }
 
 .project-rail-add-menu {
+  box-sizing: border-box;
   min-width: 260px;
   max-width: 360px;
 }
@@ -277,3 +290,6 @@
   text-overflow: ellipsis;
 }
 
+.project-rail-add-menu > * {
+  flex-shrink: 0;
+}

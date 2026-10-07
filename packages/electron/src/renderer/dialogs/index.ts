@@ -29,9 +29,9 @@ export {
   registerDataDialogs,
   type ProjectSelectionData,
   type ErrorDialogData,
-  type ConfirmDialogData,
   type SessionImportData,
 } from './dataDialogs';
+export { registerConfirmDialog, type ConfirmDialogData } from './confirmDialogRegistration';
 export {
   registerOnboardingDialogs,
   type WindowsClaudeCodeWarningData,
@@ -42,8 +42,11 @@ export {
 } from './onboardingDialogs';
 export {
   registerTeamDialogs,
-  type CreateTeamData,
   type ShareToTeamData,
+  type ShareFolderToTeamData,
+  type OrgCreationWizardData,
+  type OrgManagementDialogData,
+  type OrgProjectWalkData,
 } from './teamDialogs';
 export { registerAccountDialogs, type AccountLoginData } from './accountDialogs';
 export { useNavigationDialogs, type UseNavigationDialogsReturn } from './useNavigationDialogs';

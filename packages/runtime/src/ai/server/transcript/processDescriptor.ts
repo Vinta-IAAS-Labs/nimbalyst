@@ -10,6 +10,26 @@
 import type { TranscriptWriter } from './TranscriptWriter';
 import type { ITranscriptEventStore, TranscriptEvent } from './types';
 import type { CanonicalEventDescriptor } from './parsers/IRawMessageParser';
+import type { RawMessage } from './TranscriptTransformer';
+
+const PROMPT_ACTORS = new Set(['human', 'agent', 'system']);
+
+/**
+ * Copy who sent a prompt from its raw row onto the user_message descriptors it
+ * produced. Done here rather than in each parser so every provider carries it:
+ * the transcript uses it to tell a human turn from an agent send or the answer
+ * auto-resume, which must not close open questions.
+ */
+export function stampPromptSource(desc: CanonicalEventDescriptor, msg: Pick<RawMessage, 'metadata'>): CanonicalEventDescriptor {
+  if (desc.type !== 'user_message' || !msg.metadata) return desc;
+  const actor = (msg.metadata.promptProvenance as { actor?: unknown } | undefined)?.actor;
+  if (typeof actor === 'string' && PROMPT_ACTORS.has(actor)) {
+    desc.promptActor = actor as 'human' | 'agent' | 'system';
+  }
+  const origin = msg.metadata.promptOrigin;
+  if (typeof origin === 'string' && origin) desc.promptOrigin = origin;
+  return desc;
+}
 
 function isActiveToolCallEvent(event: TranscriptEvent): boolean {
   const payload = event.payload as Record<string, unknown>;
@@ -54,6 +74,8 @@ export async function processDescriptor(
         mode: desc.mode,
         attachments: desc.attachments,
         createdAt: desc.createdAt,
+        promptActor: desc.promptActor,
+        promptOrigin: desc.promptOrigin,
       });
     }
 
@@ -78,6 +100,12 @@ export async function processDescriptor(
         deniedReason: desc.deniedReason,
         deniedReasonType: desc.deniedReasonType,
         deniedInput: desc.deniedInput,
+        isAttachmentStagingDenied: desc.isAttachmentStagingDenied,
+        attachmentPath: desc.attachmentPath,
+        attachmentFilename: desc.attachmentFilename,
+        attachmentStagingMode: desc.attachmentStagingMode,
+        attachmentDenyRule: desc.attachmentDenyRule,
+        attachmentDetection: desc.attachmentDetection,
       });
     }
 
@@ -224,7 +252,7 @@ export async function processDescriptor(
 
 export function selectRawParser(
   provider: string,
-): 'codex' | 'codex-acp' | 'copilot' | 'claude-code' | 'opencode' | 'voice' {
+): 'codex' | 'codex-acp' | 'copilot' | 'claude-code' | 'opencode' | 'voice' | 'grok-build' | 'cursor-agent' | 'gemini-antigravity' {
   if (provider === 'copilot-cli') {
     return 'copilot';
   }
@@ -236,6 +264,15 @@ export function selectRawParser(
   }
   if (provider === 'opencode') {
     return 'opencode';
+  }
+  if (provider === 'grok-build') {
+    return 'grok-build';
+  }
+  if (provider === 'cursor-agent') {
+    return 'cursor-agent';
+  }
+  if (provider === 'antigravity-gemini-agent') {
+    return 'gemini-antigravity';
   }
   if (provider === 'openai-realtime') {
     return 'voice';

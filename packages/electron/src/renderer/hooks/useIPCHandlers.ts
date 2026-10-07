@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { registerCollabDocumentReadHandler } from './registerCollabDocumentReadHandler';
+import { useCallback, useEffect, useRef } from 'react';
 import { useAtomValue } from 'jotai';
 import type { LexicalCommand, TextReplacement } from '@nimbalyst/runtime';
 import {
@@ -11,28 +12,17 @@ import {
 } from '@nimbalyst/runtime';
 import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
 import {
+  classifyCommentAnchorInput,
+  collabCommentAnchorAdapterRegistry,
   collabCommentControllerRegistry,
   CollabCommentControllerError,
 } from '@nimbalyst/runtime/editor';
+import { canvasWorkingSetRegistry } from '@nimbalyst/runtime/canvas/canvasPresence';
 import { store } from '@nimbalyst/runtime/store';
 import { DocumentModelRegistry } from '../services/document-model/DocumentModelRegistry';
 import { aiApi } from '../services/aiApi';
 import { getFileName } from '../utils/pathUtils';
-import { isCollabUri } from '../utils/collabUri';
-import {
-  updateSharedDocumentTitle,
-  removeSharedDocument,
-  moveSharedDocument,
-  createSharedFolder,
-  renameSharedFolder,
-  moveSharedFolder,
-  removeSharedFolder,
-  collectFolderSubtree,
-  sharedFoldersAtom,
-  allSharedDocumentsAtom,
-} from '../store/atoms/collabDocuments';
-import { getCollaborativeDocumentTypeCatalog } from '../services/CollaborativeDocumentTypeCatalog';
-import { createCollaborativeDocument } from '../services/collaborativeDocumentCreationOrchestrator';
+import { isCollabUri } from '@nimbalyst/collab-protocol';
 import type { ContentMode } from '../types/WindowModeTypes';
 import { dialogRef } from '../contexts/DialogContext';
 import { DIALOG_IDS } from '../dialogs';
@@ -42,42 +32,16 @@ import {
   menuFindPreviousCommandAtom,
 } from '../store/atoms/menuCommands';
 import { openEditorFind } from '../components/TabEditor/editorFindCommand';
+import { SearchReplaceStateManager, type SearchNavigateDirection } from '@nimbalyst/runtime/plugins/SearchReplace';
+import { dispatchTrackerFocusSearch } from '@nimbalyst/collab-client/trackers-ui';
 import { acquireHeadlessCollabCommentController } from '../services/HeadlessCollabCommentController';
-import {
-  trackDocumentAction,
-  trackFolderCreated,
-  trackFolderDeleted,
-  trackFolderMoved,
-  trackFolderRenamed,
-} from '../utils/collabIndexAnalytics';
+import { HeadlessCollabDocumentError } from '../services/HeadlessCollabDocument';
+import { applyAgentDiff } from '../services/agentDocumentAccess';
+import { registerMcpCollabReadHandlers } from '../services/mcpCollabReadHandlers';
+import { registerPageTreeToolHandlers } from '../services/pageTreeTools/pageTreeToolHandlers';
 
 // Tracker field updates now go through the generic trackerStatus frontmatter format.
 // No hardcoded plan-specific field list needed.
-
-/**
- * Resolve a human folder path (e.g. "A/B") to a folderId, walking the shared
- * folder tree by name and creating any missing segments via createSharedFolder
- * (the same path a person uses). Empty/blank path resolves to the root (null).
- * Used by the shared-index MCP tool listeners below.
- */
-async function resolveSharedFolderPath(folderPath: string | undefined): Promise<string | null> {
-  const trimmed = (folderPath ?? '').trim();
-  if (!trimmed) return null;
-  const segments = trimmed.split('/').map((s) => s.trim()).filter(Boolean);
-  let parentId: string | null = null;
-  for (const segment of segments) {
-    const folders = store.get(sharedFoldersAtom);
-    const existing = folders.find(
-      (f) => (f.parentFolderId ?? null) === parentId && f.name === segment,
-    );
-    if (existing) {
-      parentId = existing.folderId;
-    } else {
-      parentId = await createSharedFolder(segment, parentId);
-    }
-  }
-  return parentId;
-}
 
 function mergeFrontmatterData(
   existing: FrontmatterData | undefined,
@@ -542,7 +506,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     // MCP Server handlers
     if (window.electronAPI.onMcpApplyDiff) {
-      cleanupFns.push(window.electronAPI.onMcpApplyDiff(async ({ replacements, resultChannel, targetFilePath }) => {
+      cleanupFns.push(window.electronAPI.onMcpApplyDiff(async ({ replacements, resultChannel, targetFilePath, workspacePath: routedWorkspacePath, agent }) => {
         try {
           // SAFETY: Require explicit targetFilePath - no fallbacks allowed
           if (!targetFilePath) {
@@ -556,66 +520,27 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
             return;
           }
 
-          const filePath = targetFilePath;
-
-          // Validate target: filesystem markdown files OR shared collab docs.
-          const isCollab = isCollabUri(filePath);
-          if (!isCollab && !filePath.endsWith('.md')) {
-            console.error('[MCP] applyDiff can only modify markdown files or collab docs:', filePath);
-            if (window.electronAPI.sendMcpApplyDiffResult) {
-              window.electronAPI.sendMcpApplyDiffResult(resultChannel, {
-                success: false,
-                error: `applyDiff can only modify markdown files (.md) or collaborative documents (collab:// URIs). Attempted to modify: ${filePath}`
-              });
-            }
-            return;
-          }
-
-          // If the file isn't registered (not open), open it in the background.
-          // Collaborative docs cannot be opened in the background here — they
-          // require an active CollaborativeTabEditor backed by a Y.Doc.
-          if (!editorRegistry.has(filePath)) {
-            if (isCollab) {
-              if (window.electronAPI.sendMcpApplyDiffResult) {
-                window.electronAPI.sendMcpApplyDiffResult(resultChannel, {
-                  success: false,
-                  error: `Cannot edit collab document ${filePath}: no editor is currently mounted for it. Open the document in collab mode first.`
-                });
-              }
-              return;
-            }
-            // Read the file content
-            const result = await window.electronAPI.readFileContent(filePath);
-            const fileContent = result?.success ? result.content : '';
-
-            // Open the file using editorRegistry's file opener
-            await editorRegistry.openFileInBackground(filePath, fileContent);
-          }
-
-          // Use the editor registry to apply replacements to the target file
-          // Pass the resultChannel as a unique ID so the event can be correlated
-          const result = await editorRegistry.applyReplacements(filePath, replacements, resultChannel);
-
-          // Ensure result is defined and has the expected shape
-          const finalResult = result || { success: false, error: 'No result returned from diff application' };
+          const finalResult = await applyAgentDiff(targetFilePath, replacements, {
+            workspacePath: routedWorkspacePath ?? propsRef.current.workspacePath,
+            ...(agent ? { agent } : {}),
+            // The mounted editor reports completion via an async event; the
+            // result channel is what correlates it back to this request.
+            requestId: resultChannel,
+          });
 
           if (window.electronAPI.sendMcpApplyDiffResult) {
-            // Make sure we have all required properties and no undefined values
-            const resultToSend = {
+            // IPC can't carry undefined values, so only include what we have.
+            const resultToSend: { success: boolean; error?: string; code?: string; title?: string } = {
               success: finalResult.success ?? false
             };
-            // Only add error if it exists (IPC can't handle undefined values)
-            if (finalResult.error) {
-              (resultToSend as any).error = finalResult.error;
-            }
+            if (finalResult.error) resultToSend.error = finalResult.error;
+            if (finalResult.code) resultToSend.code = finalResult.code;
+            if (finalResult.title) resultToSend.title = finalResult.title;
             window.electronAPI.sendMcpApplyDiffResult(resultChannel, resultToSend);
           }
 
-          // Show error in UI if the diff failed
           if (!finalResult.success) {
             console.error('Diff application failed:', finalResult.error);
-            // You could also show a toast or notification here
-            // For now, we'll just make sure it's visible in the console
           }
         } catch (error) {
           console.error('MCP applyDiff error:', error);
@@ -635,38 +560,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
       }));
     }
 
-    if (window.electronAPI.onMcpReadCollabDoc) {
-      cleanupFns.push(window.electronAPI.onMcpReadCollabDoc(async ({ targetFilePath, resultChannel }) => {
-        try {
-          if (!targetFilePath || !isCollabUri(targetFilePath)) {
-            window.electronAPI.sendMcpReadCollabDocResult(resultChannel, {
-              success: false,
-              error: `readCollabDoc requires a collab:// URI. Got: ${targetFilePath ?? '(missing)'}`,
-            });
-            return;
-          }
-
-          if (!editorRegistry.has(targetFilePath)) {
-            window.electronAPI.sendMcpReadCollabDocResult(resultChannel, {
-              success: false,
-              error: `No editor mounted for ${targetFilePath}. Open the document in collab mode first.`,
-            });
-            return;
-          }
-
-          const content = editorRegistry.getContent(targetFilePath);
-          window.electronAPI.sendMcpReadCollabDocResult(resultChannel, {
-            success: true,
-            content,
-          });
-        } catch (error) {
-          window.electronAPI.sendMcpReadCollabDocResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error reading collab doc',
-          });
-        }
-      }));
-    }
+    cleanupFns.push(registerCollabDocumentReadHandler(() => propsRef.current.workspacePath));
 
     const handleCollabDocComment = async ({
       operation,
@@ -695,11 +589,28 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
           }
           let controller =
             collabCommentControllerRegistry.get(targetFilePath);
-          if (!controller) {
-            if (operation === 'createAnchored') {
+          const entityCreation =
+            operation === 'createAnchored' &&
+            classifyCommentAnchorInput(input?.anchor).kind === 'entity';
+          // An entity anchor is only creatable where something can confirm the
+          // target exists. A mounted adapter is registered by the same host
+          // that owns the mounted controller's repository, so when it reports
+          // `attached` one Y.Doc handle both validates and persists. Otherwise
+          // fall back to the headless acquisition, whose codec adapter answers
+          // over the Y.Doc it also writes to. Either way validation and
+          // persistence never straddle two document handles.
+          const mountedAdapterOwnsAnchor =
+            entityCreation &&
+            !!controller &&
+            collabCommentAnchorAdapterRegistry.getState(
+              targetFilePath,
+              input.anchor,
+            ) === 'attached';
+          if (!controller || (entityCreation && !mountedAdapterOwnsAnchor)) {
+            if (operation === 'createAnchored' && !entityCreation) {
               throw new CollabCommentControllerError(
                 'DOCUMENT_NOT_MOUNTED',
-                `Creating an anchored comment requires ${targetFilePath} to be open in a collaborative editor.`,
+                `Creating a text-quote comment requires ${targetFilePath} to be open in a collaborative Markdown editor.`,
               );
             }
             const currentWorkspacePath =
@@ -775,6 +686,77 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
           headlessAcquisition?.release();
         }
     };
+    /**
+     * A session declaring or releasing the cards it is editing on a canvas.
+     *
+     * The claim is recorded whether or not the board is open: a session should
+     * not have to wait for a human to be looking at the right tab, and the
+     * registry publishes into awareness the moment a board mounts on that key.
+     * `published` reports which of the two happened rather than pretending both
+     * are the same thing.
+     *
+     * Nothing here consults or enforces anything. A claim is an attention
+     * declaration; it never gates an edit by this session or anyone else.
+     */
+    if (window.electronAPI.onMcpCanvasWorkingSet) {
+      cleanupFns.push(
+        window.electronAPI.onMcpCanvasWorkingSet((data) => {
+          try {
+            if (!data.agent?.sessionId || !data.agent?.sessionName) {
+              throw new Error(
+                'The main process did not provide a verified agent session identity.',
+              );
+            }
+            if (data.mode === 'declare') {
+              canvasWorkingSetRegistry.apply({
+                type: 'declare',
+                declaration: {
+                  sessionId: data.agent.sessionId,
+                  sessionName: data.agent.sessionName,
+                  boardKey: data.board,
+                  nodeIds: data.nodeIds ?? [],
+                },
+              });
+            } else {
+              canvasWorkingSetRegistry.apply({
+                type: 'release',
+                sessionId: data.agent.sessionId,
+                boardKey: data.board,
+                ...(data.nodeIds === undefined
+                  ? {}
+                  : { nodeIds: data.nodeIds }),
+              });
+            }
+            window.electronAPI.sendMcpCanvasWorkingSetResult(
+              data.resultChannel,
+              {
+                success: true,
+                published: canvasWorkingSetRegistry.hasSubscribers(data.board),
+                nodeIds: [
+                  ...(canvasWorkingSetRegistry
+                    .getBoard(data.board)
+                    .find(
+                      (agent) => agent.sessionId === data.agent.sessionId,
+                    )?.nodeIds ?? []),
+                ],
+              },
+            );
+          } catch (error) {
+            window.electronAPI.sendMcpCanvasWorkingSetResult(
+              data.resultChannel,
+              {
+                success: false,
+                code: 'CANVAS_WORKING_SET_FAILED',
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'Unknown canvas working-set error',
+              },
+            );
+          }
+        }),
+      );
+    }
     if (window.electronAPI.onMcpReadCollabDocComments) {
       cleanupFns.push(
         window.electronAPI.onMcpReadCollabDocComments((data) => {
@@ -800,171 +782,11 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
       );
     }
 
-    // Shared-index (first-class shared folders + documents) MCP tools. Each
-    // routes through the SAME renderer functions a person uses so the AI's
-    // changes sync to the team identically.
-    if (window.electronAPI.onMcpCreateSharedDoc) {
-      cleanupFns.push(window.electronAPI.onMcpCreateSharedDoc(async ({ title, documentType, parentFolderId, folderPath, initialContent, resultChannel }) => {
-        try {
-          // folderPath (by name, creates missing folders) wins over an explicit
-          // parentFolderId when both are supplied.
-          const targetParentId = folderPath !== undefined
-            ? await resolveSharedFolderPath(folderPath)
-            : (parentFolderId ?? null);
+    // Pages MCP tools (Team and Personal page trees). Each routes through the
+    // same planner and docs session a person's drag and drop uses.
+    cleanupFns.push(...registerMcpCollabReadHandlers());
 
-          const requestedDocumentType = documentType || 'markdown';
-          const catalog = getCollaborativeDocumentTypeCatalog();
-          const fileExtension = catalog.inferFileExtension(requestedDocumentType, title);
-          const resolution = catalog.resolveMetadata(requestedDocumentType, fileExtension);
-          if (resolution.state !== 'ready') throw new Error(resolution.reason);
-
-          const document = await createCollaborativeDocument({
-            descriptor: resolution.descriptor,
-            requestedName: title,
-            parentFolderId: targetParentId,
-            sourceContent: initialContent ?? '',
-            analyticsSource: 'agent_tool',
-            analyticsActorType: 'agent',
-          });
-
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: true,
-            documentId: document.documentId,
-          });
-        } catch (error) {
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error creating shared document',
-          });
-        }
-      }));
-    }
-
-    if (window.electronAPI.onMcpCreateSharedFolder) {
-      cleanupFns.push(window.electronAPI.onMcpCreateSharedFolder(async ({ name, parentFolderId, folderPath, resultChannel }) => {
-        try {
-          const targetParentId = folderPath !== undefined
-            ? await resolveSharedFolderPath(folderPath)
-            : (parentFolderId ?? null);
-          const folderId = await createSharedFolder(name, targetParentId);
-          trackFolderCreated({
-            actorType: 'agent',
-            source: 'agent_tool',
-            nested: targetParentId !== null,
-          });
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, { success: true, folderId });
-        } catch (error) {
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error creating shared folder',
-          });
-        }
-      }));
-    }
-
-    if (window.electronAPI.onMcpMoveSharedItem) {
-      cleanupFns.push(window.electronAPI.onMcpMoveSharedItem(async ({ itemId, kind, newParentFolderId, folderPath, resultChannel }) => {
-        try {
-          const targetParentId = folderPath !== undefined
-            ? await resolveSharedFolderPath(folderPath)
-            : (newParentFolderId ?? null);
-          if (kind === 'doc') {
-            const movedType = store.get(allSharedDocumentsAtom)
-              .find(doc => doc.documentId === itemId)?.documentType;
-            moveSharedDocument(itemId, targetParentId);
-            trackDocumentAction({
-              action: 'moved',
-              actorType: 'agent',
-              documentType: movedType,
-              entryPoint: 'agent_tool',
-            });
-          } else {
-            moveSharedFolder(itemId, targetParentId);
-            trackFolderMoved({
-              actorType: 'agent',
-              source: 'agent_tool',
-              toRoot: targetParentId === null,
-            });
-          }
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, { success: true });
-        } catch (error) {
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error moving shared item',
-          });
-        }
-      }));
-    }
-
-    if (window.electronAPI.onMcpRenameSharedItem) {
-      cleanupFns.push(window.electronAPI.onMcpRenameSharedItem(async ({ itemId, kind, newName, resultChannel }) => {
-        try {
-          if (kind === 'doc') {
-            const renamedType = store.get(allSharedDocumentsAtom)
-              .find(doc => doc.documentId === itemId)?.documentType;
-            await updateSharedDocumentTitle(itemId, newName);
-            trackDocumentAction({
-              action: 'renamed',
-              actorType: 'agent',
-              documentType: renamedType,
-              entryPoint: 'agent_tool',
-            });
-          } else {
-            await renameSharedFolder(itemId, newName);
-            trackFolderRenamed({
-              actorType: 'agent',
-              source: 'agent_tool',
-            });
-          }
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, { success: true });
-        } catch (error) {
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error renaming shared item',
-          });
-        }
-      }));
-    }
-
-    if (window.electronAPI.onMcpDeleteSharedItem) {
-      cleanupFns.push(window.electronAPI.onMcpDeleteSharedItem(async ({ itemId, kind, resultChannel }) => {
-        try {
-          if (kind === 'doc') {
-            const trashedType = store.get(allSharedDocumentsAtom)
-              .find(doc => doc.documentId === itemId)?.documentType;
-            removeSharedDocument(itemId);
-            trackDocumentAction({
-              action: 'trashed',
-              actorType: 'agent',
-              documentType: trashedType,
-              entryPoint: 'agent_tool',
-            });
-            window.electronAPI.sendMcpCollabIndexResult(resultChannel, { success: true });
-          } else {
-            // Count the subtree before removal so we can report what was pruned.
-            // Mirrors the sidebar's count so agent and human deletions of the
-            // same folder report the same buckets.
-            const subtreeFolderIds = new Set(collectFolderSubtree(store.get(sharedFoldersAtom), itemId));
-            const removedCount = subtreeFolderIds.size;
-            const documentCount = store.get(allSharedDocumentsAtom)
-              .filter(doc => doc.parentFolderId && subtreeFolderIds.has(doc.parentFolderId)).length;
-            removeSharedFolder(itemId);
-            trackFolderDeleted({
-              actorType: 'agent',
-              source: 'agent_tool',
-              documentCount,
-              subfolderCount: Math.max(0, removedCount - 1),
-            });
-            window.electronAPI.sendMcpCollabIndexResult(resultChannel, { success: true, removedCount });
-          }
-        } catch (error) {
-          window.electronAPI.sendMcpCollabIndexResult(resultChannel, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error deleting shared item',
-          });
-        }
-      }));
-    }
+    cleanupFns.push(...registerPageTreeToolHandlers());
 
     if (window.electronAPI.onMcpStreamContent) {
       // console.log('[MCP] Registering onMcpStreamContent handler');
@@ -1360,38 +1182,56 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
   const menuFindNextInitialRef = useRef(menuFindNextVersion);
   const menuFindPreviousInitialRef = useRef(menuFindPreviousVersion);
 
+  // The file whose editor owns Find in Files and Collab modes.
+  const getActiveFindPath = useCallback((mode: string): string | null => {
+    if (mode === 'files') {
+      return (window as unknown as { __currentDocumentPath?: string | null }).__currentDocumentPath ||
+        editorRegistry.getActiveFilePath() ||
+        null;
+    }
+    if (mode === 'collab') {
+      return collabModeRef.current?.getActiveDocumentPath?.() ?? null;
+    }
+    return null;
+  }, [collabModeRef]);
+
   useEffect(() => {
     if (menuFindVersion === menuFindInitialRef.current) return;
     const mode = propsRef.current.activeMode;
-    if (mode === 'files') {
-      const activeFilePath =
-        (window as unknown as { __currentDocumentPath?: string | null }).__currentDocumentPath ||
-        editorRegistry.getActiveFilePath();
-      if (activeFilePath) {
-        openEditorFind(activeFilePath);
-      }
-    } else if (mode === 'collab') {
-      const activeDocumentPath = collabModeRef.current?.getActiveDocumentPath?.();
-      if (activeDocumentPath) {
-        openEditorFind(activeDocumentPath);
+    if (mode === 'files' || mode === 'collab') {
+      const findPath = getActiveFindPath(mode);
+      if (findPath) {
+        openEditorFind(findPath);
       }
     } else if (mode === 'agent') {
       window.dispatchEvent(new CustomEvent('menu:find'));
+    } else if (mode === 'tracker') {
+      dispatchTrackerFocusSearch();
     }
-  }, [collabModeRef, menuFindVersion]);
+  }, [getActiveFindPath, menuFindVersion]);
+
+  // Find Next / Previous. The menu accelerator swallows Cmd+G, so the Lexical
+  // find bar only hears it through SearchReplaceStateManager (#1578). Monaco
+  // keeps handling its own find widget.
+  const dispatchFindNavigate = useCallback((direction: SearchNavigateDirection) => {
+    const mode = propsRef.current.activeMode;
+    if (mode === 'agent') {
+      window.dispatchEvent(new CustomEvent(direction === 'next' ? 'menu:find-next' : 'menu:find-previous'));
+      return;
+    }
+    const findPath = getActiveFindPath(mode);
+    if (findPath) {
+      SearchReplaceStateManager.navigate(findPath, direction);
+    }
+  }, [getActiveFindPath]);
 
   useEffect(() => {
     if (menuFindNextVersion === menuFindNextInitialRef.current) return;
-    if (propsRef.current.activeMode === 'agent') {
-      window.dispatchEvent(new CustomEvent('menu:find-next'));
-    }
-    // Editor mode: Monaco/Lexical handle this via their own keyboard shortcuts.
-  }, [menuFindNextVersion]);
+    dispatchFindNavigate('next');
+  }, [dispatchFindNavigate, menuFindNextVersion]);
 
   useEffect(() => {
     if (menuFindPreviousVersion === menuFindPreviousInitialRef.current) return;
-    if (propsRef.current.activeMode === 'agent') {
-      window.dispatchEvent(new CustomEvent('menu:find-previous'));
-    }
-  }, [menuFindPreviousVersion]);
+    dispatchFindNavigate('previous');
+  }, [dispatchFindNavigate, menuFindPreviousVersion]);
 }

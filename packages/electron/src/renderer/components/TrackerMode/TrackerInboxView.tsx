@@ -16,6 +16,7 @@ import type { JSX } from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { useFloating, offset, flip, shift, FloatingPortal, autoUpdate } from '@floating-ui/react';
+import { windowControlsClearance } from '@nimbalyst/runtime/ui/floating/windowControlsClearance';
 import type { TrackerItemType } from '@nimbalyst/runtime/core/DocumentService';
 import type { TrackerIdentity } from '@nimbalyst/runtime';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
@@ -43,6 +44,7 @@ import {
   setTrackerSnoozeAtom,
   trackerSnoozedUntilByItemIdAtom,
 } from '../../store/atoms/trackerPersonalState';
+import { confirmTrackerItemDelete } from './confirmTrackerItemDelete';
 
 interface TrackerInboxViewProps {
   filterType?: TrackerItemType | 'all';
@@ -119,6 +121,7 @@ export function TrackerInboxView({
     activeTypeFilter: filterType,
     onItemSelect,
     onDeleteItems,
+    confirmDelete: confirmTrackerItemDelete,
     onArchiveItems,
     onSwitchToFilesMode,
   });
@@ -155,7 +158,7 @@ export function TrackerInboxView({
     onOpenChange: setCollectionMenuOpen,
     placement: 'top-start',
     whileElementsMounted: autoUpdate,
-    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
+    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 }), windowControlsClearance()],
   });
 
   const assignToMe = useCallback(async (item: TrackerRecord) => {
