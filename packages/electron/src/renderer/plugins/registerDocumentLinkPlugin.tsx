@@ -39,7 +39,10 @@ import {
   buildSharedDocumentDeepLink,
   pendingCollabDocumentAtom,
   personalPagesDocumentsAtomFamily,
+  getTeamSyncProvider,
 } from '../store/atoms/collabDocuments';
+import type { MentionMember } from '@nimbalyst/runtime/editor/plugins/MentionPlugin/mentionTypeahead';
+import { teamMemberDisplayName } from '../utils/teamMemberDisplayName';
 import { activeWorkspacePathAtom } from '../store/atoms/openProjects';
 import { setWindowModeAtom } from '../store/atoms/windowMode';
 import { openConsoleLinkInWindow } from '../utils/openConsoleLink';
@@ -110,7 +113,7 @@ function listPersonalPages(options: { currentDocumentId?: string | null; pathPre
   return personalPageReferenceOptions({ documents: store.get(personalPagesDocumentsAtomFamily(workspacePath)), ...options });
 }
 
-function openTeamPage(target: string, options?: { newTab: boolean }): void {
+export function openTeamPage(target: string, options?: { newTab: boolean }): void {
   const scope = store.get(activeCollabScopeAtom);
   const targetDocumentId = parseCollabReferenceDocumentId(target);
   if (!scope || !targetDocumentId) return;
@@ -133,6 +136,19 @@ function openTeamPage(target: string, options?: { newTab: boolean }): void {
 
 function openPersonalPage(target: string, options?: { newTab: boolean }): void {
   openConsoleLinkInWindow(target, options);
+}
+
+/**
+ * The active team's members, for `@` person mentions. Mentions are keyed by
+ * email, so any document in a team workspace can mention a teammate; outside
+ * a team there is no roster and `@` offers only pages and dates.
+ */
+function listMentionMembers(): MentionMember[] {
+  const scope = store.get(activeCollabScopeAtom);
+  const members = scope ? getTeamSyncProvider(scope)?.getTeamState()?.members ?? [] : [];
+  return members
+    .filter((member) => !!member.email)
+    .map((member) => ({ name: teamMemberDisplayName(member), email: member.email! }));
 }
 
 function referenceSourceFor(documentPath: string | null): CollabReferenceSource | null {
@@ -186,6 +202,7 @@ function DocumentLinkPluginWrapper() {
       triggerFn={triggerFn}
       anchorElem={anchorElem || undefined}
       collabReferenceSource={collabReferenceSource}
+      getMentionMembers={listMentionMembers}
     />
   );
 }
