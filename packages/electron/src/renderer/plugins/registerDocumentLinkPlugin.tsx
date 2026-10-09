@@ -10,6 +10,7 @@
  */
 
 import React, { useMemo } from 'react';
+import { isAbsolute, join } from 'pathe';
 import {
   TypeaheadMenuPlugin,
   registerExtensionEditorComponent,
@@ -40,11 +41,12 @@ import {
   pendingCollabDocumentAtom,
   personalPagesDocumentsAtomFamily,
   getTeamSyncProvider,
+  getPersonalCollabHost,
 } from '../store/atoms/collabDocuments';
 import type { MentionMember } from '@nimbalyst/runtime/editor/plugins/MentionPlugin/mentionTypeahead';
 import { teamMemberDisplayName } from '../utils/teamMemberDisplayName';
 import { activeWorkspacePathAtom } from '../store/atoms/openProjects';
-import { setWindowModeAtom } from '../store/atoms/windowMode';
+import { setWindowModeAtom, windowModeAtom } from '../store/atoms/windowMode';
 import { openConsoleLinkInWindow } from '../utils/openConsoleLink';
 import {
   isPersonalPageLink,
@@ -151,6 +153,23 @@ function listMentionMembers(): MentionMember[] {
     .map((member) => ({ name: teamMemberDisplayName(member), email: member.email! }));
 }
 
+/**
+ * The Local wiki page a link in a wiki page points at, while Pages is shown.
+ * The same file open in Files keeps opening its links as files.
+ */
+function localWikiPageFor(target: string, documentPath: string): string | null {
+  const workspacePath = store.get(activeWorkspacePathAtom);
+  if (!workspacePath || store.get(windowModeAtom) !== 'collab') return null;
+  const wiki = getPersonalCollabHost(workspacePath).source();
+  if (!wiki.documentIdForFile(documentPath)) return null;
+  for (const candidate of resolveDocumentLinkLookupPaths(target, documentPath, workspacePath)) {
+    const absolute = isAbsolute(candidate) ? candidate : join(workspacePath, candidate);
+    const pageId = wiki.documentIdForFile(absolute);
+    if (pageId) return pageId;
+  }
+  return null;
+}
+
 function referenceSourceFor(documentPath: string | null): CollabReferenceSource | null {
   switch (referenceContextOf(documentPath)) {
     case 'team': {
@@ -176,6 +195,7 @@ function referenceSourceFor(documentPath: string | null): CollabReferenceSource 
         listPersonal: () => listPersonalPages({ pathPrefix: 'Personal' }),
         openTeam: openTeamPage,
         openPersonal: openPersonalPage,
+        wikiPageFor: (target) => localWikiPageFor(target, documentPath!),
       });
     case 'other':
       return null;
