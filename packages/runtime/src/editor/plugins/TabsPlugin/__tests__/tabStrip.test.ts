@@ -5,7 +5,7 @@
  */
 import { buildEditorFromExtensions } from '@lexical/extension';
 import { $getRoot, type Klass, type LexicalEditor, type LexicalNode } from 'lexical';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { buildNimbalystRootExtension } from '../../../extensions/NimbalystEditorExtensions';
 import '../../../extensions/registerBuiltinExtensions';
@@ -191,11 +191,8 @@ describe('tab menus', () => {
     expect(panelNames(editor)).toEqual(['One', 'Two', 'Three', 'Tab 4']);
 
     tabButton(strip(), 'Two').click();
-    // Empty panels delete without asking; this one has text.
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     run('delete');
     await settle();
-    expect(confirm).toHaveBeenCalledOnce();
     expect(panelNames(editor)).toEqual(['One', 'Three', 'Tab 4']);
   });
 });

@@ -262,9 +262,8 @@ export function registerTabStrips(editor: LexicalEditor): () => void {
         });
         return;
       case 'delete': {
-        // Deleting removes the panel's content too, so ask when there is any.
-        const empty = editor.getEditorState().read(() => $getNodeByKey(panelKey)?.getTextContent().trim() === '');
-        if (!empty && !window.confirm(`Delete the "${tab.name}" tab and its content?`)) return;
+        // No confirmation: native dialogs are banned in runtime source, and the
+        // deletion is an ordinary editor update that undo restores.
         mutate(() => {
           const panel = $getNodeByKey(panelKey);
           if (!$isTabPanelNode(panel)) return;
