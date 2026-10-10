@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local wiki pages an agent edited now open in the Wiki with the edit applied instead of in red/green review
 - Removing a project's last slash command or action prompt on the desktop now removes it on the phone too
 - The iOS session list now shows an error when the device's database can't be read, instead of an empty list
+- The desktop no longer fails to refresh its sign-in every 30 seconds when its saved sync server address is malformed
 
 ### Removed
 <!-- Removed features go here -->
