@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The iOS session list now shows an error when the device's database can't be read, instead of an empty list
 - The desktop no longer fails to refresh its sign-in every 30 seconds when its saved sync server address is malformed
 - A Local wiki type file written as the wiki format describes, without `icon`, `color`, `modes` or `idPrefix`, now loads; a type file that still fails to load shows in the Local section with the reason instead of its tables and typed pages silently disappearing
+- Shell commands no longer appear as sub-agents in the agent sidebar, and a stopped task no longer looks the same as one that failed.
 
 ### Removed
 <!-- Removed features go here -->
