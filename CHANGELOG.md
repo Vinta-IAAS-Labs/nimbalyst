@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- An agent session in a worktree can read and edit the folders attached to its project, which it previously could not reach
 
 ### Removed
 <!-- Removed features go here -->
