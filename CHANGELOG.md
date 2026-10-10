@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Files @-mentioned to chat providers without file tools are read from attached folders too, and no longer from a sibling folder whose name starts with the project's
 - Commit with AI from the Git panel no longer fails with "Session not found" when the selected repository is nested inside the project folder.
 - In a project spanning several repositories, the title-bar branch, the Git operations panel and the new-worktree dialog follow the file open in the editor instead of always using the first repository
+- Archiving a worktree that was interrupted by quitting the app now finishes cleanly on the next launch, without leaving its sessions visible on a deleted checkout or deleting a same-named branch in the wrong repository.
 
 ### Removed
 <!-- Removed features go here -->
