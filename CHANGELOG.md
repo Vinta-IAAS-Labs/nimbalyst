@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An error from an earlier turn, such as the "You are logged in" login card, no longer stays pinned to the bottom of a session after later turns
 - Files @-mentioned to chat providers without file tools are read from attached folders too, and no longer from a sibling folder whose name starts with the project's
 - Commit with AI from the Git panel no longer fails with "Session not found" when the selected repository is nested inside the project folder.
+- In a project spanning several repositories, the title-bar branch, the Git operations panel and the new-worktree dialog follow the file open in the editor instead of always using the first repository
 
 ### Removed
 <!-- Removed features go here -->
