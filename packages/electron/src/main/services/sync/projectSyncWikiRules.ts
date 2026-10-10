@@ -12,14 +12,20 @@
  * at another path in the wiki, the delete was a move. The stale copy then goes
  * to the wiki's `.trash/` in the library's trash format, never to `unlink`.
  *
- * The wiki's `.trash/` itself is never synced.
+ * The wiki's `.trash/` itself is never synced. Markdown syncs everywhere; the
+ * wiki's table files (`.csv`) sync only inside a wiki that exists (its marker
+ * is on disk), the same rule config discovery uses to tell the phone where the
+ * wiki is. The marker itself is eligible at the configured location whether
+ * or not it exists yet: that is how a second desktop bootstraps the wiki from
+ * the first, after which its tables follow.
  */
 import { EventEmitter } from 'events';
+import { existsSync } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
 import yaml from 'js-yaml';
-import { TRASH_DIR, acquireWriteLock } from '@nimbalyst/local-wiki';
+import { MARKER_FILE, TRASH_DIR, acquireWriteLock } from '@nimbalyst/local-wiki';
 import { logger } from '../../utils/logger';
 import { dirtyEditorRegistry } from '../DirtyEditorRegistry';
 import { localWikiFolderWithin } from '../localWiki/localWikiLocation';
@@ -62,9 +68,60 @@ export function isInWikiTrash(filePath: string, workspacePath: string): boolean 
   return rel === TRASH_DIR || rel.startsWith(`${TRASH_DIR}/`);
 }
 
-/** The one filter for the paths project file sync carries: markdown, outside the wiki's trash. */
+/**
+ * The one filter for the paths project file sync carries: markdown anywhere,
+ * the marker at the wiki location, and `.csv` tables inside a wiki whose
+ * marker exists; never the wiki's trash. The marker check is not cached, so a
+ * table that arrives right after the marker in one batch is accepted.
+ */
 export function isProjectSyncPath(filePath: string, workspacePath: string): boolean {
-  return filePath.endsWith('.md') && !isInWikiTrash(filePath, workspacePath);
+  if (filePath.endsWith('.md')) return !isInWikiTrash(filePath, workspacePath);
+  if (path.basename(filePath) === MARKER_FILE) return isWikiMarkerPath(filePath, workspacePath);
+  return isWikiTablePath(filePath, workspacePath) && existsSync(path.join(wikiRootWithin(workspacePath)!, MARKER_FILE));
+}
+
+/** The marker at the wiki location, whether or not it exists yet. */
+export function isWikiMarkerPath(filePath: string, workspacePath: string): boolean {
+  const root = wikiRootWithin(workspacePath);
+  return root !== null && path.resolve(filePath) === path.join(root, MARKER_FILE);
+}
+
+/**
+ * The server does not order a batch; the wiki marker goes first so the tables
+ * it makes eligible on a desktop that lacks the wiki are not refused.
+ */
+export function wikiMarkerFirst<T extends { relativePath: string }>(files: T[], workspacePath: string): T[] {
+  const isMarker = (f: T) => isWikiMarkerPath(path.join(workspacePath, f.relativePath), workspacePath);
+  return [...files.filter(isMarker), ...files.filter((f) => !isMarker(f))];
+}
+
+/** A `.csv` inside the wiki location, outside its trash; synced once the marker exists. */
+function isWikiTablePath(filePath: string, workspacePath: string): boolean {
+  const root = wikiRootWithin(workspacePath);
+  return root !== null && filePath.endsWith('.csv') && isInside(root, filePath) && !isInWikiTrash(filePath, workspacePath);
+}
+
+/** The wiki's syncable tables on disk (dot-names and trash skipped, as the library does). */
+export async function wikiTableFiles(workspacePath: string): Promise<string[]> {
+  const root = wikiRootWithin(workspacePath);
+  if (!root) return [];
+  const found: string[] = [];
+  const walk = async (dir: string) => {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(abs);
+      else if (entry.isFile() && isProjectSyncPath(abs, workspacePath)) found.push(abs);
+    }
+  };
+  await walk(root);
+  return found.filter((f) => f.endsWith('.csv'));
 }
 
 const FRONTMATTER_OPEN = /^﻿?---[ \t]*\r?\n/;
