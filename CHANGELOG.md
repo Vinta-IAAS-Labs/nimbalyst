@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Local wiki type file written as the wiki format describes, without `icon`, `color`, `modes` or `idPrefix`, now loads; a type file that still fails to load shows in the Local section with the reason instead of its tables and typed pages silently disappearing
 - Shell commands no longer appear as sub-agents in the agent sidebar, and a stopped task no longer looks the same as one that failed.
 - An error from an earlier turn, such as the "You are logged in" login card, no longer stays pinned to the bottom of a session after later turns
+- Files @-mentioned to chat providers without file tools are read from attached folders too, and no longer from a sibling folder whose name starts with the project's
 
 ### Removed
 <!-- Removed features go here -->
