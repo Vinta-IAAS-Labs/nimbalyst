@@ -297,6 +297,13 @@ public final class PagesWebController: NSObject, ObservableObject, PagesUnsynced
     }
 
     private func load(_ url: URL) {
+        // Every native load passes the same policy as a navigation the page starts,
+        // judged on the canonical path, so a rewritten link cannot reach `/app` or login.
+        guard ConsoleNavigationPolicy.allowsNativeLoad(url, environment: environment) else {
+            logger.warning("Refused a native load the navigation policy does not allow")
+            phase = .failed(.load("This page address is not valid."))
+            return
+        }
         guard isOnline() else {
             phase = .failed(.offline)
             return

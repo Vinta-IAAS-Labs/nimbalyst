@@ -17,7 +17,7 @@ vi.mock('../../../database/PGLiteDatabaseWorker', () => ({ database: { query: vi
 
 import { ProjectFileSyncService } from '../../ProjectFileSyncService';
 import { dirtyEditorRegistry } from '../../DirtyEditorRegistry';
-import { openWiki } from '@nimbalyst/local-wiki';
+import { acquireWriteLock, openWiki } from '@nimbalyst/local-wiki';
 
 const WIKI = 'nimbalyst-local/wiki';
 const ID = '01J9Z3K6V4C2W8N5QX7R1T0BHM';
@@ -337,6 +337,157 @@ describe('project file sync inside a Local wiki', () => {
 
     watch.dispose();
     expect(bus.removeGitignoreBypass.mock.calls.map((c) => c[1]).sort()).toEqual([existing, remote, table].sort());
+  });
+
+  it('does not trash newer content written at a held page path', async () => {
+    const old = await seedSynced(`${WIKI}/Zebra.md`, page(ID));
+    await (service as any).handleRemoteFileDelete('proj', old.syncId); // held: no other copy yet
+    // The delete was stale: a newer version of the same page lands at the same path.
+    await (service as any).handleRemoteFileUpdate('proj', remoteFile(`${WIKI}/Zebra.md`, page(ID, '# Zebra\n\nNewer.\n')));
+    await (service as any).handleRemoteFileUpdate('proj', remoteFile(`${WIKI}/Apple.md`, page(ID)));
+    expect(await readFile(old.abs, 'utf-8')).toBe(page(ID, '# Zebra\n\nNewer.\n'));
+    expect(await trashEntries()).toEqual([]);
+  });
+
+  describe('table CSVs, which carry no id of their own', () => {
+    const TABLE = 'id,title\n01J9Z3K6V4C2W8N5QX7R1T0BHA,Acme\n';
+    const MORE = `${TABLE}01J9Z3K6V4C2W8N5QX7R1T0BHB,Globex\n`;
+    const writeType = (typeId: string) => writeFile(path.join(ws, '.nimbalyst', 'trackers', 'partner.yaml'),
+      `type: ${JSON.stringify(typeId)}\ndisplayName: Partner\ndisplayNamePlural: Partners\nstorage: table\nfields:\n  - name: title\n    type: string\n`, 'utf-8');
+    const put = async (rel: string, text: string) => {
+      await mkdir(path.dirname(path.join(wiki, rel)), { recursive: true });
+      await writeFile(path.join(wiki, rel), text, 'utf-8');
+    };
+    const tableEntry = async () => {
+      const entries = await trashEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatch(/^\d+-table-partner$/);
+      const dir = path.join(wiki, '.trash', entries[0]);
+      return { dir, csv: await readFile(path.join(dir, 'Partners.csv'), 'utf-8'), manifest: JSON.parse(await readFile(path.join(dir, '.trash.json'), 'utf-8')) };
+    };
+
+    beforeEach(async () => {
+      await mkdir(path.join(ws, '.nimbalyst', 'trackers'), { recursive: true });
+      await writeType('partner');
+    });
+
+    it('trashes the old file, with its activity log, when the moved table holds all its rows', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await put('Partners.activity.jsonl', '{"action":"create"}\n');
+      await put('Sub/Partners.csv', MORE); // a row was added after the move
+      await (service as any).handleRemoteFileDelete('proj', old.syncId);
+
+      await expect(stat(old.abs)).rejects.toThrow();
+      await expect(stat(path.join(wiki, 'Partners.activity.jsonl'))).rejects.toThrow();
+      const { dir, csv, manifest } = await tableEntry();
+      expect(csv).toBe(TABLE);
+      expect(await readFile(path.join(dir, 'Partners.activity.jsonl'), 'utf-8')).toBe('{"action":"create"}\n');
+      expect(manifest).toMatchObject({
+        formatVersion: 1, kind: 'table', id: 'table:partner', typeId: 'partner', originalDir: '',
+        entries: { csv: 'Partners.csv', activity: 'Partners.activity.jsonl' },
+      });
+      expect((service as any)._fileMapCache.get('proj').fileMap.has(old.syncId)).toBe(false);
+      expect(pushFileContent).not.toHaveBeenCalled();
+    });
+
+    it('keeps the file unless another file of its type holds the same header and every one of its rows', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      const sheet = await seedSynced(`${WIKI}/Budget.csv`, 'a,b\n1,2\n'); // no table type of that name
+      await put('Other/Budget.csv', 'a,b\n1,2\n');
+      const attempts = [
+        'id,title\n01J9Z3K6V4C2W8N5QX7R1T0BHC,Unrelated\n', // created independently
+        'id,name\n01J9Z3K6V4C2W8N5QX7R1T0BHA,Acme\n', // different header
+        'id,title\n01J9Z3K6V4C2W8N5QX7R1T0BHA,Acme (older)\n', // the moved copy predates an edit to this one
+        '', // empty
+        'id,title\n"01J9Z3K6V4C2W8N5QX7R1T0BHA,Acme\n', // unparseable
+      ];
+      for (const candidate of attempts) {
+        await put('Sub/partner.csv', candidate);
+        await (service as any).handleRemoteFileDelete('proj', old.syncId);
+        expect(await readFile(old.abs, 'utf-8')).toBe(TABLE);
+      }
+      await (service as any).handleRemoteFileDelete('proj', sheet.syncId);
+      expect(await readFile(sheet.abs, 'utf-8')).toBe('a,b\n1,2\n');
+
+      // Unsynced local edits at the old path.
+      await put('Sub/partner.csv', MORE);
+      await writeFile(old.abs, `${TABLE}01J9Z3K6V4C2W8N5QX7R1T0BHD,Local edit\n`, 'utf-8');
+      await (service as any).handleRemoteFileDelete('proj', old.syncId);
+      expect(await readFile(old.abs, 'utf-8')).toContain('Local edit');
+      expect(await trashEntries()).toEqual([]);
+    });
+
+    it('does not hold a delete that arrives before the moved table; a later delivery retires it', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await (service as any).handleRemoteFileDelete('proj', old.syncId);
+      await (service as any).handleRemoteFileUpdate('proj', remoteFile(`${WIKI}/Sub/Partners.csv`, TABLE));
+      expect(await readFile(old.abs, 'utf-8')).toBe(TABLE);
+      expect(await trashEntries()).toEqual([]);
+
+      // Reconnect: the server's tombstone for the old path arrives again.
+      await (service as any).handleSyncResponse('proj', { updatedFiles: [], newFiles: [], deletedSyncIds: [old.syncId], needFromClient: [], yjsUpdates: [] });
+      await expect(stat(old.abs)).rejects.toThrow();
+      expect((await tableEntry()).csv).toBe(TABLE);
+    });
+
+    it('re-decides under the wiki write lock', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, MORE);
+      await put('Sub/Partners.csv', MORE);
+      const release = (await acquireWriteLock(wiki, { timeoutMs: 1000, staleMs: 30_000 }))!;
+      const pending = (service as any).handleRemoteFileDelete('proj', old.syncId);
+      await new Promise((r) => setTimeout(r, 50)); // decided, now waiting for the lock
+      await writeFile(path.join(wiki, 'Sub', 'Partners.csv'), TABLE, 'utf-8'); // a row was removed from the live table
+      await release();
+      await pending;
+      expect(await readFile(old.abs, 'utf-8')).toBe(MORE);
+      expect(await trashEntries()).toEqual([]);
+    });
+
+    it('keeps the file when its editor turns dirty after the check under the lock', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await put('Sub/Partners.csv', TABLE);
+      // Clean for the service's check, the first decision and the one under the lock; dirty from then on.
+      let checks = 0;
+      const isDirty = vi.spyOn(dirtyEditorRegistry, 'isDirty').mockImplementation((f) => f === old.abs && ++checks > 3);
+      await (service as any).handleRemoteFileDelete('proj', old.syncId);
+      isDirty.mockRestore();
+      expect(await readFile(old.abs, 'utf-8')).toBe(TABLE);
+      expect(await trashEntries()).toEqual([]);
+    });
+
+    it('refuses a type id that is not a safe token', async () => {
+      await writeType('x/../../../escaped');
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await put('Sub/Partners.csv', TABLE);
+      await (service as any).handleRemoteFileDelete('proj', old.syncId);
+      expect(await readFile(old.abs, 'utf-8')).toBe(TABLE);
+      expect(await readdir(ws)).not.toContain('escaped');
+      expect(await trashEntries()).toEqual([]);
+    });
+
+    it('does not bring back a table this desktop moved while sync was not running', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await rm(old.abs);
+      await put('Sub/Partners.csv', TABLE);
+
+      await (service as any).handleSyncResponse('proj', {
+        updatedFiles: [], newFiles: [remoteFile(`${WIKI}/Partners.csv`, TABLE)], deletedSyncIds: [], needFromClient: [], yjsUpdates: [],
+      });
+
+      await expect(stat(old.abs)).rejects.toThrow();
+      expect(deleteFile).toHaveBeenCalledWith('proj', old.syncId);
+    });
+
+    it('restores the old path on reconnect when the moved table does not hold its rows', async () => {
+      const old = await seedSynced(`${WIKI}/Partners.csv`, TABLE);
+      await rm(old.abs);
+      await put('Sub/Partners.csv', 'id,title\n01J9Z3K6V4C2W8N5QX7R1T0BHA,Acme (older)\n'); // same id, older cells
+      await (service as any).handleSyncResponse('proj', {
+        updatedFiles: [], newFiles: [remoteFile(`${WIKI}/Partners.csv`, TABLE)], deletedSyncIds: [], needFromClient: [], yjsUpdates: [],
+      });
+      expect(await readFile(old.abs, 'utf-8')).toBe(TABLE);
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
   });
 
   it('does not bring back a page this desktop moved while sync was not running', async () => {

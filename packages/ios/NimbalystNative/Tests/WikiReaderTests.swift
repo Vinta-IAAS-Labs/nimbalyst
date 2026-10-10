@@ -85,6 +85,8 @@ final class WikiReaderTests: XCTestCase {
     func testFixturesMatchTheLibrary() throws {
         let names = try cases()
         XCTAssertFalse(names.isEmpty, "no fixtures at \(Self.fixtures.path)")
+        // Written by the desktop round-trip test (`projectSyncWikiRoundTrip.test.ts`) from what two desktops and a phone synced.
+        XCTAssertTrue(names.contains("roundtrip"), "roundtrip fixture missing")
         for name in names {
             let (expected, snapshot) = try load(name)
             XCTAssertEqual(snapshot.formatVersion, expected.formatVersion, name)

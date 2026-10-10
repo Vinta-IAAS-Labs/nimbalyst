@@ -66,6 +66,33 @@ final class ConsoleNavigationPolicyTests: XCTestCase {
         }
     }
 
+    // R4-5: encoded dot segments are judged by the path the server will see.
+    func testEncodedDotSegmentsAreJudgedByTheCanonicalPath() {
+        let escape = ".%2e/.%2e/.%2e/.%2e"
+        // `nimbalyst://console/org/o/project/p/.%2e/.%2e/.%2e/.%2e/app/private` normalizes to /app/private.
+        XCTAssertEqual(decide("nimbalyst://console/org/organization-abc/project/p1/\(escape)/app/private"), .personalPages)
+        XCTAssertEqual(decide("\(team)/\(escape)/app/private"), .personalPages)
+        XCTAssertEqual(decide("\(team)/%2e./%2E%2E/%2e%2e/%2e./login"), .reauthenticate)
+        XCTAssertEqual(ConsoleRoute.canonicalPath("/org/o/project/p/\(escape)/app/private"), "/app/private")
+        XCTAssertEqual(
+            NimbalystExternalURLRouter.route(URL(string: "nimbalyst://console/org/organization-abc/project/p1/\(escape)/app/x")!),
+            .unsupported,
+            "never a team route"
+        )
+
+        for segment in [".%2e", "%2e.", "%2E%2E", "%2e", "a%2fb", "a%2Fb", "a%5cb", "%zz", "%c3%28", "%00"] {
+            XCTAssertNil(ConsoleRoute(path: "/org/organization-abc/project/p1/\(segment)/wiki"), segment)
+        }
+        XCTAssertNil(ConsoleRoute(path: "/org/organization-abc/project/%2e%2e/wiki"))
+        XCTAssertEqual(ConsoleRoute(path: "/org/organization-abc/project/caf%C3%A9/wiki")?.teamProjectId, "caf\u{e9}")
+
+        // Native loads pass the same policy, on the canonical path.
+        XCTAssertFalse(ConsoleNavigationPolicy.allowsNativeLoad(URL(string: "\(team)/\(escape)/app/private")!))
+        XCTAssertFalse(ConsoleNavigationPolicy.allowsNativeLoad(URL(string: "https://example.com/org/organization-abc/project/p1/wiki")!))
+        XCTAssertTrue(ConsoleNavigationPolicy.allowsNativeLoad(URL(string: "\(team)/wiki")!))
+        XCTAssertTrue(ConsoleNavigationPolicy.allowsNativeLoad(URL(string: "https://console.nimbalyst.com/authenticate/native?orgId=organization-abc&returnTo=%2Forg")!))
+    }
+
     func testExternalRouterConsoleCase() {
         XCTAssertEqual(
             NimbalystExternalURLRouter.route(URL(string: "nimbalyst://console/org/organization-abc/project/p1/page/item/NIM-1?x=1")!),

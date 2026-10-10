@@ -54,6 +54,8 @@ import androidx.compose.ui.unit.dp
 import com.nimbalyst.app.NimbalystApplication
 import com.nimbalyst.app.documents.DocumentListScreen
 import com.nimbalyst.app.wiki.WikiTreeScreen
+import com.nimbalyst.app.pages.TeamPagesTab
+import com.nimbalyst.app.pages.rememberTeamPagesModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nimbalyst.app.data.SessionEntity
 import com.nimbalyst.app.ui.navigation.WorkspaceNavigation
@@ -130,6 +132,19 @@ fun SessionListScreen(
             .distinctUntilChanged()
     }.collectAsState(initial = null)
     val wikiFolder = wiki?.folder
+    // The Team tab shows only when this project maps to a team project (or the check failed, with Retry).
+    val gitRemoteHash by remember(projectId) {
+        app.repository.observeProjects()
+            .map { projects -> projects.firstOrNull { it.id == projectId }?.gitRemoteHash }
+            .distinctUntilChanged()
+    }.collectAsState(initial = null)
+    val teamPages = rememberTeamPagesModel(projectId, gitRemoteHash)
+    val teamState by teamPages.state.collectAsState()
+    LaunchedEffect(teamState) {
+        if (teamState.checked && !teamState.isLoading && !teamState.showsTeamTab && selectedTab == ProjectTab.TEAM) {
+            selectedTab = ProjectTab.SESSIONS
+        }
+    }
     // A restored Wiki selection waits for the project row; only a project known to have no wiki resets it.
     LaunchedEffect(wiki) {
         if (wiki != null && wikiFolder == null && selectedTab == ProjectTab.WIKI) selectedTab = ProjectTab.SESSIONS
@@ -291,7 +306,7 @@ fun SessionListScreen(
             }
         )
 
-        ProjectTabRow(selected = selectedTab, tabs = projectTabs(wikiFolder != null), onSelect = { tab ->
+        ProjectTabRow(selected = selectedTab, tabs = projectTabs(wikiFolder != null, teamState.showsTeamTab), onSelect = { tab ->
             if (tab != selectedTab) {
                 selectedTab = tab
                 onTabChanged()
@@ -307,6 +322,8 @@ fun SessionListScreen(
                 onOpenDocument = onOpenDocument,
                 modifier = Modifier.fillMaxSize(),
             )
+        } else if (selectedTab == ProjectTab.TEAM) {
+            TeamPagesTab(model = teamPages, modifier = Modifier.fillMaxSize())
         } else if (selectedTab == ProjectTab.FILES) {
             DocumentSurfaceMarker()
             DocumentListScreen(
@@ -485,12 +502,12 @@ private fun SearchField(value: String, onValueChange: (String) -> Unit) {
     )
 }
 
-/** Sessions | Files | Wiki, like iOS `ProjectTab`. */
-internal enum class ProjectTab { SESSIONS, FILES, WIKI }
+/** Sessions | Files | Wiki | Team, like iOS `ProjectTab`. */
+internal enum class ProjectTab { SESSIONS, FILES, WIKI, TEAM }
 
-/** Wiki only when the project has a Local wiki. */
-internal fun projectTabs(hasWiki: Boolean): List<ProjectTab> =
-    if (hasWiki) ProjectTab.entries else ProjectTab.entries - ProjectTab.WIKI
+/** Wiki only when the project has a Local wiki; Team only when it maps to a team project. */
+internal fun projectTabs(hasWiki: Boolean, hasTeam: Boolean = false): List<ProjectTab> =
+    ProjectTab.entries.filter { (it != ProjectTab.WIKI || hasWiki) && (it != ProjectTab.TEAM || hasTeam) }
 
 private data class ProjectWiki(val folder: String?, val typesJson: String?)
 
@@ -515,6 +532,7 @@ private fun ProjectTabRow(selected: ProjectTab, tabs: List<ProjectTab>, onSelect
                             ProjectTab.SESSIONS -> R.string.session_list_tab_sessions
                             ProjectTab.FILES -> R.string.session_list_tab_files
                             ProjectTab.WIKI -> R.string.session_list_tab_wiki
+                            ProjectTab.TEAM -> R.string.session_list_tab_team
                         }
                     ),
                     style = MaterialTheme.typography.labelMedium

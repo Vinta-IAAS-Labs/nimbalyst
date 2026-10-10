@@ -79,19 +79,22 @@ public struct ConsoleRoute: Hashable, Sendable {
         // segment must be non-empty except a single trailing slash.
         var parts = Array(segments)
         if parts.last == "" { parts.removeLast() }
-        guard parts.count >= 2, parts[0] == "org", !parts.contains(""),
-              !parts.contains(where: { $0 == "." || $0 == ".." || $0.lowercased().contains("%2e%2e") || $0.lowercased().contains("%2f") })
-        else { return nil }
+        guard parts.count >= 2, parts[0] == "org", !parts.contains("") else { return nil }
         let orgKey = String(parts[1])
         guard (1...128).contains(orgKey.count),
               orgKey.unicodeScalars.allSatisfy(Self.orgKeyCharacters.contains) else { return nil }
+        // Judge each segment by what it decodes to: `.%2e` is `..` to the server
+        // that normalizes it, and an encoded `/` or `\` splits the path there.
+        var decoded: [String] = []
         for part in parts.dropFirst(2) {
-            guard part.count <= 256, part.unicodeScalars.allSatisfy(Self.segmentCharacters.contains) else { return nil }
+            guard part.count <= 256, part.unicodeScalars.allSatisfy(Self.segmentCharacters.contains),
+                  let segment = Self.decodeSegment(String(part)),
+                  segment != ".", segment != "..",
+                  !segment.unicodeScalars.contains(where: { $0 == "/" || $0 == "\\" || CharacterSet.controlCharacters.contains($0) })
+            else { return nil }
+            decoded.append(segment)
         }
-        var teamProjectId: String?
-        if parts.count >= 4, parts[2] == "project" {
-            teamProjectId = String(parts[3]).removingPercentEncoding ?? String(parts[3])
-        }
+        let teamProjectId: String? = parts.count >= 4 && parts[2] == "project" ? decoded[1] : nil
         self.path = path
         self.orgKey = orgKey
         self.teamProjectId = teamProjectId
@@ -105,6 +108,49 @@ public struct ConsoleRoute: Hashable, Sendable {
         if let query = components.percentEncodedQuery { path += "?\(query)" }
         if let fragment = components.percentEncodedFragment { path += "#\(fragment)" }
         self.init(path: path)
+    }
+
+    /// The path a server sees after percent-decoding and removing dot segments
+    /// (RFC 3986 5.2.4). Classification (`/app`, `/login`, ...) reads this, never
+    /// the raw path, so `/org/o/.%2e/.%2e/app` is a Personal page, not a team one.
+    public static func canonicalPath(_ rawPath: String) -> String {
+        var output: [String] = []
+        for raw in rawPath.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
+            let segment = decodeSegment(String(raw)) ?? String(raw)
+            switch segment {
+            case ".": continue
+            case "..": _ = output.popLast()
+            default: output.append(segment)
+            }
+        }
+        return "/" + output.joined(separator: "/")
+    }
+
+    /// Strict percent-decoding (UTF-8). Nil for a malformed escape or invalid UTF-8.
+    static func decodeSegment(_ raw: String) -> String? {
+        guard raw.contains("%") else { return raw }
+        func hex(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"): return byte - UInt8(ascii: "0")
+            case UInt8(ascii: "a")...UInt8(ascii: "f"): return byte - UInt8(ascii: "a") + 10
+            case UInt8(ascii: "A")...UInt8(ascii: "F"): return byte - UInt8(ascii: "A") + 10
+            default: return nil
+            }
+        }
+        let input = Array(raw.utf8)
+        var bytes: [UInt8] = []
+        var index = 0
+        while index < input.count {
+            if input[index] == UInt8(ascii: "%") {
+                guard index + 2 < input.count, let high = hex(input[index + 1]), let low = hex(input[index + 2]) else { return nil }
+                bytes.append(high << 4 | low)
+                index += 3
+            } else {
+                bytes.append(input[index])
+                index += 1
+            }
+        }
+        return String(bytes: bytes, encoding: .utf8)
     }
 
     /// The team Wiki home for a project.

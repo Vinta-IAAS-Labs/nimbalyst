@@ -69,6 +69,8 @@ class LocalWikiReaderTest {
     fun fixturesMatchTheLibrary() {
         val names = cases()
         assertTrue("no fixtures at ${fixtures.absolutePath}", names.isNotEmpty())
+        // Written by the desktop round-trip test (projectSyncWikiRoundTrip.test.ts) from what two desktops and a phone synced.
+        assertTrue("roundtrip fixture missing", "roundtrip" in names)
         for (name in names) {
             val expected = expected(name)
             val snapshot = read(name, expected)

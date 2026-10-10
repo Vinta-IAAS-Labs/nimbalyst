@@ -52,6 +52,8 @@ public enum ConsoleNavigationPolicy {
             return .openExternally(url)
 
         case "nimbalyst":
+            // A dot-segment path that resolves to a Personal page is one, whatever it looks like.
+            if url.host?.lowercased() == "console", isPersonal(canonicalPath(of: url)) { return .personalPages }
             switch NimbalystExternalURLRouter.route(url) {
             case .console(let route):
                 return environment.url(for: route.path).map(ConsoleNavigationAction.load) ?? .cancel
@@ -73,16 +75,30 @@ public enum ConsoleNavigationPolicy {
         }
     }
 
+    /// Whether native may load `url` itself (a route, a rewrite, re-auth, Retry).
+    public static func allowsNativeLoad(_ url: URL, environment: ConsoleEnvironment = .production) -> Bool {
+        decide(url: url, isMainFrame: true, environment: environment) == .allow
+    }
+
+    private static func canonicalPath(of url: URL) -> String {
+        ConsoleRoute.canonicalPath(URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path)
+    }
+
+    private static func isPersonal(_ path: String) -> Bool {
+        path == "/app" || path.hasPrefix("/app/")
+    }
+
     private static func decideConsole(url: URL, opensNewWindow: Bool, environment: ConsoleEnvironment) -> ConsoleNavigationAction {
-        let path = url.path
-        if path == "/app" || path.hasPrefix("/app/") { return .personalPages }
+        // Classified by the path the server will see, after decoding and dot segments.
+        let path = canonicalPath(of: url)
+        if isPersonal(path) { return .personalPages }
         if path == "/authenticate/native" {
             return opensNewWindow ? .load(url) : .allow
         }
         if path == "/login" || path.hasPrefix("/login/") || path == "/authenticate" || path.hasPrefix("/authenticate/") {
             return .reauthenticate
         }
-        if path.isEmpty || path == "/" || ConsoleRoute(url: url, environment: environment) != nil {
+        if path == "/" || ConsoleRoute(url: url, environment: environment) != nil {
             return opensNewWindow ? .load(url) : .allow
         }
         // Public wiki pages, `/connect`, and anything else the embed does not

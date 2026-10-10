@@ -250,6 +250,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - Rich mobile transcript cards for structured prompts, memory results, and live tracker links; zoomable/copyable images and tappable file links
 - Personal document/file sync and bidirectional draft sync with the desktop
 - Local wiki on the phone -- a Wiki tab for projects with a Local wiki shows its page tree by title and order (Home first, conflict copies grouped, trash hidden); pages open in the document editor with links between pages followed in the app, typed pages show their type and fields read-only above the body, and table types show their rows read-only. Page bodies are editable and keep frontmatter byte for byte; fields, table rows, and creating, renaming or moving pages stay on the desktop. A wiki in a newer format opens read-only. Requires an updated desktop syncing the project
+- Team Wiki and Team Trackers on the phone -- a Team tab for projects that belong to a team opens the team's wiki and trackers from the web console inside the app, signed in automatically from the phone's account (no second sign-in; teams that require MFA or another sign-in method open in Safari instead). Pages open read-only with an Edit button for plain pages; typed pages and type tables stay read-only. Unsaved edits are flushed when leaving or backgrounding, with a warning if they have not reached the server. Console links from Mail, Messages, the transcript and `nimbalyst://console` open in the app. Online only. Requires the updated sync server
 - Compose bar with slash command typeahead; delivery warnings track desktop activity and clear when execution or fresh output arrives, while mobile edits preserve desktop-owned running status
 - Project Actions in the composer menu -- prefill a saved desktop action prompt or launch it in a new session
 - Adaptive iPhone/iPad layout with a session sidebar on wide screens; session and draft preserved through rotation
@@ -288,6 +289,7 @@ Companion app; pairs with a desktop over encrypted sync. Voice mode is not inclu
 - Session transcript viewing (WebView)
 - Create sessions, worktrees, workstreams, and Meta Agent sessions (when the desktop alpha is on) on a chosen desktop, choosing the model at creation from the desktop's list
 - Files tab: browse and edit synced project markdown documents
+- Team Wiki and Team Trackers on the phone, matching iOS (console links open the app through verified App Links); needs an Android System WebView with multi-profile support. Requires the updated sync server
 - Local wiki on the phone, matching iOS: Wiki tab with the page tree, in-app links between pages, read-only typed fields and table rows, editable page bodies with frontmatter preserved. Requires an updated desktop syncing the project
 - Cancel running sessions, archive/unarchive, and move sessions into workstreams
 - Project Actions from the composer
