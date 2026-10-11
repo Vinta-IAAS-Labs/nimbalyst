@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+
+### Changed
+<!-- Changes to existing functionality go here -->
+
+### Fixed
+<!-- Bug fixes go here -->
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.81.0] - 2026-10-11
+
+
+### Added
+<!-- New features go here -->
 - New editor blocks for wiki pages: charts, callouts, columns, tabs, a table of contents, transclusions, `@` mentions of people and dates, link previews and video players, code excerpts, and buttons that start an agent session or create a new item. Most can be resized from a bottom-right grip and edited from the block menu.
 - Local wikis on iPhone, iPad and Android: a Wiki tab shows the project's page tree, follows links between pages in the app, and saves page edits back to the desktop
 - On iPhone, iPad and Android, a Team tab opens a team project's Wiki and Trackers (alpha)
