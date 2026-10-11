@@ -183,7 +183,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - AI-assisted commit message generation
 - Interactive git commit proposal widget with individual-hunk selection to commit only the intended lines of a shared file
 - Commit history view with ahead/behind tracking and links to the AI sessions that produced commits
-- Per-repository status, branches, file lists, and commit controls for multi-folder projects; Commit with AI proposes separate commits per repository
+- Per-repository status, branches, file lists, and commit controls for multi-folder projects; Commit with AI proposes separate commits per repository; the title-bar branch, Git panel and new-worktree dialog follow the file open in the editor
 - Auto-commit mode (toggle)
 - Merge/rebase conflict dialogs
 - Gitignore-aware file watching
@@ -202,7 +202,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 
 ## File Management
 
-- Multi-folder projects -- attach folders from the File menu or quick open; their files participate in the explorer, search, and agent context, with Git tracked per repository
+- Multi-folder projects -- attach folders from the File menu or quick open; their files participate in the explorer, search, and agent context, with Git tracked per repository; Quick Open, @ mentions and content search also find files in repositories cloned inside a project, and worktree sessions get the project's attached folders
 - File tree with expand/collapse and keyboard navigation
 - Virtualized file tree for large repositories
 - Context menu: rename, delete, reveal in Finder, open externally, copy path, move, copy
